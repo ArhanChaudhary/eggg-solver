@@ -757,6 +757,11 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     pub on_endpoint: F,
     pub stop: bool,
     pub abort: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Search only the "slice" of endpoints whose last `tail` moves are in H (outer turns
+    /// and wide half turns, which keep the centres staged and the wing parity): the path
+    /// before them must reach staged centres with even parity by a wide quarter turn. Those
+    /// last moves need no table lookups. 0: all endpoints.
+    pub tail: u8,
 }
 
 impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
@@ -768,6 +773,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             on_endpoint,
             stop: false,
             abort: None,
+            tail: 0,
         }
     }
 
@@ -782,6 +788,12 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
 
     /// [`Search1::dfs`], for the large (`BIG`) or the small table.
     fn dfs_t<const BIG: bool>(&mut self, s: &P1State, d: u8, left: u8, last: usize) {
+        if self.tail > 0 && left <= self.tail {
+            if d == 0 && !s.parity && (last == N_MOVES || WIDE_QUARTER >> last & 1 == 1) {
+                self.tail_search(s, left, last);
+            }
+            return;
+        }
         if left == 0 {
             if d == 0 {
                 let frames = self.t.endpoint_frames(s, trailing_run(&self.path));
@@ -792,7 +804,11 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             return;
         }
         let mut allowed = ALLOWED_AFTER[last];
-        if left == 1 {
+        if self.tail > 0 && left == self.tail + 1 {
+            // The last move before the tail enters staging: a wide quarter turn.
+            allowed &= WIDE_QUARTER;
+        }
+        if left == 1 && self.tail == 0 {
             // The last move must leave the wing permutation even, and the wings pairable in a
             // frame where the path's trailing run of same-axis moves has no phase-2 move (else
             // the shorter endpoint without them, with them opening phase 2, covers it): both
@@ -915,7 +931,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             } else {
                 dcs[k]
             };
-            if dc < left {
+            if dc + self.tail < left {
                 let c = s.apply(m, t);
                 self.path.push(m as u8);
                 self.dfs_t::<BIG>(&c, dc, left - 1, m);
@@ -923,6 +939,41 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 if self.stop {
                     return;
                 }
+            }
+        }
+    }
+}
+
+impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
+    /// The last `left` moves of a slice: H moves only (the centres stay staged and the wing
+    /// parity even), endpoints tested at the end; no table lookups.
+    fn tail_search(&mut self, s: &P1State, left: u8, last: usize) {
+        if left == 0 {
+            self.nodes += 1;
+            if self.nodes & 4095 == 0
+                && self
+                    .abort
+                    .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+            {
+                self.stop = true;
+                return;
+            }
+            let frames = self.t.endpoint_frames(s, trailing_run(&self.path));
+            if frames != 0 && !(self.on_endpoint)(&self.path, frames) {
+                self.stop = true;
+            }
+            return;
+        }
+        let mut allowed = ALLOWED_AFTER[last] & !WIDE_QUARTER;
+        while allowed != 0 {
+            let m = allowed.trailing_zeros() as usize;
+            allowed &= allowed - 1;
+            let c = s.apply(m, self.t);
+            self.path.push(m as u8);
+            self.tail_search(&c, left - 1, m);
+            self.path.pop();
+            if self.stop {
+                return;
             }
         }
     }

@@ -118,8 +118,12 @@ struct Reduction {
 /// The resumable state of one phase-1 length level.
 struct Level1 {
     len: u8,
+    /// Slice: endpoints whose last `tail` moves keep the centres staged (0: all).
+    tail: u8,
     jobs: Vec<Vec<u8>>,
     next: usize,
+    /// Endpoints found so far in this level.
+    found: usize,
 }
 
 /// Merge consecutive moves of the same face (moves of one axis commute).
@@ -209,7 +213,7 @@ fn p1_run<F: FnMut(&[u8], u8) -> bool>(
     close: &AtomicBool,
     spill: &mut Vec<Vec<u8>>,
 ) {
-    if split == 0 || left <= 3 {
+    if split == 0 || left <= srch.tail + 3 {
         srch.dfs(st, d, left, last);
         return;
     }
@@ -221,7 +225,7 @@ fn p1_run<F: FnMut(&[u8], u8) -> bool>(
         let c = st.apply(m, t);
         let dc = Mod3Table::decode(d, t.value(&c));
         srch.nodes += 1;
-        if dc >= left {
+        if dc + srch.tail >= left {
             continue;
         }
         srch.path.push(m as u8);
@@ -232,6 +236,12 @@ fn p1_run<F: FnMut(&[u8], u8) -> bool>(
         }
         srch.path.pop();
     }
+}
+
+/// The phase-2 lower bound of an endpoint in a frame (None if its centres cannot be solved);
+/// for experiments.
+pub fn endpoint_h2(t: &Tables, cube: &Cube, moves1: &[u8], frame: usize) -> Option<u8> {
+    make_candidate(t, cube, moves1, frame).map(|c| c.h2)
 }
 
 /// A phase-2 candidate from a phase-1 endpoint (None if its centres cannot be solved).
@@ -284,6 +294,10 @@ struct Run<'a, 'r> {
     root: P1State,
     d0: u8,
     level: Level1,
+    /// The first plain phase-1 level with endpoints, once known.
+    first: Option<u8>,
+    /// Phase-1 levels (length, tail) to search next.
+    plan: std::collections::VecDeque<(u8, u8)>,
     seen_ep: HashSet<(Vec<u8>, usize)>,
     cands: Vec<Candidate>,
     reds: Vec<Reduction>,
@@ -334,15 +348,19 @@ impl<'a> Solver<'a> {
             d0,
             level: Level1 {
                 len: d0,
+                tail: 0,
                 jobs: vec![],
                 next: 0,
+                found: 0,
             },
+            first: None,
+            plan: std::collections::VecDeque::new(),
             seen_ep: HashSet::new(),
             cands: vec![],
             reds: vec![],
             red_index: HashMap::new(),
         };
-        run.level.jobs = run.level_jobs(d0);
+        run.level.jobs = run.level_jobs(d0, 0);
         std::thread::scope(|scope| {
             // Watchdog that raises the stop flag at the deadline.
             let (stop_ref, done_ref, have_ref) = (&stop, &done, &have);
@@ -405,9 +423,10 @@ impl<'a, 'r> Run<'a, 'r> {
             debug(
                 self.start,
                 &format!(
-                    "phase 1: {} endpoints (length {}), nodes {}",
+                    "phase 1: {} endpoints (length {} tail {}), nodes {}",
                     self.cands.len(),
                     self.level.len,
+                    self.level.tail,
                     self.stats.nodes1
                 ),
             );
@@ -439,10 +458,41 @@ impl<'a, 'r> Run<'a, 'r> {
         }
     }
 
-    fn level_jobs(&self, len: u8) -> Vec<Vec<u8>> {
-        let depth = if len < 3 {
+    /// The next phase-1 level: plain levels until the first with endpoints (F); then F+1,
+    /// and before each later plain level the cheap slices of it and of the next one (their
+    /// last moves need no table lookups, so they give useful endpoints several times faster
+    /// than the plain level; the plain level finds them again, deduplicated).
+    fn next_level(&mut self) -> (u8, u8) {
+        let (len, tail) = (self.level.len, self.level.tail);
+        if tail == 0 && self.first.is_none() && self.level.found > 0 {
+            let f = len;
+            self.first = Some(f);
+            self.plan.extend([
+                (f + 1, 0),
+                (f + 2, 2),
+                (f + 2, 3),
+                (f + 2, 1),
+                (f + 3, 2),
+                (f + 3, 3),
+                (f + 2, 0),
+            ]);
+        }
+        if let Some(x) = self.plan.pop_front() {
+            return x;
+        }
+        if self.first.is_none() {
+            return (len + 1, 0);
+        }
+        // The plan always ends with a plain level: `len` was plain.
+        self.plan.extend([(len + 2, 2), (len + 2, 3), (len + 1, 0)]);
+        (len + 1, 1)
+    }
+
+    fn level_jobs(&self, len: u8, tail: u8) -> Vec<Vec<u8>> {
+        let alen = len - tail;
+        let depth = if alen < 3 {
             0
-        } else if len < 7 {
+        } else if alen < 7 {
             2
         } else {
             3
@@ -471,7 +521,7 @@ impl<'a, 'r> Run<'a, 'r> {
             for (i, &m) in p.iter().enumerate() {
                 st = st.apply(m as usize, t);
                 d = Mod3Table::decode(d, t.value(&st));
-                if d as usize > len as usize - i - 1 {
+                if d as usize + tail as usize > len as usize - i - 1 {
                     return false;
                 }
             }
@@ -484,17 +534,20 @@ impl<'a, 'r> Run<'a, 'r> {
     fn phase1(&mut self, want: usize) {
         while self.cands.len() < want && !self.stopped() && self.level.len <= 40 {
             if self.level.next >= self.level.jobs.len() {
-                let len = self.level.len + 1;
+                let (len, tail) = self.next_level();
                 self.level = Level1 {
                     len,
-                    jobs: self.level_jobs(len),
+                    tail,
+                    jobs: self.level_jobs(len, tail),
                     next: 0,
+                    found: 0,
                 };
                 continue;
             }
             let need = want - self.cands.len();
             let t = &self.t.p1;
             let (root, d0, len, stop) = (self.root, self.d0, self.level.len, self.stop);
+            let tail = self.level.tail;
             let jobs = &self.level.jobs;
             let first = self.level.next;
             let threads = self.threads;
@@ -532,6 +585,7 @@ impl<'a, 'r> Run<'a, 'r> {
                                 true
                             });
                             srch.abort = Some(stop);
+                            srch.tail = tail;
                             srch.path.extend_from_slice(prefix);
                             let last = prefix.last().map(|&m| m as usize).unwrap_or(N_MOVES);
                             let left = len - prefix.len() as u8;
@@ -566,6 +620,7 @@ impl<'a, 'r> Run<'a, 'r> {
             }
             // New (endpoint, frame) pairs, in job order; their candidates are made in
             // parallel (standardising and the phase-2 bounds cost ~30 us each).
+            self.level.found += results.iter().map(|r| r.1.len()).sum::<usize>();
             let mut todo: Vec<(Vec<u8>, usize)> = vec![];
             for (_, eps, _) in results {
                 for (moves, frames) in eps {
@@ -1140,6 +1195,54 @@ mod tests {
             total += old.len();
         }
         assert!(total > 100, "too few reductions to test ({total})");
+    }
+
+    /// A slice (tail b) finds exactly the endpoints of the plain level whose last b moves
+    /// are H moves (not wide quarter turns) after a wide quarter turn (or from the root).
+    #[test]
+    fn slices_are_the_plain_endpoints_with_an_h_tail() {
+        use crate::moves::WIDE_QUARTER;
+        use rand::Rng;
+        let t = load_p1(std::path::Path::new("tables"), false, 8, false);
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(9);
+        let mut checked = 0;
+        for _ in 0..8 {
+            let mut cube = Cube::SOLVED;
+            for _ in 0..rng.gen_range(5..9) {
+                cube = cube.apply_perm(&MOVE_PERMS[rng.gen_range(0..N_MOVES)]);
+            }
+            let root = P1State::from_cube(&cube);
+            let d0 = t.distance(&root);
+            for len in d0..=d0 + 2 {
+                let run = |tail: u8| {
+                    let mut out = vec![];
+                    let mut srch = Search1::new(&t, |p: &[u8], f| {
+                        out.push((p.to_vec(), f));
+                        true
+                    });
+                    srch.tail = tail;
+                    srch.dfs(&root, d0, len, N_MOVES);
+                    drop(srch);
+                    out.sort();
+                    out
+                };
+                let plain = run(0);
+                for b in 1..=3u8.min(len) {
+                    let want: Vec<_> = plain
+                        .iter()
+                        .filter(|(p, _)| {
+                            let a = p.len() - b as usize;
+                            p[a..].iter().all(|&m| WIDE_QUARTER >> m & 1 == 0)
+                                && (a == 0 || WIDE_QUARTER >> p[a - 1] & 1 == 1)
+                        })
+                        .cloned()
+                        .collect();
+                    assert_eq!(run(b), want, "len {len}, tail {b}");
+                    checked += want.len();
+                }
+            }
+        }
+        assert!(checked > 100, "too few slice endpoints to test ({checked})");
     }
 
     /// Jobs cut short at random points, with their handed-back subtrees searched later, find
