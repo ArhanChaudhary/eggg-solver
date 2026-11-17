@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use eggg_solver::cube::{Cube, Facelets};
 use eggg_solver::notation::{Style, format_moves, parse_moves};
-use eggg_solver::solver::{Options, Solution, Solver, Tables, load_tables, verify};
+use eggg_solver::solver::{Options, Solution, Solver, Tables, load_tables_with, verify};
 use rand::SeedableRng;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -85,6 +85,10 @@ struct TableArgs {
     /// Phase-3 H48 table: number of edge-orientation bits (0-11; table size 30 MB * 2^K).
     #[arg(long, value_name = "K", default_value_t = 2)]
     h48: u32,
+    /// Use the joint phase-2 table (tau x U/D centres x PLL parity, 1.05 GB): far fewer
+    /// phase-2 nodes.
+    #[arg(long)]
+    p2_joint: bool,
 }
 
 impl TableArgs {
@@ -279,7 +283,13 @@ fn solve_one(
 fn cmd_solve(a: SolveArgs) -> Result<(), String> {
     let threads = setup_threads(a.search.threads);
     let positions = read_positions(&a.input)?;
-    let tables = load_tables(&a.tables.dir(), a.tables.h48, threads, !a.output.quiet);
+    let tables = load_tables_with(
+        &a.tables.dir(),
+        a.tables.h48,
+        a.tables.p2_joint,
+        threads,
+        !a.output.quiet,
+    );
     let opts = options(&a.limits, &a.search, threads);
     let style = a.output.notation;
     for p in positions {
@@ -326,14 +336,26 @@ fn positions_label_useful(l: &str) -> bool {
 fn cmd_gen(a: GenArgs) -> Result<(), String> {
     let threads = setup_threads(a.threads);
     let t = Instant::now();
-    let _ = load_tables(&a.tables.dir(), a.tables.h48, threads, true);
+    let _ = load_tables_with(
+        &a.tables.dir(),
+        a.tables.h48,
+        a.tables.p2_joint,
+        threads,
+        true,
+    );
     eprintln!("all tables present ({:.1} s)", t.elapsed().as_secs_f64());
     Ok(())
 }
 
 fn cmd_bench(a: BenchArgs) -> Result<(), String> {
     let threads = setup_threads(a.search.threads);
-    let tables = load_tables(&a.tables.dir(), a.tables.h48, threads, true);
+    let tables = load_tables_with(
+        &a.tables.dir(),
+        a.tables.h48,
+        a.tables.p2_joint,
+        threads,
+        true,
+    );
     let mut opts = options(&a.limits, &a.search, threads);
     opts.hard_limit
         .get_or_insert(Duration::from_secs_f64(a.limits.time * 4.0));
@@ -455,7 +477,13 @@ fn cmd_bench3(a: Bench3Args) -> Result<(), String> {
     use eggg_solver::phase3::Search3;
     use rand::Rng;
     let threads = setup_threads(a.threads);
-    let tables = load_tables(&a.tables.dir(), a.tables.h48, threads, true);
+    let tables = load_tables_with(
+        &a.tables.dir(),
+        a.tables.h48,
+        a.tables.p2_joint,
+        threads,
+        true,
+    );
     let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(a.seed);
     let cubes: Vec<Cube3> = (0..a.count)
         .map(|_| {
