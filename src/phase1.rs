@@ -835,9 +835,6 @@ struct BNode {
     path: [u8; 44],
 }
 
-/// Pending batch nodes that start a batch run.
-const BATCH: usize = 32;
-
 /// The table guiding a search ([`Search1::dfs_t`]'s `K`).
 const K_SMALL: u8 = 0;
 const K_BIG: u8 = 1;
@@ -1227,7 +1224,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         t.mask.as_ref().unwrap().pre_index(t, &c, self.pair)
                     };
                     self.push_batch(c, i, dc, m, Some(m as u8));
-                    if self.batch.len() >= BATCH {
+                    if self.batch.len() >= t.mask.as_ref().unwrap().batch {
                         self.run_batch();
                     }
                 } else {

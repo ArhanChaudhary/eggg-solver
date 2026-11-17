@@ -49,6 +49,8 @@ pub struct MaskTable {
     /// Batches also read the masks of nodes one move from the end, so that only their
     /// staging last moves get the wing tests (`EGGG_P1_BATCH_LEAVES` set).
     pub batch_leaves: bool,
+    /// Pending batch nodes that start a batch run (`EGGG_P1_BATCH`, default 32).
+    pub batch: usize,
     big: HugeBuf<u32>,
     red: HugeBuf<u64>,
     /// The pair table: 5 bytes per entry (and 3 bytes of padding).
@@ -119,6 +121,10 @@ impl MaskTable {
         MaskTable {
             kind,
             batch_leaves: std::env::var_os("EGGG_P1_BATCH_LEAVES").is_some(),
+            batch: std::env::var("EGGG_P1_BATCH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32),
             big: HugeBuf::zeroed(1),
             red: HugeBuf::zeroed(1),
             pair: HugeBuf::zeroed(1),
