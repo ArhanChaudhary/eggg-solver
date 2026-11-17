@@ -552,12 +552,24 @@ impl P1State {
         })
     }
 
+    /// The U/D-colour and R/L-colour position masks of the centres.
     #[inline(always)]
     pub fn masks(&self) -> (u32, u32) {
-        let rl = self.centres.bit_mask(1) & MASK24;
-        let fb = self.centres.bit_mask(2) & MASK24;
-        (!(rl | fb) & MASK24, rl)
+        centre_masks(self.centres)
     }
+
+    /// The centre masks of the child after move `m` (those of `self.apply(m, t)`).
+    #[inline(always)]
+    pub fn child_masks(&self, m: usize, t: &P1Tables) -> (u32, u32) {
+        centre_masks(self.centres.gather(&t.centre_idx[m]))
+    }
+}
+
+#[inline(always)]
+fn centre_masks(centres: V32) -> (u32, u32) {
+    let rl = centres.bit_mask(1) & MASK24;
+    let fb = centres.bit_mask(2) & MASK24;
+    (!(rl | fb) & MASK24, rl)
 }
 
 pub struct P1Tables {
@@ -723,37 +735,41 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             }
             return;
         }
-        // Stage 1: children, prefetch of their class info; stage 2: table indices, prefetched;
-        // stage 3: read the values; stage 4: descend into the children that can still reach
-        // the goal.
-        let mut kids: [std::mem::MaybeUninit<(P1State, u64, u8)>; N_MOVES] =
-            [const { std::mem::MaybeUninit::uninit() }; N_MOVES];
-        let mut infos: [*const u32; N_MOVES] = [std::ptr::null(); N_MOVES];
-        let mut rls = [0u32; N_MOVES];
+        // Stage 1: the children's centre masks, and a prefetch of their class info (small
+        // table) or table entry (large table); stage 2 (small table): table indices,
+        // prefetched; stage 3: in move order, descend into the children that can still reach
+        // the goal. Only the table indices are kept: the few children descended into are
+        // rebuilt from `s`.
+        let mut idx = [0u64; N_MOVES];
         let mut nk = 0;
-        while allowed != 0 {
-            let m = allowed.trailing_zeros() as usize;
-            allowed &= allowed - 1;
-            let c = s.apply(m, self.t);
-            let (ud, rl) = c.masks();
-            if self.t.big {
+        let mut a = allowed;
+        if self.t.big {
+            while a != 0 {
+                let m = a.trailing_zeros() as usize;
+                a &= a - 1;
+                let (ud, rl) = s.child_masks(m, self.t);
                 let i = self.t.staging.big_index(ud, rl);
                 self.t.table.prefetch(i);
-                kids[nk].write((c, i, m as u8));
-            } else {
+                idx[nk] = i;
+                nk += 1;
+            }
+        } else {
+            let mut infos: [*const u32; N_MOVES] = [std::ptr::null(); N_MOVES];
+            let mut rls = [0u32; N_MOVES];
+            while a != 0 {
+                let m = a.trailing_zeros() as usize;
+                a &= a - 1;
+                let (ud, rl) = s.child_masks(m, self.t);
                 let p = self.t.staging.info(ud);
                 crate::table::prefetch(p);
                 infos[nk] = p;
                 rls[nk] = rl;
-                kids[nk].write((c, 0, m as u8));
+                nk += 1;
             }
-            nk += 1;
-        }
-        if !self.t.big {
             for k in 0..nk {
                 let i = self.t.staging.fast_index(unsafe { *infos[k] }, rls[k]);
                 self.t.table.prefetch(i);
-                unsafe { kids[k].assume_init_mut() }.1 = i;
+                idx[k] = i;
             }
         }
         self.nodes += nk as u64;
@@ -764,16 +780,27 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             self.stop = true;
             return;
         }
+        // With the large table, each value is read just before it is needed, so that the first
+        // subtrees overlap the later children's table reads; the small table is mostly
+        // cached, and reading all the values first is faster.
         let mut dcs = [0u8; N_MOVES];
-        for k in 0..nk {
-            let (_, i, _) = unsafe { kids[k].assume_init_ref() };
-            dcs[k] = Mod3Table::decode(d, self.t.table.get(*i));
+        if !self.t.big {
+            for k in 0..nk {
+                dcs[k] = Mod3Table::decode(d, self.t.table.get(idx[k]));
+            }
         }
         for k in 0..nk {
-            if dcs[k] < left {
-                let (c, _, m) = unsafe { kids[k].assume_init_ref() };
-                self.path.push(*m);
-                self.dfs(c, dcs[k], left - 1, *m as usize);
+            let m = allowed.trailing_zeros() as usize;
+            allowed &= allowed - 1;
+            let dc = if self.t.big {
+                Mod3Table::decode(d, self.t.table.get(idx[k]))
+            } else {
+                dcs[k]
+            };
+            if dc < left {
+                let c = s.apply(m, self.t);
+                self.path.push(m as u8);
+                self.dfs(&c, dc, left - 1, m);
                 self.path.pop();
                 if self.stop {
                     return;
