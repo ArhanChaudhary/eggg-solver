@@ -306,6 +306,8 @@ impl<'a, 'r> Run<'a, 'r> {
 
     fn rounds(&mut self, endpoints: usize, reductions: usize) {
         let (mut want1, mut want2) = (endpoints.max(1), reductions.max(1));
+        // Time spent producing reductions (phases 1 and 2) and checking them (phase 3).
+        let (mut produce, mut check) = (Duration::ZERO, Duration::ZERO);
         loop {
             if self.stopped() {
                 return;
@@ -331,15 +333,19 @@ impl<'a, 'r> Run<'a, 'r> {
                     self.stats.nodes2
                 ),
             );
-            // Phase 3 may take about twice as long as this round's phases 1 and 2 before the
-            // pool grows again.
-            let budget = (t0.elapsed() * 2).max(Duration::from_millis(20));
-            self.phase3_levels(Instant::now() + budget);
+            produce += t0.elapsed();
+            // Phase 3 gets about 1.5 times the production time so far (shallow levels over the
+            // whole pool are cheap; deep ones wait for a bigger pool).
+            let t1 = Instant::now();
+            let budget =
+                (produce.mul_f64(1.5).saturating_sub(check)).max(Duration::from_millis(10));
+            self.phase3_levels(t1 + budget);
+            check += t1.elapsed();
             if self.stopped() || self.level.len > 40 {
                 return;
             }
-            want1 *= 4;
-            want2 *= 4;
+            want1 *= 2;
+            want2 *= 2;
         }
     }
 
@@ -495,7 +501,9 @@ impl<'a, 'r> Run<'a, 'r> {
 
     /// Phase 2, level by level on the reduction length, until `want` reductions in total.
     fn phase2(&mut self, want: usize) {
-        let cap = self.best_len().saturating_sub(12).min(64);
+        // Reductions are only worth producing if a phase 3 of 15 moves or more could still
+        // beat the best solution.
+        let cap = self.best_len().saturating_sub(16).min(64);
         let mut t12 = self
             .cands
             .iter()
