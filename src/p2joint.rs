@@ -6,9 +6,10 @@
 //! pairing interact strongly; their joint distance is far tighter than the maximum of the two.
 //!
 //! Size: 70 * 12!/2 * 2 states, reduced by the four rotations V = {I, x2, y2, z2} (which keep
-//! the low wing slots low and the U/D axis): the pair (U/D pattern, tau on the four M-slice
-//! edges) is reduced to a class, and the other eight entries of tau, conjugated into the
-//! class representative, are ranked (8!/2). Distances are stored mod 3 in 2 bits.
+//! the low wing slots low and the U/D axis) and the swap of the U and D colours: the pair
+//! (U/D pattern, tau on the four M-slice edges) is reduced to a class, and the other eight
+//! entries of tau, conjugated into the class representative, are ranked (8!/2). Distances
+//! are stored mod 3 in 2 bits (1.05 GB).
 
 use crate::comb::{FACT, perm_rank};
 use crate::cube::{EDGE_POS, GEO, ROTATIONS, centre_slot, mat_apply};
@@ -40,7 +41,7 @@ pub struct Joint {
     /// Class -> raw representative.
     rep: Vec<u32>,
     /// Class -> stabiliser bitmask (bit s: symmetry s fixes the representative), identity
-    /// excluded.
+    /// excluded. Symmetry 2k + c is rotation k of V, with the colour complement if c = 1.
     stab: Vec<u8>,
     pub ud_move: [[u8; 17]; 70],
     pub table: HugeBuf<u64>,
@@ -154,7 +155,13 @@ impl Joint {
                 }
                 ud[r] = p2.rank70(out);
             }
+            // The distance is also invariant under swapping the U and D colours (a recolouring:
+            // the goal has both orientations), and the moves outside the 17 (Lw2 = Rw2 x2...)
+            // map neighbours of a symmetric image to complemented images: the symmetry group
+            // must include the complement.
+            let udc: [u8; 70] = std::array::from_fn(|r| p2.rank70(!p2.unrank70(ud[r])));
             syms.push(Sym { e, ud });
+            syms.push(Sym { e, ud: udc });
         }
         // Classes of (pattern, prefix).
         let mut cls = vec![u32::MAX; N_RAW];
@@ -180,8 +187,8 @@ impl Joint {
                     st |= 1 << k;
                 }
                 if cls[img] == u32::MAX {
-                    // V is abelian and every element is its own inverse.
-                    cls[img] = class << 2 | k as u32;
+                    // The group is abelian and every element is its own inverse.
+                    cls[img] = class << 3 | k as u32;
                 }
             }
             stab.push(st);
@@ -218,20 +225,25 @@ impl Joint {
     #[inline(always)]
     pub fn index(&self, ud: u32, tau: &[u8; 16], pll: u32) -> usize {
         let c = self.cls[ud as usize * N_PREFIX + prefix_rank(tau)];
-        let s = (c & 3) as usize;
+        let s = (c & 7) as usize;
         let r = if s == 0 {
             rest_rank(tau)
         } else {
             rest_rank(&conj(tau, &self.syms[s]))
         };
-        ((c >> 2) as usize * N_REST + r) * 2 + pll as usize
+        ((c >> 3) as usize * N_REST + r) * 2 + pll as usize
+    }
+
+    /// [`Joint::canonical`], for checks.
+    pub fn canonical_pub(&self, ud: u32, tau: &[u8; 16], pll: u32) -> usize {
+        self.canonical(ud, tau, pll)
     }
 
     /// The canonical index (minimum over the stabiliser), used by the generator.
     fn canonical(&self, ud: u32, tau: &[u8; 16], pll: u32) -> usize {
         let c = self.cls[ud as usize * N_PREFIX + prefix_rank(tau)];
-        let class = (c >> 2) as usize;
-        let s = (c & 3) as usize;
+        let class = (c >> 3) as usize;
+        let s = (c & 7) as usize;
         let t = if s == 0 {
             *tau
         } else {
@@ -240,7 +252,7 @@ impl Joint {
         let mut r = rest_rank(&t);
         let st = self.stab[class];
         if st != 0 {
-            for k in 1..4 {
+            for k in 1..8 {
                 if st >> k & 1 == 1 {
                     r = r.min(rest_rank(&conj(&t, &self.syms[k])));
                 }
@@ -315,13 +327,13 @@ impl Joint {
                 }
             }
             match next {
-                Some((u2, t2, p)) => {
+                Some((u2, t2, p)) if d < 40 => {
                     ud = u2;
                     tau = t2;
                     pll = p;
                     d += 1;
                 }
-                None => return d,
+                _ => return d,
             }
         }
     }
@@ -448,6 +460,132 @@ mod tests {
     use super::*;
 
     #[test]
+    fn canonical_decodes_to_its_orbit() {
+        let p2 = P2Tables::base_for_tests();
+        let j = Joint::new(&p2);
+        let mut rng = rand::thread_rng();
+        use rand::Rng;
+        let mut bad = 0;
+        for _ in 0..20000 {
+            let idx = rng.gen_range(0..j.n);
+            let (ud, tau, pll) = j.state(idx);
+            let c = j.canonical(ud, &tau, pll);
+            let (u2, t2, p2b) = j.state(c);
+            if j.canonical(u2, &t2, p2b) != c {
+                bad += 1;
+            }
+        }
+        assert_eq!(
+            bad, 0,
+            "canonical indices that do not decode to their own orbit"
+        );
+    }
+
+    #[test]
+    fn symmetry_reduced_bfs_matches_raw() {
+        let p2 = P2Tables::base_for_tests();
+        let j = Joint::new(&p2);
+        let id: [u8; 16] = std::array::from_fn(|i| i as u8);
+        let goals = [
+            (p2.rank70(0x0f) as u32, id, 0u32),
+            (p2.rank70(0xf0) as u32, id, 0),
+        ];
+        // Raw BFS.
+        let mut raw = std::collections::HashMap::new();
+        let mut fr: Vec<(u32, [u8; 16], u32)> = goals.to_vec();
+        for g in &goals {
+            raw.insert(*g, 0u8);
+        }
+        for d in 1..=4u8 {
+            let mut next = vec![];
+            for &(ud, tau, pll) in &fr {
+                for k in 0..17 {
+                    let s = (
+                        j.ud_move[ud as usize][k] as u32,
+                        p2.tau_move(&tau, k),
+                        pll ^ (WIDE >> k & 1),
+                    );
+                    if !raw.contains_key(&s) {
+                        raw.insert(s, d);
+                        next.push(s);
+                    }
+                }
+            }
+            fr = next;
+        }
+        // Symmetry-reduced BFS over canonical indices.
+        let mut red = std::collections::HashMap::new();
+        let mut fr: Vec<usize> = goals.iter().map(|g| j.canonical(g.0, &g.1, g.2)).collect();
+        for &i in &fr {
+            red.insert(i, 0u8);
+        }
+        for d in 1..=4u8 {
+            let mut next = vec![];
+            for &i in &fr {
+                let (ud, tau, pll) = j.state(i);
+                for k in 0..17 {
+                    let c = j.canonical(
+                        j.ud_move[ud as usize][k] as u32,
+                        &p2.tau_move(&tau, k),
+                        pll ^ (WIDE >> k & 1),
+                    );
+                    if !red.contains_key(&c) {
+                        red.insert(c, d);
+                        next.push(c);
+                    }
+                }
+            }
+            fr = next;
+        }
+        // Which symmetries change raw depths (for states deep enough inside the BFS ball)?
+        let mut per_sym = [0usize; 4];
+        let mut per_sym_nocomp = [0usize; 4];
+        for (s, &d) in &raw {
+            if d > 2 {
+                continue;
+            }
+            for (k, sy) in j.syms.iter().enumerate() {
+                let img = (sy.ud[s.0 as usize] as u32, conj(&s.1, sy), s.2);
+                if raw.get(&img) != Some(&d) {
+                    per_sym[k] += 1;
+                }
+                // Same without the colour complement.
+                let comp = sy.ud[p2.rank70(0x0f) as usize] != p2.rank70(0x0f);
+                let ud2 = if comp {
+                    p2.rank70(!p2.unrank70(sy.ud[s.0 as usize]) as u8) as u32
+                } else {
+                    sy.ud[s.0 as usize] as u32
+                };
+                if raw.get(&(ud2, conj(&s.1, sy), s.2)) != Some(&d) {
+                    per_sym_nocomp[k] += 1;
+                }
+            }
+        }
+        eprintln!(
+            "depth changes per symmetry: {per_sym:?}, without complement: {per_sym_nocomp:?}"
+        );
+        let mut bad = 0;
+        for (s, &d) in &raw {
+            let c = j.canonical(s.0, &s.1, s.2);
+            if red.get(&c) != Some(&d) {
+                bad += 1;
+                if bad <= 4 {
+                    let rep = j.state(c);
+                    eprintln!(
+                        "raw depth {d}, reduced {:?}; rep raw depth {:?}; rep canonical == c: {}; ud {} rep ud {}",
+                        red.get(&c),
+                        raw.get(&rep),
+                        j.canonical(rep.0, &rep.1, rep.2) == c,
+                        s.0,
+                        rep.0
+                    );
+                }
+            }
+        }
+        assert_eq!(bad, 0, "raw states whose canonical entry has another depth");
+    }
+
+    #[test]
     fn raw_level_counts() {
         // Raw BFS over (U/D pattern, tau, PLL bit) from the goals; the counts were measured
         // independently with a separate model of the phase-2 group.
@@ -486,7 +624,7 @@ mod tests {
         let p2 = P2Tables::base_for_tests();
         let j = Joint::new(&p2);
         assert!(
-            j.classes() > 200_000 && j.classes() < 220_000,
+            j.classes() > 100_000 && j.classes() < 110_000,
             "{} classes",
             j.classes()
         );

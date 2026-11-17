@@ -835,7 +835,7 @@ pub fn load_tables_with(
     let mut p2 = p2;
     if joint {
         let mut j = crate::p2joint::Joint::new(&p2);
-        let path = dir.join("p2-joint.tab");
+        let path = dir.join("p2-joint2.tab");
         j.table = crate::table::HugeBuf::zeroed(j.bytes() / 8);
         let bytes = unsafe {
             std::slice::from_raw_parts_mut(
@@ -843,7 +843,7 @@ pub fn load_tables_with(
                 j.bytes(),
             )
         };
-        if crate::table::load(&path, "p2-joint", bytes).is_err() {
+        if crate::table::load(&path, "p2-joint2", bytes).is_err() {
             if verbose {
                 eprintln!(
                     "generating the joint phase-2 table ({:.1} GB)...",
@@ -854,7 +854,7 @@ pub fn load_tables_with(
             let bytes = unsafe {
                 std::slice::from_raw_parts(j.table.as_slice().as_ptr() as *const u8, j.bytes())
             };
-            crate::table::save(&path, "p2-joint", bytes).expect("saving table");
+            crate::table::save(&path, "p2-joint2", bytes).expect("saving table");
         }
         p2.joint = Some(j);
     }

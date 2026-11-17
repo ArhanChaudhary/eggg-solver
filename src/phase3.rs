@@ -116,12 +116,21 @@ impl P3Tables {
     /// (corner-class distance, h48 index) of a cube.
     #[inline(always)]
     fn probe(&self, v: &C3) -> (u8, usize) {
-        let cs = self.coords.cocsep[self.fast.cocsep(v)];
+        let cs = self.corners(v);
+        (cs as u8, self.probe_edges(v, cs))
+    }
+
+    /// The cocsep entry (class << 16 | symmetry << 8 | corner distance) of a cube.
+    #[inline(always)]
+    fn corners(&self, v: &C3) -> u32 {
+        self.coords.cocsep[self.fast.cocsep(v)]
+    }
+
+    /// The h48 index of a cube, given its cocsep entry.
+    #[inline(always)]
+    fn probe_edges(&self, v: &C3, cs: u32) -> usize {
         let (eslot, msplit, eo) = self.fast.edges(v, (cs >> 8 & 255) as usize);
-        (
-            (cs & 255) as u8,
-            self.h48.index(cs >> 16, eslot, msplit, eo),
-        )
+        self.h48.index(cs >> 16, eslot, msplit, eo)
     }
 
     /// Bound of a cube (debugging aid).
@@ -273,7 +282,8 @@ impl<'a> Search3<'a> {
                 };
                 // `own`: the side that moved on the right (its coset changes); `other` moved
                 // on the left.
-                let (oc, oi) = t.probe(&own);
+                let ocs = t.corners(&own);
+                let oc = ocs as u8;
                 if oc >= left {
                     continue;
                 }
@@ -292,6 +302,7 @@ impl<'a> Search3<'a> {
                 if xc >= left || xh >= left {
                     continue;
                 }
+                let oi = t.probe_edges(&own, ocs);
                 t.h48.prefetch(oi);
                 if xi != KNOWN {
                     t.h48.prefetch(xi);
