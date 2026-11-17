@@ -768,10 +768,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
 
     /// [`Search1::dfs`], for the large (`BIG`) or the small table.
     fn dfs_t<const BIG: bool>(&mut self, s: &P1State, d: u8, left: u8, last: usize) {
-        let t = self.t;
         if left == 0 {
             if d == 0 {
-                let frames = t.endpoint_frames(s, last);
+                let frames = self.t.endpoint_frames(s, last);
                 if frames != 0 && !(self.on_endpoint)(&self.path, frames) {
                     self.stop = true;
                 }
@@ -791,9 +790,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 let m = allowed.trailing_zeros() as usize;
                 allowed &= allowed - 1;
                 self.nodes += 1;
-                let pos = t.wing_dst[m].gather(&s.pos);
+                let pos = self.t.wing_dst[m].gather(&s.pos);
                 let mut frames = 0u8;
-                for (f, fr) in t.frames.iter().enumerate() {
+                for (f, fr) in self.t.frames.iter().enumerate() {
                     if fr.p2_mask >> m & 1 == 0 && fr.wings_ok(&pos) {
                         frames |= 1 << f;
                     }
@@ -801,11 +800,11 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 if frames == 0 {
                     continue;
                 }
-                let c = s.apply(m, t);
-                if Mod3Table::decode(d, t.value(&c)) != 0 {
+                let c = s.apply(m, self.t);
+                if Mod3Table::decode(d, self.t.value(&c)) != 0 {
                     continue;
                 }
-                for (f, fr) in t.frames.iter().enumerate() {
+                for (f, fr) in self.t.frames.iter().enumerate() {
                     if frames >> f & 1 == 1 && !fr.centres_ok(&c.centres) {
                         frames &= !(1 << f);
                     }
@@ -822,6 +821,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             }
             return;
         }
+        let t = self.t;
         // Stage 1: the children's centre masks, and a prefetch of their table entry (large
         // table) or class info (small table); stage 2 (small table): table indices,
         // prefetched; stage 3: in move order, descend into the children that can still reach
