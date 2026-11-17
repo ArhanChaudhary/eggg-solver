@@ -11,7 +11,7 @@
 //! entries of tau, conjugated into the class representative, are ranked (8!/2). Distances
 //! are stored mod 3 in 2 bits (1.05 GB).
 
-use crate::comb::{FACT, perm_rank};
+use crate::comb::FACT;
 use crate::cube::{EDGE_POS, GEO, ROTATIONS, centre_slot, mat_apply};
 use crate::moves::MOVE_PERMS;
 use crate::phase2::{P2_MOVES, P2Tables};
@@ -46,6 +46,8 @@ pub(crate) struct Sym {
 pub struct FbView {
     /// U/D pattern rank of the rotated state, by F/B pattern rank.
     fb_ud: [u8; 70],
+    /// F/B pattern rank after each phase-2 move.
+    fb_move: [[u8; 17]; 70],
     sym: Sym,
     /// The rotation takes the low wing slots to the high ones: the rotated pairing is the
     /// conjugate of the inverse of tau.
@@ -101,12 +103,15 @@ pub(crate) fn rest_rank(tau: &[u8; 16]) -> usize {
     for &e in &M_EDGES {
         pm |= 1 << tau[e];
     }
-    let mut p = [0u8; 8];
+    // Lehmer rank in Horner form (no factorial table).
+    let (mut r, mut used) = (0u32, 0u32);
     for (i, &e) in REST.iter().enumerate() {
         let v = tau[e] as u32;
-        p[i] = (v - (pm & ((1 << v) - 1)).count_ones()) as u8;
+        let x = v - (pm & ((1 << v) - 1)).count_ones();
+        r = r * (8 - i as u32) + (!used & ((1 << x) - 1)).count_ones();
+        used |= 1 << x;
     }
-    (perm_rank(&p) / 2) as usize
+    (r / 2) as usize
 }
 
 pub(crate) fn perm8_unrank(mut r: usize) -> [u8; 8] {
@@ -183,8 +188,17 @@ impl FbView {
             e_inv.0[e[i] as usize] = i as u8;
             e_map.0[i] = e[i];
         }
+        let mut fb_move = [[0u8; 17]; 70];
+        for (r, row) in fb_move.iter_mut().enumerate() {
+            let c = p2.centre_cube(r as u32 * 24);
+            for (i, &mv) in P2_MOVES.iter().enumerate() {
+                let cc = p2.centre_coord_of(&c.apply_perm(&MOVE_PERMS[mv as usize]));
+                row[i] = (cc / 24 % 70) as u8;
+            }
+        }
         FbView {
             fb_ud,
+            fb_move,
             sym: Sym {
                 e,
                 ud: [0; 70],
@@ -199,7 +213,13 @@ impl FbView {
     /// bit is unchanged.
     #[inline(always)]
     pub fn map(&self, cc: u32, tau: &[u8; 16]) -> (u32, [u8; 16]) {
-        let ud = self.fb_ud[(cc / 24 % 70) as usize] as u32;
+        self.map_fb(cc / 24 % 70, tau)
+    }
+
+    /// [`FbView::map`] from the F/B pattern rank.
+    #[inline(always)]
+    fn map_fb(&self, fb: u32, tau: &[u8; 16]) -> (u32, [u8; 16]) {
+        let ud = self.fb_ud[fb as usize] as u32;
         let t = if self.inverse {
             let mut inv = [0u8; 16];
             for e in 0..12 {
@@ -223,22 +243,20 @@ impl Joint {
 
     /// Exact F/B-view distance, by walking down the mod-3 table over the phase-2 moves.
     pub fn distance_fb(&self, p2: &P2Tables, cc: u32, tau: &[u8; 16]) -> u8 {
-        let (mut cc, mut tau) = (cc, *tau);
-        let mut d = 0;
-        loop {
-            let v = self.get(self.index_fb(cc, &tau));
-            let next = (0..17)
-                .map(|i| (p2.centre_move[cc as usize][i], p2.tau_move(&tau, i)))
-                .find(|(c2, t2)| self.get(self.index_fb(*c2, t2)) == (v + 2) % 3);
-            match next {
-                Some((c2, t2)) if d < 40 => {
-                    cc = c2;
-                    tau = t2;
-                    d += 1;
-                }
-                _ => return d,
-            }
-        }
+        self.walk(
+            (cc / 24 % 70, *tau, cc & 1),
+            |&(fb, ref tau, pll)| {
+                let (ud, t) = self.fb.map_fb(fb, tau);
+                self.index(ud, &t, pll)
+            },
+            |&(fb, ref tau, pll), i| {
+                (
+                    self.fb.fb_move[fb as usize][i] as u32,
+                    p2.tau_move(tau, i),
+                    pll ^ (WIDE >> i & 1),
+                )
+            },
+        )
     }
 }
 
@@ -453,30 +471,44 @@ impl Joint {
 
     /// Exact distance of a state, by walking down the mod-3 table.
     pub fn distance(&self, p2: &P2Tables, ud: u32, tau: &[u8; 16], pll: u32) -> u8 {
-        let (mut ud, mut tau, mut pll) = (ud, *tau, pll);
-        let mut d = 0;
-        loop {
-            let v = self.get(self.index(ud, &tau, pll));
-            let mut next = None;
-            for i in 0..17 {
-                let t2 = p2.tau_move(&tau, i);
-                let u2 = self.ud_move[ud as usize][i] as u32;
-                let p = pll ^ (WIDE >> i & 1);
-                if self.get(self.index(u2, &t2, p)) == (v + 2) % 3 {
-                    next = Some((u2, t2, p));
-                    break;
+        self.walk(
+            (ud, *tau, pll),
+            |&(ud, ref tau, pll)| self.index(ud, tau, pll),
+            |&(ud, ref tau, pll), i| {
+                (
+                    self.ud_move[ud as usize][i] as u32,
+                    p2.tau_move(tau, i),
+                    pll ^ (WIDE >> i & 1),
+                )
+            },
+        )
+    }
+
+    /// Walk down the mod-3 table from `start` to a goal, each step to the first neighbour one
+    /// closer: the exact distance. (Prefetching all 17 neighbours per step was slower.)
+    #[inline(always)]
+    fn walk<S: Copy>(
+        &self,
+        start: S,
+        idx: impl Fn(&S) -> usize,
+        step: impl Fn(&S, usize) -> S,
+    ) -> u8 {
+        let mut s = start;
+        let mut v = self.get(idx(&s));
+        for d in 0..40 {
+            let want = (v + 2) % 3;
+            match (0..17)
+                .map(|i| step(&s, i))
+                .find(|k| self.get(idx(k)) == want)
+            {
+                Some(k) => {
+                    s = k;
+                    v = want;
                 }
-            }
-            match next {
-                Some((u2, t2, p)) if d < 40 => {
-                    ud = u2;
-                    tau = t2;
-                    pll = p;
-                    d += 1;
-                }
-                _ => return d,
+                None => return d,
             }
         }
+        40
     }
 
     /// Breadth-first generation, in place with 2 bits per entry (3 = not reached yet).

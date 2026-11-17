@@ -162,10 +162,17 @@ struct TableArgs {
     /// whatever the tier.
     #[arg(long)]
     p1_big: bool,
-    /// Use the big joint phase-2 table (tau x U/D x F/B centres x PLL parity, 18.4 GB;
-    /// generated on first use, about an hour on 48 threads).
-    #[arg(long)]
-    p2_big: bool,
+    /// Large joint phase-2 tables (tau x two centre patterns x PLL parity), whatever the
+    /// tier: udrl (U/D x R/L, ~6.3 GB) and/or udfb (U/D x F/B, ~18.4 GB). Generated on first
+    /// use (long).
+    #[arg(long, value_enum, value_delimiter = ',')]
+    p2_big: Vec<BigKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum BigKind {
+    Udrl,
+    Udfb,
 }
 
 impl TableArgs {
@@ -185,16 +192,24 @@ impl TableArgs {
             eprintln!(
                 "tables: h48 h{k}{}{}{} ({:?} tier)",
                 if joint { ", joint phase 2" } else { "" },
-                if self.p2_big {
-                    ", big joint phase 2"
+                if self.p2_big.is_empty() {
+                    String::new()
                 } else {
-                    ""
+                    format!(", large joint phase 2 {:?}", self.p2_big)
                 },
                 if big { ", large phase 1" } else { "" },
                 self.tier.resolve(&self.dir())
             );
         }
-        load_tables_full(&self.dir(), k, joint, big, self.p2_big, threads, verbose)
+        let kinds: Vec<eggg_solver::p2big::Kind> = self
+            .p2_big
+            .iter()
+            .map(|k| match k {
+                BigKind::Udrl => eggg_solver::p2big::Kind::UdRl,
+                BigKind::Udfb => eggg_solver::p2big::Kind::UdFb,
+            })
+            .collect();
+        load_tables_full(&self.dir(), k, joint, big, &kinds, threads, verbose)
     }
 
     fn dir(&self) -> PathBuf {

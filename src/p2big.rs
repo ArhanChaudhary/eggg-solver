@@ -1,16 +1,28 @@
-//! A large joint phase-2 pruning table over the pairing permutation tau, the U/D *and* F/B
-//! centre patterns and the PLL-parity bit: everything of the phase-2 state but the R/L centre
-//! pattern (12 values, covered by the exact centre table), so its bound is close to the exact
-//! phase-2 distance.
+//! Large joint phase-2 pruning tables over the pairing permutation tau, two of the three
+//! centre-pattern coordinates and the PLL-parity bit:
 //!
-//! Size: 70 * 70 * 12!/2 * 2 = 2.35e12 states, reduced by 32 symmetries: the spatial
-//! symmetries (rotations and reflections) that keep the R/L axis and map the low wing slots to
-//! low ones, times the colour swaps U<->D and F<->B (the goal has every orientation of the U/D
-//! and F/B centres once the R/L ones are ignored). The pair of patterns is reduced first, then
-//! the M-slice entries of tau under the pair's stabiliser; the other eight entries are ranked
-//! (8!/2). Distances are stored mod 3 in 2 bits (~18 GB).
+//! * [`Kind::UdRl`]: U/D pattern (70) x R/L pattern (12) x tau x PLL, read twice: directly and
+//!   through the rotation x, which turns the F/B pattern into a U/D one (as the F/B view of the
+//!   1 GB joint table does). 4.0e11 states, 16 symmetries, ~6.3 GB.
+//! * [`Kind::UdFb`]: U/D pattern x F/B pattern x tau x PLL (everything of the phase-2 state but
+//!   the R/L pattern). 2.35e12 states, 32 symmetries, ~18.4 GB.
+//!
+//! Each dominates the 1 GB joint table (tau x U/D x PLL). Measured with their exact values
+//! computed by IDA* (examples/p2deep, ORACLE=...), phase-2 nodes per solution when
+//! enumerating all solutions one move above the bound, relative to the two views of the 1 GB
+//! table: U/D x R/L (both views) 3.8x fewer, U/D x F/B 2.4x fewer, all three 6.6x fewer.
+//!
+//! Symmetries: the spatial symmetries (rotations and reflections) that keep the low wing
+//! slots low and the axes of the two patterns (as a pair: U/D x F/B also has rotoreflections
+//! of order 4 about the R/L axis that swap the U/D and F/B axes), times the colour swaps of
+//! the two patterns (the projected goal has every orientation of the two solved patterns).
+//! The pair of patterns is reduced first, then the M-slice entries of tau under the pair's
+//! stabiliser; the other eight entries are ranked (8!/2). Distances are stored mod 3 in
+//! 2 bits.
 
-use crate::cube::{EDGE_POS, FACE_NORMAL, GEO, Mat, centre_slot, face_of_normal, mat_apply};
+use crate::cube::{
+    B, D, EDGE_POS, F, FACE_NORMAL, GEO, L, Mat, R, U, centre_slot, face_of_normal, mat_apply,
+};
 use crate::p2joint::{
     M_EDGES, N_PREFIX, N_REST, Sym, WIDE, conj, conj_edges, perm8_unrank, prefix_rank,
     prefix_unrank, rest_rank,
@@ -20,33 +32,98 @@ use crate::simd::V32;
 use crate::table::HugeBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-const N_PAIR: usize = 70 * 70;
-const UD_POS: [usize; 8] = [0, 1, 2, 3, 12, 13, 14, 15];
-const FB_POS: [usize; 8] = [8, 9, 10, 11, 20, 21, 22, 23];
+/// Centre positions of the U/D, R/L and F/B orbits (face +, face -).
+const POS: [[usize; 8]; 3] = [
+    [0, 1, 2, 3, 12, 13, 14, 15],
+    [4, 5, 6, 7, 16, 17, 18, 19],
+    [8, 9, 10, 11, 20, 21, 22, 23],
+];
+/// The colour of each orbit marked in its pattern mask, and the other one.
+const FIRST: [usize; 3] = [U, R, F];
+const SECOND: [usize; 3] = [D, L, B];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// U/D x R/L patterns (with the x view: F/B x R/L).
+    UdRl,
+    /// U/D x F/B patterns.
+    UdFb,
+}
+
+impl Kind {
+    /// Orbit (0 U/D, 1 R/L, 2 F/B) of the second pattern.
+    fn second(self) -> usize {
+        match self {
+            Kind::UdRl => 1,
+            Kind::UdFb => 2,
+        }
+    }
+
+    /// Number of values of the second pattern.
+    fn nb(self) -> usize {
+        match self {
+            Kind::UdRl => 12,
+            Kind::UdFb => 70,
+        }
+    }
+
+    pub fn file_name(self) -> &'static str {
+        match self {
+            Kind::UdRl => "p2-big-udrl",
+            Kind::UdFb => "p2-big-udfb",
+        }
+    }
+}
 
 struct BSym {
     /// Edge part (conjugation of tau).
     sym: Sym,
     /// The edge part is the identity (a pure colour swap).
     plain: bool,
-    /// Image of a pattern pair ud * 70 + fb.
+    /// Image of a pattern pair.
     pair: Vec<u16>,
 }
 
+#[derive(Clone, Copy)]
+struct PairEntry {
+    /// Symmetry taking the pair to its class representative.
+    sym: u8,
+    /// The representative has a non-trivial stabiliser.
+    nt: bool,
+    /// Trivial stabiliser: the first class of the pair class (class = base + prefix rank,
+    /// most pairs); otherwise the pair class's offset in `pref_cls`.
+    base: u32,
+}
+
+/// The table read through the rotation x (U/D x R/L only): the state's (F/B, R/L) patterns
+/// become the rotated state's (U/D, R/L) ones, and the rotated pairing is the conjugate of
+/// tau's inverse (x takes the low wing slots to the high ones).
+pub struct View {
+    /// Rotated pattern pair, by fb * 12 + rl.
+    pair: Vec<u16>,
+    sym: Sym,
+    inverse: bool,
+}
+
 pub struct Big {
+    pub kind: Kind,
     syms: Vec<BSym>,
-    /// Pattern pair -> pair class << 5 | symmetry taking the pair to the class representative.
-    pair_cls: Vec<u32>,
-    /// (pair class, M-slice prefix) -> class << 5 | symmetry (in the pair's stabiliser) taking
-    /// the prefix to the class representative.
+    /// Pattern pair -> the symmetry taking it to its class representative, and where its
+    /// classes are.
+    pair_cls: Vec<PairEntry>,
+    /// (pair class with a non-trivial stabiliser, M-slice prefix) -> class << 6 | (the class
+    /// has a non-trivial stabiliser) << 5 | symmetry (in the pair's stabiliser) taking the
+    /// prefix to the class representative.
     pref_cls: Vec<u32>,
     /// Class -> representative (pair, prefix).
     rep: Vec<(u16, u16)>,
     /// Class -> stabiliser of the representative (bit s: symmetry s fixes it), identity
     /// excluded.
     stab: Vec<u32>,
-    pub fb_move: [[u8; 17]; 70],
-    pub ud_move: [[u8; 17]; 70],
+    /// Pattern moves of the two orbits: [pattern][move].
+    a_move: Vec<[u8; 17]>,
+    b_move: Vec<[u8; 17]>,
+    pub view: Option<View>,
     pub table: HugeBuf<u64>,
     pub n: usize,
 }
@@ -73,110 +150,148 @@ fn all_mats() -> Vec<Mat> {
     out
 }
 
+/// Pattern masks of the three orbits (bit i: position `POS[o][i]` holds colour `FIRST[o]`)
+/// after conjugating by `m`: a centre of colour c at position p goes to position m(p) with
+/// colour m(c).
+fn image_masks(m: &Mat, masks: [u8; 3]) -> [u8; 3] {
+    let g = &*GEO;
+    let col = |f: usize| face_of_normal(mat_apply(m, FACE_NORMAL[f]));
+    let mut out = [0u8; 3];
+    for o in 0..3 {
+        for (i, &p) in POS[o].iter().enumerate() {
+            let c = if masks[o] >> i & 1 == 1 {
+                FIRST[o]
+            } else {
+                SECOND[o]
+            };
+            let q = centre_slot(mat_apply(m, g.centre_pos[p]));
+            let (o2, j) = (0..3)
+                .find_map(|o2| POS[o2].iter().position(|&x| x == q).map(|j| (o2, j)))
+                .unwrap();
+            let c2 = col(c);
+            assert!(c2 == FIRST[o2] || c2 == SECOND[o2]);
+            if c2 == FIRST[o2] {
+                out[o2] |= 1 << j;
+            }
+        }
+    }
+    out
+}
+
+/// The edge map of `m` and whether it keeps the low wing slots low (None: it mixes them).
+fn edge_map(p2: &P2Tables, m: &Mat) -> ([u8; 12], Option<bool>) {
+    let g = &*GEO;
+    let mut e = [0u8; 12];
+    let mut lows = 0;
+    for i in 0..12 {
+        let p = mat_apply(m, EDGE_POS[i]);
+        e[i] = EDGE_POS.iter().position(|&q| q == p).unwrap() as u8;
+        let img = crate::cube::wing_slot(mat_apply(m, g.wing_pos[p2.low[i] as usize]));
+        if img as u8 == p2.low[e[i] as usize] {
+            lows += 1;
+        }
+    }
+    let keep = match lows {
+        12 => Some(true),
+        0 => Some(false),
+        _ => None,
+    };
+    (e, keep)
+}
+
+fn edge_sym(e: [u8; 12]) -> Sym {
+    let (mut e_inv, mut e_map) = (V32([0x80; 32]), V32([0; 32]));
+    for i in 0..12 {
+        e_inv.0[e[i] as usize] = i as u8;
+        e_map.0[i] = e[i];
+    }
+    Sym {
+        e,
+        ud: [0; 70],
+        e_inv,
+        e_map,
+    }
+}
+
 impl Big {
+    /// Rank of orbit `o`'s pattern mask (70 for U/D and F/B, 12 for R/L).
+    fn rank(p2: &P2Tables, o: usize, mask: u8) -> usize {
+        let r = if o == 1 {
+            p2.rank12(mask)
+        } else {
+            p2.rank70(mask)
+        };
+        assert!(r != 255, "pattern not allowed");
+        r as usize
+    }
+
+    fn unrank(p2: &P2Tables, o: usize, r: usize) -> u8 {
+        if o == 1 {
+            p2.unrank12(r as u8)
+        } else {
+            p2.unrank70(r as u8)
+        }
+    }
+
     /// Symmetries, classes and move tables (no table data).
-    pub fn new(p2: &P2Tables) -> Big {
-        let g = &*GEO;
+    pub fn new(p2: &P2Tables, kind: Kind) -> Big {
+        let ob = kind.second();
+        let nb = kind.nb();
+        let n_pair = 70 * nb;
         let mut geo: Vec<(Mat, [u8; 12])> = vec![];
         for m in all_mats() {
-            if m[0][0] == 0 {
+            // Keep the R/L axis, and for U/D x R/L also the U/D axis.
+            if m[0][0] == 0 || (kind == Kind::UdRl && m[1][1] == 0) {
                 continue;
             }
-            let mut e = [0u8; 12];
-            let mut lows = 0;
-            for i in 0..12 {
-                let p = mat_apply(&m, EDGE_POS[i]);
-                e[i] = EDGE_POS.iter().position(|&q| q == p).unwrap() as u8;
-                let img = crate::cube::wing_slot(mat_apply(&m, g.wing_pos[p2.low[i] as usize]));
-                if img as u8 == p2.low[e[i] as usize] {
-                    lows += 1;
-                }
-            }
-            assert!(
-                lows == 0 || lows == 12,
-                "a symmetry mixes low and high slots"
-            );
-            if lows == 12 {
+            let (e, keep) = edge_map(p2, &m);
+            assert!(keep.is_some(), "a symmetry mixes low and high slots");
+            if keep == Some(true) {
                 geo.push((m, e));
             }
         }
         // Identity first.
         geo.sort_by_key(|(m, _)| *m != crate::cube::IDENTITY);
-        assert_eq!(geo.len(), 8, "low-keeping symmetries of the R/L axis");
+        assert_eq!(
+            geo.len(),
+            if kind == Kind::UdRl { 4 } else { 8 },
+            "low-keeping symmetries"
+        );
         let mut syms = vec![];
         for (m, e) in &geo {
-            // Pattern pair images: a centre of colour c at position p goes to position m(p)
-            // with colour m(c).
-            let col = |f: usize| face_of_normal(mat_apply(m, FACE_NORMAL[f]));
-            let mut base = vec![0u16; N_PAIR];
-            for (pair, b) in base.iter_mut().enumerate() {
-                let (ud, fb) = (
-                    p2.unrank70((pair / 70) as u8),
-                    p2.unrank70((pair % 70) as u8),
-                );
-                let (mut ud2, mut fb2) = (0u8, 0u8);
-                for (pos, mask, c1, c0) in [
-                    (&UD_POS, ud, crate::cube::U, crate::cube::D),
-                    (&FB_POS, fb, crate::cube::F, crate::cube::B),
-                ] {
-                    for (i, &p) in pos.iter().enumerate() {
-                        let c = if mask >> i & 1 == 1 { c1 } else { c0 };
-                        let q = centre_slot(mat_apply(m, g.centre_pos[p]));
-                        let c2 = col(c);
-                        if let Some(j) = UD_POS.iter().position(|&x| x == q) {
-                            if c2 == crate::cube::U {
-                                ud2 |= 1 << j;
-                            }
-                        } else {
-                            let j = FB_POS.iter().position(|&x| x == q).unwrap();
-                            if c2 == crate::cube::F {
-                                fb2 |= 1 << j;
-                            }
-                        }
-                    }
-                }
-                *b = p2.rank70(ud2) as u16 * 70 + p2.rank70(fb2) as u16;
-            }
-            let (mut e_inv, mut e_map) = (V32([0x80; 32]), V32([0; 32]));
-            for i in 0..12 {
-                e_inv.0[e[i] as usize] = i as u8;
-                e_map.0[i] = e[i];
-            }
+            let base: Vec<(u8, u8)> = (0..n_pair)
+                .map(|pair| {
+                    let mut masks = [0x0fu8; 3];
+                    masks[0] = Self::unrank(p2, 0, pair / nb);
+                    masks[ob] = Self::unrank(p2, ob, pair % nb);
+                    let out = image_masks(m, masks);
+                    (out[0], out[ob])
+                })
+                .collect();
             let plain = *m == crate::cube::IDENTITY;
             for comp in 0..4u32 {
                 let pair = base
                     .iter()
-                    .map(|&x| {
-                        let (mut ud, mut fb) = (x as usize / 70, x as usize % 70);
-                        if comp & 1 == 1 {
-                            ud = p2.rank70(!p2.unrank70(ud as u8)) as usize;
-                        }
-                        if comp & 2 == 2 {
-                            fb = p2.rank70(!p2.unrank70(fb as u8)) as usize;
-                        }
-                        (ud * 70 + fb) as u16
+                    .map(|&(a, b)| {
+                        let a = if comp & 1 == 1 { !a } else { a };
+                        let b = if comp & 2 == 2 { !b } else { b };
+                        (Self::rank(p2, 0, a) * nb + Self::rank(p2, ob, b)) as u16
                     })
                     .collect();
                 syms.push(BSym {
-                    sym: Sym {
-                        e: *e,
-                        ud: [0; 70],
-                        e_inv,
-                        e_map,
-                    },
+                    sym: edge_sym(*e),
                     plain,
                     pair,
                 });
             }
         }
-        // Inverses (the group is not abelian: the rotoreflections about the R/L axis, which
-        // swap the U/D and F/B axes, have order 4).
+        // Inverses (U/D x F/B's group is not abelian).
         let inv: Vec<u32> = syms
             .iter()
             .map(|s| {
                 syms.iter()
                     .position(|t| {
-                        (0..N_PAIR).all(|p| t.pair[s.pair[p] as usize] as usize == p)
+                        (0..n_pair).all(|p| t.pair[s.pair[p] as usize] as usize == p)
                             && (0..12).all(|i| t.sym.e[s.sym.e[i] as usize] as usize == i)
                     })
                     .expect("symmetry without an inverse") as u32
@@ -184,10 +299,10 @@ impl Big {
             .collect();
         let ns = syms.len();
         // Pair classes.
-        let mut pair_cls = vec![u32::MAX; N_PAIR];
+        let mut pair_cls = vec![u32::MAX; n_pair];
         let mut pair_rep = vec![];
         let mut pair_stab = vec![];
-        for p in 0..N_PAIR {
+        for p in 0..n_pair {
             if pair_cls[p] != u32::MAX {
                 continue;
             }
@@ -205,20 +320,34 @@ impl Big {
             }
             pair_stab.push(st);
         }
-        // Prefix classes within each pair class.
-        let mut pref_cls = vec![u32::MAX; pair_rep.len() * N_PREFIX];
+        // Prefix classes within each pair class: one per prefix when the pair's stabiliser is
+        // trivial, else the orbits of the stabiliser.
+        let mut pref_cls = vec![];
         let mut rep = vec![];
         let mut stab = vec![];
+        let mut info = vec![(0u32, false); pair_rep.len()];
         for (c1, &p) in pair_rep.iter().enumerate() {
             let st1 = pair_stab[c1];
+            if st1 == 1 {
+                info[c1] = (rep.len() as u32, false);
+                for pr in 0..N_PREFIX {
+                    rep.push((p as u16, pr as u16));
+                    stab.push(0);
+                }
+                continue;
+            }
+            let off = pref_cls.len();
+            info[c1] = (off as u32, true);
+            pref_cls.resize(off + N_PREFIX, u32::MAX);
             for pr in 0..N_PREFIX {
-                if pref_cls[c1 * N_PREFIX + pr] != u32::MAX {
+                if pref_cls[off + pr] != u32::MAX {
                     continue;
                 }
                 let class = rep.len() as u32;
                 rep.push((p as u16, pr as u16));
                 let pv = prefix_unrank(pr);
                 let mut st = 0u32;
+                let mut imgs = vec![];
                 for (k, s) in syms.iter().enumerate() {
                     if st1 >> k & 1 == 0 {
                         continue;
@@ -231,42 +360,75 @@ impl Big {
                     if img == pr && k != 0 {
                         st |= 1 << k;
                     }
-                    let slot = &mut pref_cls[c1 * N_PREFIX + img];
+                    imgs.push((img, k));
+                }
+                for (img, k) in imgs {
+                    let slot = &mut pref_cls[off + img];
                     if *slot == u32::MAX {
-                        *slot = class << 5 | inv[k];
+                        *slot = class << 6 | ((st != 0) as u32) << 5 | inv[k];
                     }
                 }
                 stab.push(st);
             }
         }
-        assert!(ns <= 32 && rep.len() < 1 << 27);
-        let ud_move = {
-            let mut t = [[0u8; 17]; 70];
-            for (r, row) in t.iter_mut().enumerate() {
-                for (i, x) in row.iter_mut().enumerate() {
-                    *x = (p2.centre_move[r * 1680][i] / 1680) as u8;
+        let pair_cls = pair_cls
+            .iter()
+            .map(|&c| {
+                let (base, nt) = info[(c >> 5) as usize];
+                PairEntry {
+                    sym: (c & 31) as u8,
+                    nt,
+                    base,
                 }
-            }
-            t
+            })
+            .collect();
+        assert!(ns <= 32 && rep.len() < 1 << 26);
+        // Pattern moves, read off the centre coordinate's (((ud * 70 + fb) * 12 + rl) * 2 + pll).
+        let unit = [1680usize, 2, 24];
+        let modulo = [70usize, 12, 70];
+        let moves = |o: usize| -> Vec<[u8; 17]> {
+            (0..modulo[o])
+                .map(|r| {
+                    std::array::from_fn(|i| {
+                        (p2.centre_move[r * unit[o]][i] as usize / unit[o] % modulo[o]) as u8
+                    })
+                })
+                .collect()
         };
-        let fb_move = {
-            let mut t = [[0u8; 17]; 70];
-            for (r, row) in t.iter_mut().enumerate() {
-                for (i, x) in row.iter_mut().enumerate() {
-                    *x = (p2.centre_move[r * 24][i] / 24 % 70) as u8;
-                }
+        let view = (kind == Kind::UdRl).then(|| {
+            let m = *crate::cube::ROTATIONS
+                .iter()
+                .find(|m| m[0][0] == 1 && m[1][1] == 0)
+                .unwrap();
+            let (e, keep) = edge_map(p2, &m);
+            let pair = (0..70 * 12)
+                .map(|x| {
+                    let masks = [
+                        0x0f,
+                        Self::unrank(p2, 1, x % 12),
+                        Self::unrank(p2, 2, x / 12),
+                    ];
+                    let out = image_masks(&m, masks);
+                    (Self::rank(p2, 0, out[0]) * 12 + Self::rank(p2, 1, out[1])) as u16
+                })
+                .collect();
+            View {
+                pair,
+                sym: edge_sym(e),
+                inverse: !keep.expect("x mixes low and high slots"),
             }
-            t
-        };
+        });
         let n = rep.len() * N_REST * 2;
         Big {
+            kind,
             syms,
             pair_cls,
             pref_cls,
             rep,
             stab,
-            fb_move,
-            ud_move,
+            a_move: moves(0),
+            b_move: moves(ob),
+            view,
             table: HugeBuf::zeroed(1),
             n,
         }
@@ -280,42 +442,76 @@ impl Big {
         self.n.div_ceil(32) * 8
     }
 
-    /// The class and the tau conjugated into its representative's frame (one stabiliser
-    /// variant).
+    /// The pattern pair of a full centre coordinate.
     #[inline(always)]
-    fn class_of(&self, pair: usize, tau: &[u8; 16]) -> (usize, [u8; 16]) {
+    fn pair_of(&self, cc: u32) -> usize {
+        match self.kind {
+            Kind::UdRl => (cc / 1680 * 12 + cc / 2 % 12) as usize,
+            Kind::UdFb => (cc / 24) as usize,
+        }
+    }
+
+    /// The class, the tau conjugated into its representative's frame (one stabiliser
+    /// variant) and whether the class has a non-trivial stabiliser.
+    #[inline(always)]
+    fn class_of(&self, pair: usize, tau: &[u8; 16]) -> (usize, [u8; 16], bool) {
         let c = self.pair_cls[pair];
-        let s1 = &self.syms[(c & 31) as usize];
+        let s1 = &self.syms[c.sym as usize];
         let t1 = if s1.plain {
             *tau
         } else {
             conj_edges(tau, &s1.sym)
         };
-        let k = self.pref_cls[(c >> 5) as usize * N_PREFIX + prefix_rank(&t1)];
+        if !c.nt {
+            return (c.base as usize + prefix_rank(&t1), t1, false);
+        }
+        let k = self.pref_cls[c.base as usize + prefix_rank(&t1)];
         let s2 = &self.syms[(k & 31) as usize];
         let t2 = if s2.plain {
             t1
         } else {
             conj_edges(&t1, &s2.sym)
         };
-        ((k >> 5) as usize, t2)
+        ((k >> 6) as usize, t2, k >> 5 & 1 == 1)
     }
 
-    /// Table index from the full phase-2 centre coordinate and tau (one stabiliser variant;
-    /// the table holds the same value in all of them).
+    /// Table index of (pattern pair, tau, PLL bit) (one stabiliser variant; the table holds
+    /// the same value in all of them).
+    #[inline(always)]
+    fn index_pair(&self, pair: usize, tau: &[u8; 16], pll: u32) -> usize {
+        let (class, t, _) = self.class_of(pair, tau);
+        (class * N_REST + rest_rank(&t)) * 2 + pll as usize
+    }
+
+    /// Table index from the full phase-2 centre coordinate and tau.
     #[inline(always)]
     pub fn index(&self, cc: u32, tau: &[u8; 16]) -> usize {
-        let pair = (cc / 24) as usize;
-        let (class, t) = self.class_of(pair, tau);
-        (class * N_REST + rest_rank(&t)) * 2 + (cc & 1) as usize
+        self.index_pair(self.pair_of(cc), tau, cc & 1)
+    }
+
+    /// Table index of the x view of a state (U/D x R/L only).
+    #[inline(always)]
+    pub fn index_view(&self, cc: u32, tau: &[u8; 16]) -> usize {
+        let v = self.view.as_ref().unwrap();
+        let pair = v.pair[(cc / 24 % 70 * 12 + cc / 2 % 12) as usize] as usize;
+        let t = if v.inverse {
+            let mut inv = [0u8; 16];
+            for e in 0..12 {
+                inv[tau[e] as usize] = e as u8;
+            }
+            conj_edges(&inv, &v.sym)
+        } else {
+            conj_edges(tau, &v.sym)
+        };
+        self.index_pair(pair, &t, cc & 1)
     }
 
     /// The canonical index (minimum over the stabiliser), used by the generator.
     fn canonical(&self, pair: usize, tau: &[u8; 16], pll: u32) -> usize {
-        let (class, t) = self.class_of(pair, tau);
+        let (class, t, nt) = self.class_of(pair, tau);
         let mut r = rest_rank(&t);
-        let st = self.stab[class];
-        if st != 0 {
+        if nt {
+            let st = self.stab[class];
             for k in 1..self.syms.len() {
                 if st >> k & 1 == 1 {
                     r = r.min(rest_rank(&conj(&t, &self.syms[k].sym)));
@@ -374,31 +570,70 @@ impl Big {
         crate::table::prefetch(unsafe { self.table.as_ptr().add(i >> 5) });
     }
 
-    /// Exact distance of a state (full centre coordinate `cc`), by walking down the table.
-    pub fn distance(&self, p2: &P2Tables, cc: u32, tau: &[u8; 16]) -> u8 {
-        let (mut cc, mut tau) = (cc, *tau);
-        let mut d = 0;
-        loop {
-            let v = self.get(self.index(cc, &tau));
+    /// The neighbour of (pattern pair, tau, PLL bit) by phase-2 move `k`.
+    #[inline(always)]
+    fn step(
+        &self,
+        p2: &P2Tables,
+        (pair, tau, pll): (usize, &[u8; 16], u32),
+        k: usize,
+    ) -> (usize, [u8; 16], u32) {
+        let nb = self.kind.nb();
+        (
+            self.a_move[pair / nb][k] as usize * nb + self.b_move[pair % nb][k] as usize,
+            p2.tau_move(tau, k),
+            pll ^ (WIDE >> k & 1),
+        )
+    }
+
+    /// Exact distance of (pattern pair, tau, PLL bit), by walking down the table: each step
+    /// to the first neighbour one closer.
+    fn walk(&self, p2: &P2Tables, pair: usize, tau: &[u8; 16], pll: u32) -> u8 {
+        let (mut pair, mut tau, mut pll) = (pair, *tau, pll);
+        let mut v = self.get(self.index_pair(pair, &tau, pll));
+        for d in 0..40 {
+            let want = (v + 2) % 3;
             let next = (0..17)
-                .map(|i| (p2.centre_move[cc as usize][i], p2.tau_move(&tau, i)))
-                .find(|(c2, t2)| self.get(self.index(*c2, t2)) == (v + 2) % 3);
+                .map(|k| self.step(p2, (pair, &tau, pll), k))
+                .find(|(p, t, l)| self.get(self.index_pair(*p, t, *l)) == want);
             match next {
-                Some((c2, t2)) if d < 40 => {
-                    cc = c2;
-                    tau = t2;
-                    d += 1;
+                Some((p, t, l)) => {
+                    (pair, tau, pll) = (p, t, l);
+                    v = want;
                 }
-                _ => return d,
+                None => return d,
             }
         }
+        40
+    }
+
+    /// Exact distance of a state (full centre coordinate `cc`).
+    pub fn distance(&self, p2: &P2Tables, cc: u32, tau: &[u8; 16]) -> u8 {
+        self.walk(p2, self.pair_of(cc), tau, cc & 1)
+    }
+
+    /// Exact distance of the x view of a state (U/D x R/L only).
+    pub fn distance_view(&self, p2: &P2Tables, cc: u32, tau: &[u8; 16]) -> u8 {
+        // Walk in the view's own frame: the view of a state is a state of the table, and the
+        // distance is a distance in the rotated (same) move graph.
+        let v = self.view.as_ref().unwrap();
+        let pair = v.pair[(cc / 24 % 70 * 12 + cc / 2 % 12) as usize] as usize;
+        let t = if v.inverse {
+            let mut inv = [0u8; 16];
+            for e in 0..12 {
+                inv[tau[e] as usize] = e as u8;
+            }
+            conj_edges(&inv, &v.sym)
+        } else {
+            conj_edges(tau, &v.sym)
+        };
+        self.walk(p2, pair, &t, cc & 1)
     }
 
     #[inline(always)]
     fn neighbour(&self, p2: &P2Tables, pair: usize, tau: &[u8; 16], pll: u32, k: usize) -> usize {
-        let (ud, fb) = (pair / 70, pair % 70);
-        let pair2 = self.ud_move[ud][k] as usize * 70 + self.fb_move[fb][k] as usize;
-        self.canonical(pair2, &p2.tau_move(tau, k), pll ^ (WIDE >> k & 1))
+        let (p, t, l) = self.step(p2, (pair, tau, pll), k);
+        self.canonical(p, &t, l)
     }
 
     /// The 17 neighbours' canonical indices of entry `idx`, xored (to time the generator's
@@ -407,6 +642,18 @@ impl Big {
     pub fn probe(&self, p2: &P2Tables, idx: usize) -> usize {
         let (pair, tau, pll) = self.state(idx);
         (0..17).fold(0, |a, k| a ^ self.neighbour(p2, pair, &tau, pll, k))
+    }
+
+    /// The goal pairs: both patterns solved, either way round.
+    fn goal_pairs(&self, p2: &P2Tables) -> Vec<usize> {
+        let ob = self.kind.second();
+        let mut out = vec![];
+        for a in [0x0fu8, 0xf0] {
+            for b in [0x0fu8, 0xf0] {
+                out.push(Self::rank(p2, 0, a) * self.kind.nb() + Self::rank(p2, ob, b));
+            }
+        }
+        out
     }
 
     /// Breadth-first generation, in place with 2 bits per entry (3 = not reached yet).
@@ -432,11 +679,9 @@ impl Big {
         };
         let id: [u8; 16] = std::array::from_fn(|i| i as u8);
         let mut count = 0usize;
-        for ud in [p2.rank70(0x0f), p2.rank70(0xf0)] {
-            for fb in [p2.rank70(0x0f), p2.rank70(0xf0)] {
-                if set(self.canonical(ud as usize * 70 + fb as usize, &id, 0), 0) {
-                    count += 1;
-                }
+        for g in self.goal_pairs(p2) {
+            if set(self.canonical(g, &id, 0), 0) {
+                count += 1;
             }
         }
         let mut frontier = count;
@@ -472,14 +717,14 @@ impl Big {
                                     }
                                 } else if v == 3 {
                                     let (pair, tau, pll) = self.state(i);
-                                    // All neighbours' entries prefetched, then checked.
-                                    let mut js = [0usize; 17];
-                                    for (k, j) in js.iter_mut().enumerate() {
-                                        *j = self.neighbour(p2, pair, &tau, pll, k);
-                                        crate::table::prefetch(&w[*j >> 5]);
-                                    }
-                                    if js.iter().any(|&j| get(j) == code) && set(i, next_code) {
-                                        local += 1;
+                                    for k in 0..17 {
+                                        let j = self.neighbour(p2, pair, &tau, pll, k);
+                                        if get(j) == code {
+                                            if set(i, next_code) {
+                                                local += 1;
+                                            }
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -493,7 +738,8 @@ impl Big {
             d += 1;
             if verbose {
                 eprintln!(
-                    "  big phase-2 table depth {d}: {frontier} ({count} of {n}, {:.1} s)",
+                    "  {:?} phase-2 table depth {d}: {frontier} ({count} of {n}, {:.1} s)",
+                    self.kind,
                     t0.elapsed().as_secs_f64()
                 );
             }
@@ -523,12 +769,11 @@ mod tests {
     use crate::moves::MOVE_PERMS;
     use crate::phase2::P2_MOVES;
 
-    #[test]
-    fn classes_and_symmetry() {
+    fn check_classes(kind: Kind) {
         let p2 = P2Tables::build_centres_for_tests();
-        let b = Big::new(&p2);
+        let b = Big::new(&p2, kind);
         eprintln!(
-            "{} syms, {} classes, {} entries, {:.1} GB",
+            "{kind:?}: {} syms, {} classes, {} entries, {:.2} GB",
             b.syms.len(),
             b.classes(),
             b.n,
@@ -552,56 +797,85 @@ mod tests {
                 );
             }
             // The fast index is one of the stabiliser variants.
-            let cc = (pair * 12 * 2) as u32 + pll;
-            let (p3, t3, l3) = b.state(b.index(cc, &tau));
+            let (p3, t3, l3) = b.state(b.index_pair(pair, &tau, pll));
             assert_eq!(b.canonical(p3, &t3, l3), c);
         }
     }
 
     #[test]
-    fn moves_match_cube() {
-        // The pattern-pair moves agree with the cube.
+    fn classes_and_symmetry_udfb() {
+        check_classes(Kind::UdFb);
+    }
+
+    #[test]
+    fn classes_and_symmetry_udrl() {
+        check_classes(Kind::UdRl);
+    }
+
+    #[test]
+    fn moves_and_views_match_cube() {
+        // The pattern-pair moves agree with the cube, and the x view is the rotated cube.
+        use crate::moves::Conj;
         let p2 = P2Tables::build_centres_for_tests();
-        let b = Big::new(&p2);
+        let bs = [Big::new(&p2, Kind::UdFb), Big::new(&p2, Kind::UdRl)];
+        let m = *crate::cube::ROTATIONS
+            .iter()
+            .find(|m| m[0][0] == 1 && m[1][1] == 0)
+            .unwrap();
+        let cj = Conj::new(m);
         let mut rng = rand::thread_rng();
         use rand::Rng;
         let mut c = crate::cube::Cube::SOLVED;
         for _ in 0..2000 {
             let i = rng.gen_range(0..17);
             let cc = p2.centre_coord_of(&c);
-            let (ud, fb) = ((cc / 1680) as usize, (cc / 24 % 70) as usize);
+            let tau = p2.tau_of(&c);
+            for b in &bs {
+                let pair = b.pair_of(cc);
+                let c2 = c.apply_perm(&MOVE_PERMS[P2_MOVES[i] as usize]);
+                let cc2 = p2.centre_coord_of(&c2);
+                let s = b.step(&p2, (pair, &tau, cc & 1), i);
+                assert_eq!(s.0, b.pair_of(cc2));
+                assert_eq!(s.2, cc2 & 1);
+            }
+            // The view: the rotated cube's own (U/D, R/L) pair and tau.
+            let b = &bs[1];
+            let y = cj.apply(&c);
+            let mut masks = [0u8; 3];
+            for o in 0..2 {
+                for (k, &p) in POS[o].iter().enumerate() {
+                    if y.ct[p] / 4 == FIRST[o] as u8 {
+                        masks[o] |= 1 << k;
+                    }
+                }
+            }
+            let want = b.index_pair(
+                Big::rank(&p2, 0, masks[0]) * 12 + Big::rank(&p2, 1, masks[1]),
+                &p2.tau_of(&y),
+                crate::phase2::pll_parity(&y, &p2.low),
+            );
+            let (pw, tw, lw) = b.state(want);
+            let (pv, tv, lv) = b.state(b.index_view(cc, &tau));
+            assert_eq!(b.canonical(pw, &tw, lw), b.canonical(pv, &tv, lv));
             c = c.apply_perm(&MOVE_PERMS[P2_MOVES[i] as usize]);
-            let cc2 = p2.centre_coord_of(&c);
-            assert_eq!(b.ud_move[ud][i] as u32, cc2 / 1680);
-            assert_eq!(b.fb_move[fb][i] as u32, cc2 / 24 % 70);
         }
     }
 
-    #[test]
-    fn symmetry_reduced_bfs_matches_raw() {
+    fn reduced_bfs_matches_raw(kind: Kind, depth: u8) {
         let p2 = P2Tables::build_centres_for_tests();
-        let b = Big::new(&p2);
+        let b = Big::new(&p2, kind);
         let id: [u8; 16] = std::array::from_fn(|i| i as u8);
-        let mut goals = vec![];
-        for ud in [p2.rank70(0x0f), p2.rank70(0xf0)] {
-            for fb in [p2.rank70(0x0f), p2.rank70(0xf0)] {
-                goals.push((ud as usize * 70 + fb as usize, id, 0u32));
-            }
-        }
+        let goals: Vec<(usize, [u8; 16], u32)> =
+            b.goal_pairs(&p2).into_iter().map(|g| (g, id, 0)).collect();
         let step = |&(pair, tau, pll): &(usize, [u8; 16], u32), k: usize| {
-            let (ud, fb) = (pair / 70, pair % 70);
-            (
-                b.ud_move[ud][k] as usize * 70 + b.fb_move[fb][k] as usize,
-                p2.tau_move(&tau, k),
-                pll ^ (WIDE >> k & 1),
-            )
+            b.step(&p2, (pair, &tau, pll), k)
         };
         let mut raw = std::collections::HashMap::new();
         let mut fr = goals.clone();
         for g in &goals {
             raw.insert(*g, 0u8);
         }
-        for d in 1..=4u8 {
+        for d in 1..=depth {
             let mut next = vec![];
             for s in &fr {
                 for k in 0..17 {
@@ -619,7 +893,7 @@ mod tests {
         for &i in &fr {
             red.insert(i, 0u8);
         }
-        for d in 1..=4u8 {
+        for d in 1..=depth {
             let mut next = vec![];
             for &i in &fr {
                 let s = b.state(i);
@@ -641,5 +915,16 @@ mod tests {
             }
         }
         assert_eq!(bad, 0, "raw states whose canonical entry has another depth");
+        eprintln!("{kind:?}: {} raw states to depth {depth} agree", raw.len());
+    }
+
+    #[test]
+    fn symmetry_reduced_bfs_matches_raw_udfb() {
+        reduced_bfs_matches_raw(Kind::UdFb, 5);
+    }
+
+    #[test]
+    fn symmetry_reduced_bfs_matches_raw_udrl() {
+        reduced_bfs_matches_raw(Kind::UdRl, 5);
     }
 }
