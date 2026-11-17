@@ -82,6 +82,9 @@ pub struct Staging {
     stab: Vec<Vec<u8>>,
     /// Mask permutation tables: sym_perm[s][byte][value].
     sym_perm: Vec<[[u32; 256]; 3]>,
+    /// The symmetries as byte gathers (position i of the image is position sym_gather[s][i]
+    /// of the source; positions 24.. fixed), padded to 256 so that any info byte indexes it.
+    sym_gather: Box<[V32; 256]>,
     move_perm: Vec<[[u32; 256]; 3]>,
     /// Unlabelled rank of an 8-of-16 mask (x and its complement share a rank).
     unl: Box<[u16; 1 << 16]>,
@@ -203,6 +206,14 @@ impl Staging {
             }
         }
         assert_eq!(unl_inv.len(), N_SPLIT);
+        let mut sym_gather: Box<[V32; 256]> = vec![V32(std::array::from_fn(|i| i as u8)); 256]
+            .try_into()
+            .unwrap();
+        for (g, p) in sym_gather.iter_mut().zip(&syms) {
+            for j in 0..24 {
+                g.0[p[j] as usize] = j as u8;
+            }
+        }
         Staging {
             a_info: {
                 // Huge pages: this table is read at random for every child.
@@ -213,6 +224,7 @@ impl Staging {
             class_rep,
             stab,
             sym_perm,
+            sym_gather,
             move_perm,
             unl,
             unl_inv,
@@ -263,6 +275,16 @@ impl Staging {
         let s = (info & 255) as usize;
         let b = apply_mask(&self.sym_perm[s], rl);
         let rem = !self.class_rep[class] & MASK24;
+        (class * N_SPLIT + self.unl[pext(b, rem) as u16 as usize] as usize) as u64
+    }
+
+    /// [`Staging::fast_index`] from the flags of the centres (see [`P1State::centre_flags`]).
+    #[inline(always)]
+    fn fast_index_flags(&self, info: u32, flags: &V32) -> u64 {
+        let class = (info >> 8) as usize;
+        let h = flags.gather(&self.sym_gather[(info & 255) as usize]);
+        let b = crate::simd::movemask(&h);
+        let rem = crate::simd::movemask(&crate::simd::add(&h, &h));
         (class * N_SPLIT + self.unl[pext(b, rem) as u16 as usize] as usize) as u64
     }
 
@@ -595,19 +617,24 @@ impl P1State {
     }
 }
 
-/// The U/D-colour, other-colour and R/L-colour position masks of the centres after move `m`,
-/// from the parent's [`P1State::centre_flags`].
+/// The [`P1State::centre_flags`] of the child after move `m`, from the parent's.
 ///
 /// # Safety
 /// `m < N_MOVES`.
 #[inline(always)]
-unsafe fn child_masks(flags: &V32, m: usize, t: &P1Tables) -> (u32, u32, u32) {
+unsafe fn child_flags(flags: &V32, m: usize, t: &P1Tables) -> V32 {
     debug_assert!(m < N_MOVES);
-    let g = flags.gather(unsafe { t.centre_idx.get_unchecked(m) });
-    let rl = crate::simd::movemask(&g);
-    let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
+    flags.gather(unsafe { t.centre_idx.get_unchecked(m) })
+}
+
+/// The U/D-colour, other-colour and R/L-colour position masks of centres, from their
+/// [`P1State::centre_flags`].
+#[inline(always)]
+fn flag_masks(g: &V32) -> (u32, u32, u32) {
+    let rl = crate::simd::movemask(g);
+    let nud = crate::simd::movemask(&crate::simd::add(g, g));
     debug_assert!((rl | nud) >> 24 == 0);
-    (nud ^ MASK24, nud, rl)
+    (!nud & MASK24, nud, rl)
 }
 
 #[inline(always)]
@@ -811,7 +838,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             while a != 0 {
                 let m = a.trailing_zeros() as usize;
                 a &= a - 1;
-                let (ud, nud, rl) = unsafe { child_masks(&flags, m, t) };
+                let (ud, nud, rl) = flag_masks(&unsafe { child_flags(&flags, m, t) });
                 let i = t.staging.big_index_n(ud, nud, rl);
                 t.table.prefetch(i);
                 unsafe { *idx.get_unchecked_mut(nk) = i };
@@ -819,21 +846,21 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             }
         } else {
             let mut infos: [*const u32; N_MOVES] = [std::ptr::null(); N_MOVES];
-            let mut rls = [0u32; N_MOVES];
+            let mut gs = [V32::ZERO; N_MOVES];
             while a != 0 {
                 let m = a.trailing_zeros() as usize;
                 a &= a - 1;
-                let (ud, _, rl) = unsafe { child_masks(&flags, m, t) };
-                let p = t.staging.info(ud);
+                let g = unsafe { child_flags(&flags, m, t) };
+                let p = t.staging.info(flag_masks(&g).0);
                 crate::table::prefetch(p);
                 unsafe {
                     *infos.get_unchecked_mut(nk) = p;
-                    *rls.get_unchecked_mut(nk) = rl;
+                    *gs.get_unchecked_mut(nk) = g;
                 }
                 nk += 1;
             }
-            for ((i, &p), &rl) in idx.iter_mut().zip(&infos[..nk]).zip(&rls) {
-                *i = t.staging.fast_index(unsafe { *p }, rl);
+            for ((i, &p), g) in idx.iter_mut().zip(&infos[..nk]).zip(&gs) {
+                *i = t.staging.fast_index_flags(unsafe { *p }, g);
                 t.table.prefetch(*i);
             }
         }
@@ -913,13 +940,16 @@ mod tests {
                 for m in 0..N_MOVES {
                     let c = s.apply(m, &t);
                     let (ud, rl) = c.masks();
-                    assert_eq!(
-                        unsafe { child_masks(&flags, m, &t) },
-                        (ud, !ud & MASK24, rl)
-                    );
+                    let g = unsafe { child_flags(&flags, m, &t) };
+                    assert_eq!(flag_masks(&g), (ud, !ud & MASK24, rl));
                     assert_eq!(
                         t.staging.big_index_n(ud, !ud & MASK24, rl),
                         t.staging.big_index(ud, rl)
+                    );
+                    let info = unsafe { *t.staging.info(ud) };
+                    assert_eq!(
+                        t.staging.fast_index_flags(info, &g),
+                        t.staging.fast_index(info, rl)
                     );
                 }
                 s = s.apply((step * 7 + 3) % N_MOVES, &t);
