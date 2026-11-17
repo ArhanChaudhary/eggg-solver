@@ -627,15 +627,16 @@ impl P1Tables {
         }
     }
 
-    /// Which frames accept this staged state as an endpoint (bit f), given the last move.
+    /// Which frames accept this staged state as an endpoint (bit f), given the trailing run
+    /// of same-axis moves of its path ([`trailing_run`]).
     #[inline]
-    pub fn endpoint_frames(&self, s: &P1State, last: usize) -> u8 {
+    pub fn endpoint_frames(&self, s: &P1State, run: u32) -> u8 {
         if s.parity {
             return 0;
         }
         let mut out = 0;
         for (f, fr) in self.frames.iter().enumerate() {
-            if last < N_MOVES && fr.p2_mask >> last & 1 == 1 {
+            if fr.p2_mask & run != 0 {
                 continue;
             }
             if fr.wings_ok(&s.pos) && fr.centres_ok(&s.centres) {
@@ -644,6 +645,19 @@ impl P1Tables {
         }
         out
     }
+}
+
+/// The moves (a bit per move index) of the trailing run of same-axis moves of `path`.
+#[inline]
+pub fn trailing_run(path: &[u8]) -> u32 {
+    let mut run = 0;
+    if let Some(&last) = path.last() {
+        let axis = (last / 3) % 3;
+        for &m in path.iter().rev().take_while(|&&m| (m / 3) % 3 == axis) {
+            run |= 1 << m;
+        }
+    }
+    run
 }
 
 /// Depth-first search for phase-1 endpoints of exactly `depth` moves below a node.
@@ -672,7 +686,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     pub fn dfs(&mut self, s: &P1State, d: u8, left: u8, last: usize) {
         if left == 0 {
             if d == 0 {
-                let frames = self.t.endpoint_frames(s, last);
+                let frames = self.t.endpoint_frames(s, trailing_run(&self.path));
                 if frames != 0 && !(self.on_endpoint)(&self.path, frames) {
                     self.stop = true;
                 }
@@ -682,20 +696,28 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         let mut allowed = ALLOWED_AFTER[last];
         if left == 1 {
             // The last move must leave the wing permutation even, and the wings pairable in a
-            // frame where it is not a phase-2 move: both are tested before the centres.
+            // frame where the path's trailing run of same-axis moves has no phase-2 move (else
+            // the shorter endpoint without them, with them opening phase 2, covers it): both
+            // are tested before the centres.
             allowed &= if s.parity {
                 WIDE_QUARTER
             } else {
                 !WIDE_QUARTER
             };
+            let run = trailing_run(&self.path);
             while allowed != 0 {
                 let m = allowed.trailing_zeros() as usize;
                 allowed &= allowed - 1;
                 self.nodes += 1;
                 let pos = self.t.wing_dst[m].gather(&s.pos);
+                let run_m = if last < N_MOVES && (m / 3) % 3 == (last / 3) % 3 {
+                    run | 1 << m
+                } else {
+                    1 << m
+                };
                 let mut frames = 0u8;
                 for (f, fr) in self.t.frames.iter().enumerate() {
-                    if fr.p2_mask >> m & 1 == 0 && fr.wings_ok(&pos) {
+                    if fr.p2_mask & run_m == 0 && fr.wings_ok(&pos) {
                         frames |= 1 << f;
                     }
                 }
