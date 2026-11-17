@@ -39,6 +39,9 @@ pub enum MaskKind {
 
 pub struct MaskTable {
     pub kind: MaskKind,
+    /// Batches also read the masks of nodes one move from the end, so that only their
+    /// staging last moves get the wing tests (`EGGG_P1_BATCH_LEAVES` set).
+    pub batch_leaves: bool,
     big: HugeBuf<u32>,
     red: HugeBuf<u64>,
     /// Per symmetry, per byte of a stored 36-bit mask: the searched state's 27-bit mask.
@@ -104,6 +107,7 @@ impl MaskTable {
     fn empty(kind: MaskKind) -> MaskTable {
         MaskTable {
             kind,
+            batch_leaves: std::env::var_os("EGGG_P1_BATCH_LEAVES").is_some(),
             big: HugeBuf::zeroed(1),
             red: HugeBuf::zeroed(1),
             conj: vec![],

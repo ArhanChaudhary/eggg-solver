@@ -925,13 +925,19 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 self.reads += 1;
                 self.path.clear();
                 self.path.extend_from_slice(&nd.path[..nd.plen as usize]);
-                if nd.left == 2 {
+                if nd.left == 1 {
+                    self.leaf(&nd.s, 1, nd.last as usize, Some(a));
+                    if self.stop {
+                        self.batch.clear();
+                        return;
+                    }
+                } else if nd.left == 2 && !mt.batch_leaves {
                     while a != 0 {
                         let m = a.trailing_zeros() as usize;
                         a &= a - 1;
                         let c = nd.s.apply(m, t);
                         self.path.push(m as u8);
-                        self.leaf(&c, 1, m);
+                        self.leaf(&c, 1, m, None);
                         self.path.pop();
                         if self.stop {
                             self.batch.clear();
@@ -952,6 +958,17 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             }
             cur.clear();
             self.batch_next = cur;
+        }
+    }
+
+    /// The fewest moves left of a node queued for a batch (1 if the batches also read the
+    /// masks of nodes one move from the end, to test only their staging last moves).
+    #[inline(always)]
+    fn batch_min_left(&self) -> u8 {
+        if self.t.mask.as_ref().is_some_and(|m| m.batch_leaves) {
+            1
+        } else {
+            2
         }
     }
 
@@ -983,12 +1000,13 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     }
 
     /// The last move below `s` (exact distance `d`, one move left): endpoint tests.
-    fn leaf(&mut self, s: &P1State, d: u8, last: usize) {
+    /// `staging`: the moves that stage the centres, if known (from a move mask, `d` = 1).
+    fn leaf(&mut self, s: &P1State, d: u8, last: usize, staging: Option<u32>) {
         // The last move must leave the wing permutation even, and the wings pairable in a
         // frame where the path's trailing run of same-axis moves has no phase-2 move (else
         // the shorter endpoint without them, with them opening phase 2, covers it): both
         // are tested before the centres.
-        let mut allowed = ALLOWED_AFTER[last];
+        let mut allowed = ALLOWED_AFTER[last] & staging.unwrap_or(u32::MAX);
         allowed &= if s.parity {
             WIDE_QUARTER
         } else {
@@ -1015,9 +1033,11 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 continue;
             }
             let c = s.apply(m, self.t);
-            self.reads += 1;
-            if Mod3Table::decode(d, self.value(&c)) != 0 {
-                continue;
+            if staging.is_none() {
+                self.reads += 1;
+                if Mod3Table::decode(d, self.value(&c)) != 0 {
+                    continue;
+                }
             }
             frames &= self.t.pair_frames(&c.centres, self.pair);
             for (f, fr) in self.t.frames.iter().enumerate() {
@@ -1051,7 +1071,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             return;
         }
         if left == 1 {
-            self.leaf(s, d, last);
+            self.leaf(s, d, last, None);
             return;
         }
         if K == K_MASK && d == left {
@@ -1169,7 +1189,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             };
             if dc < left {
                 let c = s.apply(m, t);
-                if K == K_MASK && dc == left - 1 && dc >= 2 {
+                if K == K_MASK && dc == left - 1 && dc >= self.batch_min_left() {
                     self.push_batch(c, idx[k], dc, m, Some(m as u8));
                     if self.batch.len() >= BATCH {
                         self.run_batch();
