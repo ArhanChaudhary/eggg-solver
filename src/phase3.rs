@@ -96,10 +96,21 @@ impl P3Tables {
     /// (corner-class distance, h48 index) of a cube.
     #[inline(always)]
     fn probe(&self, v: &C3) -> (u8, usize) {
-        let i = self.fast.cocsep(v);
+        self.probe_at(v, self.fast.cocsep(v))
+    }
+
+    /// The cocsep entry of a cocsep index (a cube's).
+    #[inline(always)]
+    fn cocsep_ptr(&self, i: usize) -> *const u32 {
         debug_assert!(i < self.coords.cocsep.len());
         // SAFETY: a cube's cocsep index is below N_COCSEP (the table's length).
-        let cs = unsafe { *self.coords.cocsep.get_unchecked(i) };
+        unsafe { self.coords.cocsep.as_ptr().add(i) }
+    }
+
+    /// [`P3Tables::probe`], given the cube's cocsep index.
+    #[inline(always)]
+    fn probe_at(&self, v: &C3, i: usize) -> (u8, usize) {
+        let cs = unsafe { *self.cocsep_ptr(i) };
         let (eslot, msplit, eo) = self.fast.edges(v, (cs >> 8 & 255) as usize);
         (
             (cs & 255) as u8,
@@ -284,7 +295,11 @@ impl<'a> Search3<'a> {
         let mut kids: [std::mem::MaybeUninit<Kid>; 18] =
             [const { std::mem::MaybeUninit::uninit() }; 18];
         let mut nk = 0;
-        // Stage 1: children, corner-class bounds, prefetch of the table entries.
+        // Stage 0: children, and a prefetch of the cocsep entries of the side that moved on the
+        // right and (once per face, see below) of the other side.
+        let mut pre: [std::mem::MaybeUninit<(Node, u8, u32, u32)>; 18] =
+            [const { std::mem::MaybeUninit::uninit() }; 18];
+        let mut np = 0;
         let mut allowed = if back {
             ALLOWED_BEFORE[last_b]
         } else {
@@ -297,68 +312,94 @@ impl<'a> Search3<'a> {
             allowed &= !(7 << (face * 3));
             // The side not moved by a turn of this face gets the same coset for X and X'
             // (X2 is in the target group), and its parent's for X2.
-            let mut twin: Option<(u8, usize)> = None;
+            let mut twin_ci = u32::MAX;
             for pw in 0..3 {
                 if fm >> pw & 1 == 0 {
                     continue;
                 }
                 let m = (face * 3 + pw) as usize;
                 self.nodes += 1;
-                let (node, own, other) = if back {
+                let node = if back {
                     let b = &t.fast.moves[crate::moves::inverse_move(m)];
-                    let node = Node {
+                    Node {
                         v: n.v.apply_inv_c(b),
                         y: n.y.apply_c(b),
-                    };
-                    (node, node.y, node.v)
+                    }
                 } else {
                     let c = &t.fast.moves[m];
-                    let node = Node {
+                    Node {
                         v: n.v.apply_c(c),
                         y: n.y.apply_inv_c(c),
-                    };
-                    (node, node.v, node.y)
+                    }
                 };
                 // `own`: the side that moved on the right (its coset changes); `other` moved
                 // on the left.
-                let (oc, oi) = t.probe(&own);
-                if oc >= left {
-                    continue;
-                }
-                let (xc, xi, xh) = if pw == 1 {
-                    (0, KNOWN, if back { hv } else { hy })
+                let (own, other) = if back {
+                    (&node.y, &node.v)
                 } else {
-                    match twin {
-                        Some((c, i)) => (c, i, 0),
-                        None => {
-                            let (c, i) = t.probe(&other);
-                            twin = Some((c, i));
-                            (c, i, 0)
-                        }
-                    }
+                    (&node.v, &node.y)
                 };
-                if xc >= left || xh >= left {
-                    continue;
+                let ci = t.fast.cocsep(own) as u32;
+                crate::table::prefetch(t.cocsep_ptr(ci as usize));
+                if pw != 1 && twin_ci == u32::MAX {
+                    twin_ci = t.fast.cocsep(other) as u32;
+                    crate::table::prefetch(t.cocsep_ptr(twin_ci as usize));
                 }
-                t.h48.prefetch(oi);
-                if xi != KNOWN {
-                    t.h48.prefetch(xi);
-                }
-                let (iv, iy, hv0, hy0) = if back {
-                    (xi, oi, xc.max(xh), oc)
-                } else {
-                    (oi, xi, oc, xc.max(xh))
-                };
-                kids[nk].write(Kid {
+                debug_assert!(np < 18);
+                unsafe { pre.get_unchecked_mut(np) }.write((
                     node,
-                    m: m as u8,
-                    iv,
-                    iy,
-                    hv: hv0,
-                    hy: hy0,
-                });
-                nk += 1;
+                    m as u8,
+                    ci,
+                    if pw == 1 { u32::MAX } else { twin_ci },
+                ));
+                np += 1;
             }
+        }
+        // Stage 1: corner-class bounds, table indices, prefetch of the table entries.
+        let mut twin: (u32, u8, usize) = (u32::MAX, 0, 0);
+        for p in pre.iter().take(np) {
+            let (node, m, ci, xci) = unsafe { p.assume_init_ref() };
+            let (node, m) = (*node, *m as usize);
+            let (own, other) = if back {
+                (&node.y, &node.v)
+            } else {
+                (&node.v, &node.y)
+            };
+            let (oc, oi) = t.probe_at(own, *ci as usize);
+            if oc >= left {
+                continue;
+            }
+            let (xc, xi, xh) = if *xci == u32::MAX {
+                (0, KNOWN, if back { hv } else { hy })
+            } else {
+                // The two quarter turns of a face share the other side's probe.
+                if twin.0 != (m / 3) as u32 {
+                    let (c, i) = t.probe_at(other, *xci as usize);
+                    twin = ((m / 3) as u32, c, i);
+                }
+                (twin.1, twin.2, 0)
+            };
+            if xc >= left || xh >= left {
+                continue;
+            }
+            t.h48.prefetch(oi);
+            if xi != KNOWN {
+                t.h48.prefetch(xi);
+            }
+            let (iv, iy, hv0, hy0) = if back {
+                (xi, oi, xc.max(xh), oc)
+            } else {
+                (oi, xi, oc, xc.max(xh))
+            };
+            kids[nk].write(Kid {
+                node,
+                m: m as u8,
+                iv,
+                iy,
+                hv: hv0,
+                hy: hy0,
+            });
+            nk += 1;
         }
         // Stage 2: read the bounds and descend.
         let r = left - 1;
