@@ -103,6 +103,10 @@ fn main() {
         let t0 = Instant::now();
         load_pat(&mut p1, dir, pat == "big", 8, true);
         p1.pat.as_ref().unwrap().table.data.collapse();
+        if std::env::var("EGGG_P1_MASK").is_ok_and(|v| v == "virtual") {
+            // Counts only: per-pair searches with batches of pattern-decreasing moves.
+            p1.mask = Some(eggg_solver::p1mask::MaskTable::virtual_table());
+        }
         eprintln!(
             "pattern table loaded in {:.1} s",
             t0.elapsed().as_secs_f64()

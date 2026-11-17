@@ -177,9 +177,10 @@ impl MaskTable {
         (j, info as u8)
     }
 
-    /// The 27-move mask of state `s` (index `i` and symmetry `sym` as above).
+    /// The 27-move mask of state `s` (index `i` and symmetry `sym` as above); the virtual
+    /// table also serves the per-pair searches (`pair`: the pattern table's distance).
     #[inline(always)]
-    pub fn get(&self, t: &P1Tables, i: u64, sym: u8, s: &P1State) -> u32 {
+    pub fn get(&self, t: &P1Tables, i: u64, sym: u8, s: &P1State, pair: usize) -> u32 {
         match self.kind {
             MaskKind::Big => self.big[i as usize],
             MaskKind::Reduced => {
@@ -192,8 +193,14 @@ impl MaskTable {
                     | c[4][(e >> 32 & 255) as usize]
             }
             MaskKind::Virtual => {
-                let (ud, rl) = s.masks();
-                mask_of(t, ud, rl, &moves36()[..N_MOVES]) as u32
+                let v = t.value_pair(s, pair);
+                let mut mask = 0;
+                for m in 0..N_MOVES {
+                    if t.value_pair(&s.apply(m, t), pair) == (v + 2) % 3 {
+                        mask |= 1 << m;
+                    }
+                }
+                mask
             }
         }
     }
@@ -313,7 +320,7 @@ mod tests {
         for _ in 0..200 {
             let mut s = P1State::from_cube(&Cube::random(&mut rng));
             for k in 0..12 {
-                let want = v.get(&t, 0, 0, &s);
+                let want = v.get(&t, 0, 0, &s, crate::phase1::ALL_PAIRS);
                 let (ud, rl) = s.masks();
                 assert_eq!(mask_of(&t, ud, rl, &mv[..N_MOVES]) as u32, want);
                 // The reduced table's entry: the 36-move mask of the symmetric image.

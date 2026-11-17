@@ -920,7 +920,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 }
             }
             for nd in &cur {
-                let mut a = mt.get(t, nd.idx, nd.sym, &nd.s) & ALLOWED_AFTER[nd.last as usize];
+                let mut a =
+                    mt.get(t, nd.idx, nd.sym, &nd.s, self.pair) & ALLOWED_AFTER[nd.last as usize];
                 self.nodes += a.count_ones() as u64;
                 self.reads += 1;
                 self.path.clear();
@@ -986,6 +987,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 self.dfs_t::<K_PAT_BIG>(s, d, left, last)
             } else {
                 self.dfs_t::<K_PAT>(s, d, left, last)
+            }
+            if self.t.mask.is_some() && !self.stop {
+                self.run_batch();
             }
         } else if self.t.big && self.t.mask.is_some() {
             self.dfs_t::<K_MASK>(s, d, left, last);
@@ -1074,7 +1078,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             self.leaf(s, d, last, None);
             return;
         }
-        if K == K_MASK && d == left {
+        // Batches: with the move masks, or (counts only) per-pair searches with the virtual
+        // move-mask table, which then gives the pattern-distance-decreasing moves.
+        let batched = K == K_MASK || (K >= K_PAT && K <= K_PAT_BIG && self.t.mask.is_some());
+        if batched && d == left {
             let (ud, rl) = s.masks();
             let i = self.t.staging.big_index(ud, rl);
             self.push_batch(*s, i, left, last, None);
@@ -1189,7 +1196,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             };
             if dc < left {
                 let c = s.apply(m, t);
-                if K == K_MASK && dc == left - 1 && dc >= self.batch_min_left() {
+                if batched && dc == left - 1 && dc >= self.batch_min_left() {
                     self.push_batch(c, idx[k], dc, m, Some(m as u8));
                     if self.batch.len() >= BATCH {
                         self.run_batch();
