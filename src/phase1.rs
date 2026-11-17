@@ -19,7 +19,7 @@ use crate::moves::{
     ALLOWED_AFTER, MOVE_PERMS, N_MOVES, PHASE2_MASK, WIDE_QUARTER, frame_rotation, rotate_move,
 };
 use crate::simd::V32;
-use crate::table::{Mod3Table, UNSEEN};
+use crate::table::Mod3Table;
 
 pub const N_CLASSES_A: usize = 15582;
 pub const N_SPLIT: usize = 6435;
@@ -27,8 +27,6 @@ const MASK24: u32 = 0xff_ffff;
 
 /// Centre colour codes: the colour pair (class) is code >> 1, U/D = 0, R/L = 1, F/B = 2.
 pub const CODE_OF_FACE: [u8; 6] = [0, 2, 4, 1, 3, 5];
-pub const FACE_OF_CODE: [u8; 6] = [0, 3, 1, 4, 2, 5];
-
 #[inline(always)]
 pub fn pext(x: u32, m: u32) -> u32 {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
@@ -380,8 +378,6 @@ pub struct Frame {
     pub rl_pos: [u8; 8],
     /// Allowed patterns (bit i = position rl_pos[i] holds the pair's first colour).
     pub rl_ok: [u64; 4],
-    /// For each move, the slots whose wings end up in the low slots.
-    pub low_src: [[u8; 12]; N_MOVES],
     /// 0x80 at the low slots (looked up by each wing's slot).
     pub low_tab: V32,
 }
@@ -478,8 +474,6 @@ impl Frame {
         let count: u32 = ok.iter().map(|w| w.count_ones()).sum();
         assert_eq!(count, 12);
         let low_slots: [u8; 12] = low_slots.try_into().unwrap();
-        let low_src =
-            std::array::from_fn(|m| low_slots.map(|s| MOVE_PERMS[m].wing_src[s as usize]));
         let mut low_tab = V32::ZERO;
         for &sl in &low_slots {
             low_tab.0[sl as usize] = 0x80;
@@ -487,7 +481,6 @@ impl Frame {
         Frame {
             p2_mask,
             low_tab,
-            low_src,
             low_slots,
             high_pieces,
             rl_pos,
@@ -550,6 +543,15 @@ impl P1State {
         }
     }
 
+    /// The state after `moves` and its exact staging distance, from this state at exact
+    /// distance `d`.
+    pub fn after(&self, moves: &[u8], d: u8, t: &P1Tables) -> (P1State, u8) {
+        moves.iter().fold((*self, d), |(s, d), &m| {
+            let c = s.apply(m as usize, t);
+            (c, Mod3Table::decode(d, t.value(&c)))
+        })
+    }
+
     #[inline(always)]
     pub fn masks(&self) -> (u32, u32) {
         let rl = self.centres.bit_mask(1) & MASK24;
@@ -565,31 +567,14 @@ pub struct P1Tables {
     pub big: bool,
     pub frames: [Frame; 3],
     pub centre_idx: [V32; N_MOVES],
-    pub wing_idx: [V32; N_MOVES],
     /// Destination slot of each slot under each move (applied to wing positions).
     pub wing_dst: [V32; N_MOVES],
 }
 
 impl P1Tables {
-    pub fn build(depths: Option<&[u8]>, threads: usize) -> P1Tables {
-        let staging = Staging::new();
-        let owned;
-        let depths = match depths {
-            Some(d) => d,
-            None => {
-                owned = staging.generate(threads);
-                &owned
-            }
-        };
-        assert!(depths.iter().all(|&d| d != UNSEEN));
-        let table = Mod3Table::from_depths(depths);
-        Self::with_table(staging, table)
-    }
-
     pub fn with_table(staging: Staging, table: Mod3Table) -> P1Tables {
         let frames = [Frame::new(0), Frame::new(1), Frame::new(2)];
         let centre_idx = std::array::from_fn(|m| V32::from_slice(&MOVE_PERMS[m].centre_src));
-        let wing_idx = std::array::from_fn(|m| V32::from_slice(&MOVE_PERMS[m].wing_src));
         let wing_dst = std::array::from_fn(|m| {
             let mut d = V32::ZERO;
             for t in 0..24 {
@@ -603,7 +588,6 @@ impl P1Tables {
             big: false,
             frames,
             centre_idx,
-            wing_idx,
             wing_dst,
         }
     }

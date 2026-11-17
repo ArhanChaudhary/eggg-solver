@@ -155,10 +155,6 @@ impl TableArgs {
 
     fn load(&self, threads: usize, verbose: bool) -> Tables {
         let (k, joint, big) = self.config();
-        if big {
-            // SAFETY: set before any threads are started.
-            unsafe { std::env::set_var("EGGG_P1_BIG", "1") };
-        }
         if verbose {
             eprintln!(
                 "tables: h48 h{k}{}{} ({:?} tier)",
@@ -167,7 +163,7 @@ impl TableArgs {
                 self.tier.resolve()
             );
         }
-        load_tables_with(&self.dir(), k, joint, threads, verbose)
+        load_tables_with(&self.dir(), k, joint, big, threads, verbose)
     }
 
     fn dir(&self) -> PathBuf {
@@ -184,10 +180,10 @@ struct SearchArgs {
     /// Worker threads (default: all cores).
     #[arg(short = 'j', long)]
     threads: Option<usize>,
-    /// Phase-1 endpoints collected per round.
+    /// Phase-1 endpoints collected in the first round (doubled each round).
     #[arg(long, default_value_t = Options::default().endpoints)]
     endpoints: usize,
-    /// Reductions collected per round.
+    /// Reductions collected in the first round (doubled each round).
     #[arg(long, default_value_t = Options::default().reductions)]
     reductions: usize,
 }

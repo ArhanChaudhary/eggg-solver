@@ -14,7 +14,7 @@ target/release/eggg-solver solve "Rw U2 x Rw2 F' Bw D Lw' 2R B2 u'" -t 5
 target/release/eggg-solver solve UUUU...BBBB
 # SiGN output, all cores, stop at the first solution of at most 40 moves:
 target/release/eggg-solver solve "..." -n sign -l 40
-# Random positions, from stdin (one per line), batch output:
+# Ten random positions, solutions only (scrambles can also come one per line on stdin):
 target/release/eggg-solver solve --random 10 -q
 # Generate the tables up front, or benchmark:
 target/release/eggg-solver gen
@@ -54,7 +54,9 @@ orientation, so the output needs no rotations.
    even and the wings *pairable* (the 12 "low" wing slots of the phase-2 frame hold one wing of
    each dedge, an even number of them "high"). One search tree serves all 18 combinations of
    frame (which axis phase 2 turns only by half turns) and colour-to-axis assignment. Guided by
-   an exact staging table reduced by the 48 symmetries.
+   an exact staging table (reduced by the 48 symmetries, or the large unreduced one); the
+   search is split into jobs that hand back their unstarted subtrees when stopped, so threads
+   never wait for one another.
 2. **Phase 2** (TPR phase 3): pair the dedges and solve the centres with
    U D F B R2 L2 Uw2 Rw2 Fw2, guided by an exact centre table and either the pairing
    permutation table or the much tighter joint table.
@@ -63,13 +65,18 @@ orientation, so the output needs no rotations.
 
 The driver collects many phase-1 endpoints and reductions and searches phase 3 level by
 level on the total length over all of them, so each solution found is the shortest the pool
-allows; the pool grows while time remains.
+allows; the pool grows while time remains, and once a solution exists phase 2 only produces
+reductions that a phase 3 of at most 14 moves would turn into a shorter one.
 
 ## Development
 
 - `cargo test --release` (end-to-end tests use `./tables`, generating them if missing).
-- `scripts/bench.sh LABEL` / `scripts/m2-bench.sh NAME...` and `scripts/compare.py A B`:
-  benchmark suites (random positions, best length after a time limit, multi- and
-  single-threaded) and before/after tables.
-- `examples/` holds deterministic checks used during optimisation (`p1check`, `p3nodes`,
-  `p2jcheck`, ...).
+- Benchmarks (random positions; best length after a time limit, multi- and single-threaded):
+  `scripts/x86-build.sh LABEL REF` + `scripts/x86-bench.sh NAME...` on this machine,
+  `scripts/m2-build.sh` + `scripts/m2-bench.sh` on the ARM laptop (each under an exclusive
+  benchmark lock), then `scripts/compare.py A B` for a before/after table and
+  `scripts/paired.py A.json B.json` for a per-position paired comparison (runs of one build
+  reproduce per-position lengths, so small differences are measurable).
+- `examples/` holds deterministic checks used during optimisation: `p1check` (phase-1
+  endpoint hash and node count), `p2jcheck` (joint-table admissibility), `p3check`,
+  `p3nodes` and `p3tasks` (phase-3 bounds, node counts and task splitting).

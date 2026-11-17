@@ -234,11 +234,6 @@ impl Joint {
         ((c >> 3) as usize * N_REST + r) * 2 + pll as usize
     }
 
-    /// [`Joint::canonical`], for checks.
-    pub fn canonical_pub(&self, ud: u32, tau: &[u8; 16], pll: u32) -> usize {
-        self.canonical(ud, tau, pll)
-    }
-
     /// The canonical index (minimum over the stabiliser), used by the generator.
     fn canonical(&self, ud: u32, tau: &[u8; 16], pll: u32) -> usize {
         let c = self.cls[ud as usize * N_PREFIX + prefix_rank(tau)];

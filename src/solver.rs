@@ -5,9 +5,9 @@
 //!    resumed, so no endpoint is searched twice.
 //! 2. Each endpoint is brought into the standard frame, and phase 2 is searched level by level
 //!    on the reduction length, collecting reductions (deduplicated by their 3x3x3).
-//! 3. Phase 3 first finds a solution quickly (a bounded IDA* on the most promising
-//!    reductions), then searches level by level on the total length over all reductions, so
-//!    each solution found is the shortest the pool allows.
+//! 3. Phase 3 searches level by level on the total length over all reductions (an IDA*
+//!    per reduction, split into tasks over the threads), so each solution found is the
+//!    shortest the pool allows; phase 2 then only produces reductions that could beat it.
 //!
 //! Rounds repeat with geometrically more endpoints and reductions while time remains, only
 //! looking for shorter solutions.
@@ -43,9 +43,9 @@ pub struct Options {
     /// one).
     pub hard_limit: Option<Duration>,
     pub threads: usize,
-    /// Phase-1 endpoints collected in the first round (multiplied by 4 each round).
+    /// Phase-1 endpoints collected in the first round (doubled each round).
     pub endpoints: usize,
-    /// Reductions collected in the first round (multiplied by 4 each round).
+    /// Reductions collected in the first round (doubled each round).
     pub reductions: usize,
 }
 
@@ -524,12 +524,7 @@ impl<'a, 'r> Run<'a, 'r> {
                                 break;
                             }
                             let prefix = &jobs[j];
-                            let mut st = root;
-                            let mut d = d0;
-                            for &m in prefix {
-                                st = st.apply(m as usize, t);
-                                d = Mod3Table::decode(d, t.value(&st));
-                            }
+                            let (st, d) = root.after(prefix, d0, t);
                             let mut eps = vec![];
                             let mut spill = vec![];
                             let mut srch = Search1::new(t, |p: &[u8], f| {
@@ -803,7 +798,7 @@ impl<'a, 'r> Run<'a, 'r> {
             srch.abort_level = Some(&found);
             let sol = match task {
                 Some(task) => srch.run_task(task),
-                None => srch.search_depth(&r.c3, d, N_MOVES),
+                None => srch.search_depth(&r.c3, d),
             };
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
             match sol {
@@ -833,9 +828,9 @@ impl<'a, 'r> Run<'a, 'r> {
     }
 }
 
-/// Load or build the phase-1 tables in `dir`.
-pub fn load_p1(dir: &std::path::Path, threads: usize, verbose: bool) -> P1Tables {
-    let big = p1_big();
+/// Load or build the phase-1 tables in `dir`; `big`: the large staging table (no symmetry
+/// reduction, faster lookups) instead of the reduced one.
+pub fn load_p1(dir: &std::path::Path, big: bool, threads: usize, verbose: bool) -> P1Tables {
     let (p1_name, p1_len) = if big {
         ("p1-staging-big", crate::phase1::Staging::big_len())
     } else {
@@ -846,14 +841,8 @@ pub fn load_p1(dir: &std::path::Path, threads: usize, verbose: bool) -> P1Tables
     let n = p1_len;
     let mut table = Mod3Table {
         data: crate::table::HugeBuf::zeroed(n.div_ceil(32)),
-        n: n as u64,
     };
-    let bytes = unsafe {
-        std::slice::from_raw_parts_mut(
-            table.data.as_mut_slice().as_mut_ptr() as *mut u8,
-            table.data.byte_len(),
-        )
-    };
+    let bytes = table.data.as_bytes_mut();
     if crate::table::load(&p1_path, p1_name, bytes).is_err() {
         if verbose {
             eprintln!("generating phase-1 staging table ({p1_name})...");
@@ -864,12 +853,7 @@ pub fn load_p1(dir: &std::path::Path, threads: usize, verbose: bool) -> P1Tables
             staging.generate(threads)
         };
         table = Mod3Table::from_depths(&depths);
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                table.data.as_slice().as_ptr() as *const u8,
-                table.data.byte_len(),
-            )
-        };
+        let bytes = table.data.as_bytes();
         crate::table::save(&p1_path, p1_name, bytes).expect("saving table");
     }
     let mut p1 = P1Tables::with_table(staging, table);
@@ -879,38 +863,28 @@ pub fn load_p1(dir: &std::path::Path, threads: usize, verbose: bool) -> P1Tables
 
 /// Load or build all tables in `dir`.
 pub fn load_tables(dir: &std::path::Path, h48_k: u32, threads: usize, verbose: bool) -> Tables {
-    load_tables_with(dir, h48_k, false, threads, verbose)
+    load_tables_with(dir, h48_k, false, false, threads, verbose)
 }
 
-/// Large phase-1 staging table instead of the symmetry-reduced one ($EGGG_P1_BIG, set by
-/// `--p1-big`).
-fn p1_big() -> bool {
-    std::env::var_os("EGGG_P1_BIG").is_some()
-}
-
-/// Load or build all tables in `dir`; `joint`: also the joint phase-2 table (2.1 GB).
+/// Load or build all tables in `dir`; `joint`: also the joint phase-2 table (1.05 GB);
+/// `p1_big`: the large phase-1 staging table (1.2 GB).
 pub fn load_tables_with(
     dir: &std::path::Path,
     h48_k: u32,
     joint: bool,
+    p1_big: bool,
     threads: usize,
     verbose: bool,
 ) -> Tables {
     let t0 = Instant::now();
-    let p1 = load_p1(dir, threads, verbose);
+    let p1 = load_p1(dir, p1_big, threads, verbose);
     let p2_path = dir.join("p2-tau.tab");
     let p2 = {
         let n = crate::phase2::N_TAU;
         let mut table = Mod3Table {
             data: crate::table::HugeBuf::zeroed(n.div_ceil(32)),
-            n: n as u64,
         };
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                table.data.as_mut_slice().as_mut_ptr() as *mut u8,
-                table.data.byte_len(),
-            )
-        };
+        let bytes = table.data.as_bytes_mut();
         if crate::table::load(&p2_path, "p2-tau", bytes).is_ok() {
             P2Tables::build(Some(table), threads)
         } else {
@@ -918,12 +892,7 @@ pub fn load_tables_with(
                 eprintln!("generating phase-2 pairing table...");
             }
             let t = P2Tables::build(None, threads);
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    t.tau_table.data.as_slice().as_ptr() as *const u8,
-                    t.tau_table.data.byte_len(),
-                )
-            };
+            let bytes = t.tau_table.data.as_bytes();
             crate::table::save(&p2_path, "p2-tau", bytes).expect("saving table");
             t
         }
@@ -933,12 +902,7 @@ pub fn load_tables_with(
         let mut j = crate::p2joint::Joint::new(&p2);
         let path = dir.join("p2-joint2.tab");
         j.table = crate::table::HugeBuf::zeroed(j.bytes() / 8);
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                j.table.as_mut_slice().as_mut_ptr() as *mut u8,
-                j.bytes(),
-            )
-        };
+        let bytes = j.table.as_bytes_mut();
         if crate::table::load(&path, "p2-joint2", bytes).is_err() {
             if verbose {
                 eprintln!(
@@ -947,9 +911,7 @@ pub fn load_tables_with(
                 );
             }
             j.generate(&p2, threads, verbose);
-            let bytes = unsafe {
-                std::slice::from_raw_parts(j.table.as_slice().as_ptr() as *const u8, j.bytes())
-            };
+            let bytes = j.table.as_bytes();
             crate::table::save(&path, "p2-joint2", bytes).expect("saving table");
         }
         p2.joint = Some(j);
@@ -979,7 +941,7 @@ mod tests {
     /// exactly the endpoints of one uninterrupted search.
     #[test]
     fn split_jobs_find_the_same_endpoints() {
-        let t = load_p1(std::path::Path::new("tables"), 8, false);
+        let t = load_p1(std::path::Path::new("tables"), false, 8, false);
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(7);
         for scramble in 0..6 {
             let mut cube = Cube::SOLVED;
@@ -1004,12 +966,7 @@ mod tests {
                 let mut count = 0usize;
                 while let Some(prefix) = queue.pop() {
                     let close = AtomicBool::new(false);
-                    let mut st = root;
-                    let mut d = d0;
-                    for &m in &prefix {
-                        st = st.apply(m as usize, &t);
-                        d = Mod3Table::decode(d, t.value(&st));
-                    }
+                    let (st, d) = root.after(&prefix, d0, &t);
                     let mut spill = vec![];
                     let mut srch = Search1::new(&t, |p: &[u8], f| {
                         got.push((p.to_vec(), f));

@@ -97,28 +97,6 @@ pub fn perm_parity(p: &[u8]) -> u8 {
     par
 }
 
-/// Rank of a multiset arrangement: `labels[i]` in 0..k for each of n positions with
-/// `counts[c]` of each label, as a mixed-radix number of nested combinations.
-pub fn multiset_rank(labels: &[u8], counts: &[usize]) -> u64 {
-    let mut rank = 0u64;
-    let mut remaining: Vec<usize> = (0..labels.len()).collect();
-    for c in 0..counts.len().saturating_sub(1) {
-        let n = remaining.len();
-        let mut mask = 0u32;
-        let mut next = vec![];
-        for (j, &pos) in remaining.iter().enumerate() {
-            if labels[pos] as usize == c {
-                mask |= 1 << j;
-            } else {
-                next.push(pos);
-            }
-        }
-        rank = rank * binom(n, counts[c]) as u64 + comb_rank(mask) as u64;
-        remaining = next;
-    }
-    rank
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

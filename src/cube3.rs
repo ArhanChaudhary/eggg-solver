@@ -1,7 +1,7 @@
 //! The 3x3x3 reached after reduction: cubie model, moves (U R F D L B, indices 0..18 as in
 //! the 4x4x4 move numbering), and extraction from a reduced 4x4x4.
 
-use crate::cube::{CORNER_POS, Cube, EDGE_POS, GEO, Perm, V3, mat_apply, rot, rotation_mapping};
+use crate::cube::{Cube, EDGE_POS, GEO, Perm, V3, mat_apply, rot, rotation_mapping};
 use crate::moves::{Conj, MOVE_PERMS, turn_of};
 use std::sync::LazyLock;
 
@@ -169,9 +169,6 @@ impl Cube3 {
         out.is_valid().then_some(out)
     }
 }
-
-#[allow(unused)]
-const _C: [V3; 8] = CORNER_POS;
 
 #[cfg(test)]
 mod tests {

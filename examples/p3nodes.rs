@@ -27,7 +27,7 @@ fn main() {
         let mut n = 0u64;
         for x in &cubes {
             let mut s = Search3::new(&t);
-            if let Some(sol) = s.search_depth(x, d, eggg_solver::moves::N_MOVES) {
+            if let Some(sol) = s.search_depth(x, d) {
                 assert_eq!(x.apply_moves(&sol), Cube3::SOLVED);
                 found += 1;
             }

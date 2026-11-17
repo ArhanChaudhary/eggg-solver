@@ -8,9 +8,9 @@
 //! * the pairing permutation tau: for each edge, the edge holding the partner of the wing in
 //!   its low slot (12!/2 even permutations), exact table, distance mod 3.
 
-use crate::comb::{FACT, binom, comb_rank, perm_rank, perm_unrank};
+use crate::comb::{comb_rank, perm_rank, perm_unrank};
 use crate::cube::{B, Cube, D, F, L, R, U};
-use crate::moves::{ALLOWED_AFTER, Conj, MOVE_PERMS, N_MOVES, PHASE2_MASK, frame_rotation};
+use crate::moves::{ALLOWED_AFTER, Conj, MOVE_PERMS, PHASE2_MASK, frame_rotation};
 use crate::phase1::Frame;
 use crate::table::{Mod3Table, UNSEEN};
 
@@ -26,9 +26,8 @@ const FB_POS: [usize; 8] = [8, 9, 10, 11, 20, 21, 22, 23];
 const RL_POS: [usize; 8] = [4, 5, 6, 7, 16, 17, 18, 19];
 
 pub struct P2Tables {
-    /// Low wing slot and high wing slot of each edge.
+    /// Low wing slot of each edge.
     pub low: [u8; 12],
-    pub high: [u8; 12],
     rank70: [u8; 256],
     unrank70: [u8; 70],
     rl12: [u8; 256],
@@ -117,7 +116,6 @@ impl P2Tables {
         }
         P2Tables {
             low,
-            high,
             rank70,
             unrank70,
             rl12,
@@ -129,12 +127,11 @@ impl P2Tables {
             joint: None,
             tau_table: Mod3Table {
                 data: crate::table::HugeBuf::zeroed(1),
-                n: 0,
             },
         }
     }
 
-    /// Build all tables (the tau table from `tau_depths` if given, else by BFS).
+    /// Build all tables (the tau table from `tau_mod3` if given, else by BFS).
     pub fn build(tau_mod3: Option<Mod3Table>, threads: usize) -> P2Tables {
         let mut t = P2Tables::base();
         t.build_centres();
@@ -329,7 +326,6 @@ pub fn pll_parity(c: &Cube, low: &[u8; 12]) -> u32 {
 
 /// Bring a phase-1 endpoint into the standard frame and colour assignment: conjugate by the
 /// frame rotation, then recolour so that the colour pair on each axis is that axis's own.
-/// Returns the transformed cube and the rotation used for the frame (to map moves back).
 pub fn standardise(c: &Cube, frame: usize) -> Cube {
     let rot = frame_rotation(frame);
     let x = Conj::new(rot).apply(c);
@@ -359,9 +355,6 @@ pub fn standardise(c: &Cube, frame: usize) -> Cube {
     }
     unreachable!("no rotation standardises the colour pairs")
 }
-
-#[allow(unused)]
-const _U: [usize; 2] = [B, N_MOVES];
 
 /// Moves that may end phase 2 after move `last`: a wide half turn, but not one right after an
 /// outer turn on its own axis ("U Uw2" = "Uw2 U": the shorter reduction, with U left to
@@ -511,11 +504,6 @@ impl<'a> Search2<'a> {
 #[inline(always)]
 fn cc_is_goal(t: &P2Tables, cc: u32) -> bool {
     t.centre_dist[cc as usize] == 0
-}
-
-#[allow(unused)]
-fn _unused() {
-    let _ = (FACT, binom);
 }
 
 #[cfg(test)]

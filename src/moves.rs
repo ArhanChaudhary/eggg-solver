@@ -28,12 +28,6 @@ pub const MOVE_FACES: [(usize, u8); 9] = [
     (F, 2),
 ];
 
-/// Axis group of move face `i` (moves of the same group commute).
-#[inline]
-pub const fn axis_of(m: usize) -> usize {
-    (m / 3) % 3
-}
-
 pub fn move_of(m: usize) -> Move {
     let (face, width) = MOVE_FACES[m / 3];
     Move {
@@ -89,19 +83,14 @@ pub const PHASE2_MASK: u32 = 0b111
     | (1 << 22)
     | (1 << 25);
 
-/// Outer face moves (the 3x3 moves).
-pub const OUTER_MASK: u32 = (1 << 18) - 1;
-
 pub static MOVE_PERMS: LazyLock<[Perm; N_MOVES]> =
     LazyLock::new(|| std::array::from_fn(|m| Perm::of_turn(turn_of(m))));
 
-/// Rotation matrix that maps the y axis to the x axis, x to z and z to y: the 120 degree turn
-/// about the UFR-DBL diagonal. It maps the 27-move set onto itself.
+/// The rotation that takes frame `f` to the standard frame (R/L axis special): f = 0 the
+/// identity, f = 1 maps the U/D axis to R/L, f = 2 the F/B axis. These are the turns about the
+/// UFR-DBL diagonal (by 0, 120 or 240 degrees), which map the 27-move set onto itself.
 pub fn frame_rotation(f: usize) -> Mat {
-    // f = 0: identity (R/L special), f = 1: maps the U/D axis to R/L, f = 2: F/B to R/L.
-    let target = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
-    let src = [[1i8, 0, 0], [0, 1, 0], [0, 0, 1]][[0, 1, 2][f]];
-    let _ = target;
+    let src = [[1i8, 0, 0], [0, 1, 0], [0, 0, 1]][f];
     *ROTATIONS
         .iter()
         .find(|m| mat_apply(m, src) == [1, 0, 0] && mat_apply(m, [1, 1, 1]) == [1, 1, 1])
@@ -122,7 +111,6 @@ pub fn rotate_move(m: usize, rot: &Mat) -> usize {
 /// A spatial symmetry applied to whole cube states: conjugation, `X -> s X s^-1`.
 /// Moves on `X` correspond to the rotated moves on the conjugate.
 pub struct Conj {
-    pub mat: Mat,
     corner_slot: [u8; 8],
     corner_twist: [u8; 8],
     wing_slot: [u8; 24],
@@ -135,7 +123,6 @@ impl Conj {
         use crate::cube::{CORNER_POS, GEO, centre_slot, corner_slot, wing_slot};
         let g = &*GEO;
         let mut c = Conj {
-            mat,
             corner_slot: [0; 8],
             corner_twist: [0; 8],
             wing_slot: [0; 24],
@@ -198,9 +185,6 @@ impl Conj {
         self.colour
     }
 }
-
-#[allow(unused)]
-const _FACES: [usize; 4] = [D, L, B, R];
 
 #[cfg(test)]
 mod tests {

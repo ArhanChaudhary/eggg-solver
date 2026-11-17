@@ -11,8 +11,8 @@
 //! 4-bit minimum of the group; values: code 0 = "at most base" (use the group minimum),
 //! codes 1..3 = base + code (3 meaning at least base + 3).
 
-use crate::comb::{binom, comb_rank, comb_unrank};
-use crate::cube::{Mat, ROTATIONS, face_of_normal, mat_apply};
+use crate::comb::comb_rank;
+use crate::cube::{Mat, ROTATIONS, mat_apply};
 use crate::cube3::{Cube3, N_MOVES3};
 use crate::moves::ALLOWED_AFTER;
 use crate::table::HugeBuf;
@@ -80,7 +80,6 @@ pub fn sym_mats() -> Vec<Mat> {
 
 /// Symmetry data for the 3x3x3.
 pub struct Syms {
-    pub mats: Vec<Mat>,
     /// Corner slot images.
     pub cslot: [[u8; 8]; 48],
     pub eslot: [[u8; 12]; 48],
@@ -98,7 +97,6 @@ impl Syms {
     pub fn new() -> Syms {
         let mats = sym_mats();
         let mut s = Syms {
-            mats: mats.clone(),
             cslot: [[0; 8]; 48],
             eslot: [[0; 12]; 48],
             ea: [[0; 12]; 48],
@@ -291,8 +289,6 @@ impl Coords {
                     }
                 }
             }
-            // Every position of the target tetrads/orientation is a goal: add the cosets of
-            // the target (corners permuted within tetrads, oriented) at depth 0.
             frontier = next;
             d += 1;
         }
@@ -334,6 +330,7 @@ impl Coords {
 
     /// Edge part (eslot, msplit, eo11) of a cube.
     #[inline]
+    #[cfg(test)]
     pub fn edge_part(&self, x: &Cube3) -> (u32, u32, u32) {
         let mut emask = 0u32;
         let mut mmask = 0u32;
@@ -673,11 +670,6 @@ fn dfs_mark(
         allowed &= allowed - 1;
         dfs_mark(co, &x.apply(m), left - 1, m, depth, ks, n, mark);
     }
-}
-
-#[allow(unused)]
-fn _u() {
-    let _ = (binom, comb_unrank, face_of_normal);
 }
 
 #[cfg(test)]

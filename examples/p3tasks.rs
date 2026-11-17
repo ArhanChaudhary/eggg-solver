@@ -15,7 +15,7 @@ fn main() {
         }
         for d in 12u8..=15 {
             let mut a = Search3::new(&t);
-            let whole = a.search_depth(&x, d, eggg_solver::moves::N_MOVES);
+            let whole = a.search_depth(&x, d);
             n_whole += a.nodes;
             let mut b = Search3::new(&t);
             let mut split = None;

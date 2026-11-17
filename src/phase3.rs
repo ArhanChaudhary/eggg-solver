@@ -26,12 +26,7 @@ impl P3Tables {
             base,
             data: crate::table::HugeBuf::zeroed(H48::bytes(k) / 8),
         };
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                h48.data.as_mut_slice().as_mut_ptr() as *mut u8,
-                H48::bytes(k),
-            )
-        };
+        let bytes = h48.data.as_bytes_mut();
         if crate::table::load(&path, &name, bytes).is_err() {
             if verbose {
                 eprintln!(
@@ -40,26 +35,11 @@ impl P3Tables {
                 );
             }
             h48 = H48::generate(&coords, k, base, threads, verbose);
-            let bytes = unsafe {
-                std::slice::from_raw_parts(h48.data.as_slice().as_ptr() as *const u8, H48::bytes(k))
-            };
+            let bytes = h48.data.as_bytes();
             crate::table::save(&path, &name, bytes).expect("saving table");
         }
         let fast = H48Fast::new(&coords);
         P3Tables { coords, fast, h48 }
-    }
-
-    /// H48 lower bound of a cube (with the corner-class bound).
-    #[inline]
-    pub fn h48_bound(&self, x: &Cube3) -> u8 {
-        let co = &self.coords;
-        let cs = co.cocsep[co.cocsep_of(x)];
-        let class = cs >> 16;
-        let tt = (cs >> 8 & 255) as usize;
-        let cd = (cs & 255) as u8;
-        let (eslot, msplit, eo) = co.edge_part_conj(x, tt);
-        let v = self.h48.value(self.h48.index(class, eslot, msplit, eo));
-        v.max(cd)
     }
 }
 
@@ -140,7 +120,6 @@ pub struct Search3<'a> {
     front: Vec<u8>,
     back: Vec<u8>,
     pub nodes: u64,
-    pub node_limit: u64,
     pub abort: Option<&'a AtomicBool>,
     /// A second abort flag (another search of the same level found a solution).
     pub abort_level: Option<&'a AtomicBool>,
@@ -169,7 +148,6 @@ impl<'a> Search3<'a> {
             front: Vec::with_capacity(24),
             back: Vec::with_capacity(24),
             nodes: 0,
-            node_limit: u64::MAX,
             abort: None,
             abort_level: None,
             aborted: false,
@@ -182,9 +160,9 @@ impl<'a> Search3<'a> {
         self.t.bound(&v).max(self.t.bound(&v.inverse()))
     }
 
-    /// Look for a solution of exactly `depth` moves whose first move may follow `first_after`
-    /// (callers search depths in increasing order).
-    pub fn search_depth(&mut self, c: &Cube3, depth: u8, first_after: usize) -> Option<Vec<u8>> {
+    /// Look for a solution of exactly `depth` moves (callers search depths in increasing
+    /// order).
+    pub fn search_depth(&mut self, c: &Cube3, depth: u8) -> Option<Vec<u8>> {
         let v = C3::from_cube(c);
         let n = Node { v, y: v.inverse() };
         let (hv, hy) = (self.t.bound(&n.v), self.t.bound(&n.y));
@@ -196,7 +174,14 @@ impl<'a> Search3<'a> {
         }
         self.front.clear();
         self.back.clear();
-        if self.dfs(&n, depth, first_after, crate::moves::N_MOVES, hv, hy) {
+        if self.dfs(
+            &n,
+            depth,
+            crate::moves::N_MOVES,
+            crate::moves::N_MOVES,
+            hv,
+            hy,
+        ) {
             let mut p = self.front.clone();
             p.extend(self.back.iter().rev());
             Some(p)
@@ -252,7 +237,7 @@ impl<'a> Search3<'a> {
     /// Shortest solution of at most `max_len` moves.
     pub fn solve(&mut self, c: &Cube3, max_len: u8) -> Option<Vec<u8>> {
         let h = self.lower_bound(c);
-        (h..=max_len).find_map(|d| self.search_depth(c, d, crate::moves::N_MOVES))
+        (h..=max_len).find_map(|d| self.search_depth(c, d))
     }
 
     /// The solution is front moves, then `left` unknown moves, then the back moves reversed;
@@ -266,10 +251,9 @@ impl<'a> Search3<'a> {
         if self.aborted {
             return false;
         }
-        if self.nodes > self.node_limit
-            || (self.nodes & 4095 == 0
-                && (self.abort.is_some_and(|a| a.load(Ordering::Relaxed))
-                    || self.abort_level.is_some_and(|a| a.load(Ordering::Relaxed))))
+        if self.nodes & 4095 == 0
+            && (self.abort.is_some_and(|a| a.load(Ordering::Relaxed))
+                || self.abort_level.is_some_and(|a| a.load(Ordering::Relaxed)))
         {
             self.aborted = true;
             return false;

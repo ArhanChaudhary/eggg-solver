@@ -41,6 +41,15 @@ impl<T: Copy> HugeBuf<T> {
     }
 
     #[inline(always)]
+    /// The buffer as bytes (for loading and saving; `T` is plain data).
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.byte_len()) }
+    }
+
+    pub fn as_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u8, self.byte_len()) }
+    }
+
     pub fn as_ptr(&self) -> *const T {
         self.ptr
     }
@@ -123,12 +132,10 @@ pub fn prefetch<T>(p: *const T) {
 /// of a child differs from its parent's by at most one, so it can be decoded from the parent's.
 pub struct Mod3Table {
     pub data: HugeBuf<u64>,
-    pub n: u64,
 }
 
 impl Mod3Table {
     pub fn from_depths(depths: &[u8]) -> Mod3Table {
-        let n = depths.len() as u64;
         let mut data = HugeBuf::<u64>::zeroed(depths.len().div_ceil(32));
         let words = data.as_mut_slice();
         crate::par::for_chunks(words.len(), 1 << 14, |range| {
@@ -147,7 +154,7 @@ impl Mod3Table {
                 unsafe { *(words.as_ptr() as *mut u64).add(w) = x };
             }
         });
-        Mod3Table { data, n }
+        Mod3Table { data }
     }
 
     #[inline(always)]
@@ -188,38 +195,6 @@ impl Mod3Table {
             t
         };
         d + T[MOD3[(d & 31) as usize] as usize][(v & 3) as usize] - 1
-    }
-}
-
-/// Distances in 4 bits per entry (15 = unreachable).
-pub struct NibbleTable {
-    pub data: HugeBuf<u8>,
-    pub n: u64,
-}
-
-impl NibbleTable {
-    pub fn from_depths(depths: &[u8]) -> NibbleTable {
-        let mut data = HugeBuf::<u8>::zeroed(depths.len().div_ceil(2));
-        let bytes = data.as_mut_slice();
-        for (i, b) in bytes.iter_mut().enumerate() {
-            let lo = depths.get(2 * i).copied().unwrap_or(UNSEEN).min(15);
-            let hi = depths.get(2 * i + 1).copied().unwrap_or(UNSEEN).min(15);
-            *b = lo | (hi << 4);
-        }
-        NibbleTable {
-            data,
-            n: depths.len() as u64,
-        }
-    }
-
-    #[inline(always)]
-    pub fn get(&self, i: u64) -> u8 {
-        (self.data[(i >> 1) as usize] >> ((i & 1) * 4)) & 15
-    }
-
-    #[inline(always)]
-    pub fn prefetch(&self, i: u64) {
-        prefetch(unsafe { self.data.as_ptr().add((i >> 1) as usize) });
     }
 }
 

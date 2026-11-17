@@ -70,11 +70,6 @@ mod imp {
         unsafe { st(_mm256_and_si256(ld(a), ld(b))) }
     }
 
-    #[inline(always)]
-    pub fn cmpeq(a: &V32, x: u8) -> V32 {
-        unsafe { st(_mm256_cmpeq_epi8(ld(a), _mm256_set1_epi8(x as i8))) }
-    }
-
     /// Shift every byte left by N bits (bits leaving a byte may enter the next one; only bit
     /// 7 of the result is meaningful).
     #[inline(always)]
@@ -169,15 +164,6 @@ mod imp {
     }
 
     #[inline(always)]
-    pub fn cmpeq(a: &V32, x: u8) -> V32 {
-        unsafe {
-            let c = vdupq_n_u8(x);
-            let (a0, a1) = ld(a);
-            st((vceqq_u8(a0, c), vceqq_u8(a1, c)))
-        }
-    }
-
-    #[inline(always)]
     pub fn shl<const N: i32>(a: &V32) -> V32 {
         unsafe {
             let (a0, a1) = ld(a);
@@ -246,17 +232,12 @@ mod imp {
     }
 
     #[inline(always)]
-    pub fn cmpeq(a: &V32, x: u8) -> V32 {
-        V32(std::array::from_fn(|i| if a.0[i] == x { 0xff } else { 0 }))
-    }
-
-    #[inline(always)]
     pub fn shl<const N: i32>(a: &V32) -> V32 {
         V32(a.0.map(|x| x << N))
     }
 }
 
-pub use imp::{add, and, cmpeq, gather, min, movemask, shl, shuf, sub, xor};
+pub use imp::{add, and, gather, min, movemask, shl, shuf, sub, xor};
 
 impl V32 {
     pub const ZERO: V32 = V32([0; 32]);
@@ -271,12 +252,6 @@ impl V32 {
     #[inline(always)]
     pub fn gather(self, idx: &V32) -> V32 {
         gather(&self, idx)
-    }
-
-    /// Bitmask of the bytes equal to `x` (bit i for byte i).
-    #[inline(always)]
-    pub fn eq_mask(self, x: u8) -> u32 {
-        movemask(&cmpeq(&self, x))
     }
 
     /// Bitmask of the bytes whose value has bit `b` set.
@@ -331,7 +306,6 @@ mod tests {
         for i in 0..32 {
             assert_eq!(m >> i & 1, (v[i] >> 7) as u32);
         }
-        assert_eq!(a.eq_mask(v[3]) >> 3 & 1, 1);
         for bit in 0..8 {
             let bm = a.bit_mask(bit);
             for i in 0..32 {

@@ -1,8 +1,6 @@
 //! Move notation: parsing WCA and SiGN notation, and printing outer block turns.
 
-use crate::cube::{
-    B, D, F, FACE_CHARS, FACE_NORMAL, L, Mat, R, Turn, U, face_of_normal, mat_apply, mat_mul,
-};
+use crate::cube::{F, FACE_CHARS, R, Turn, U};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum Style {
@@ -114,67 +112,9 @@ fn parse_move(tok: &str) -> Result<Turn, String> {
     Ok(turn)
 }
 
-/// Converts a sequence of outer block turns that never move the DBL corner (the solver's
-/// internal moves: U, Uw, 3Uw, R, Rw, 3Rw, F, Fw, 3Fw) into OBTM moves without any 3-layer
-/// turns, by writing 3Uw as D followed by a change of the frame (and so on).
-pub fn to_output_moves(turns: &[Turn]) -> Vec<Move> {
-    let mut frame: Mat = crate::cube::IDENTITY;
-    let mut out = vec![];
-    for &t in turns {
-        let axis = t.axis as usize;
-        // Decode: the internal turns are blocks from the positive face.
-        let width = t.layers.count_ones() as u8;
-        let (pos_face, neg_face) = match axis {
-            0 => (R, L),
-            1 => (U, D),
-            _ => (F, B),
-        };
-        let from_positive = t.layers & 8 != 0;
-        let face = if from_positive { pos_face } else { neg_face };
-        let base = Turn::face(face, width, 1);
-        assert_eq!(base.layers, t.layers, "not an outer block turn");
-        let power = (1..4)
-            .find(|&p| Turn::face(face, width, p).k == t.k)
-            .unwrap();
-        let (face, width, rotation) = if width == 3 {
-            let opp = if from_positive { neg_face } else { pos_face };
-            (opp, 1, Some(Turn::rotation(face, power)))
-        } else {
-            (face, width, None)
-        };
-        let phys = face_of_normal(mat_apply(&frame, FACE_NORMAL[face]));
-        out.push(Move {
-            face: phys as u8,
-            width,
-            power,
-        });
-        if let Some(rot) = rotation {
-            // frame <- frame * R_rot^-1
-            let inv = rotation_matrix(rot.inverse());
-            frame = mat_mul(&frame, &inv);
-        }
-    }
-    out
-}
-
-fn rotation_matrix(t: Turn) -> Mat {
-    let cols = [t.apply([1, 0, 0]), t.apply([0, 1, 0]), t.apply([0, 0, 1])];
-    let mut m = [[0i8; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            m[i][j] = cols[j][i];
-        }
-    }
-    m
-}
-
-#[allow(unused)]
-const _: [usize; 3] = [D, L, B];
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cube::{Cube, Facelets};
 
     #[test]
     fn parse_and_format() {
@@ -189,26 +129,5 @@ mod tests {
         };
         assert_eq!(m.format(Style::Wca), "Rw'");
         assert_eq!(m.format(Style::Sign), "r'");
-    }
-
-    #[test]
-    fn output_conversion_solves() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        for _ in 0..200 {
-            let n = rng.gen_range(1..30);
-            let mut turns = vec![];
-            for _ in 0..n {
-                let face = [U, R, F][rng.gen_range(0..3)];
-                turns.push(Turn::face(face, rng.gen_range(1..4), rng.gen_range(1..4)));
-            }
-            let scrambled = Cube::SOLVED.apply_turns(&turns).to_facelets();
-            let solution: Vec<Turn> = turns.iter().rev().map(|t| t.inverse()).collect();
-            let out = to_output_moves(&solution);
-            assert!(out.iter().all(|m| m.width < 3));
-            let end = out.iter().fold(scrambled, |f, m| f.apply_turn(m.to_turn()));
-            assert!(end.is_solved());
-            let _ = Facelets::is_solved;
-        }
     }
 }

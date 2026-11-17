@@ -1,5 +1,6 @@
 //! End-to-end tests of the solver. They use the tables in $EGGG_TABLES (default ./tables),
-//! generating any that are missing (slow the first time), with the smallest H48 table.
+//! generating any that are missing (slow the first time), with the H48 table of the small
+//! tier (h3; $EGGG_TEST_H48 to change it).
 
 use eggg_solver::cube::{Cube, Facelets};
 use eggg_solver::notation::{Style, format_moves, parse_moves};
@@ -17,7 +18,7 @@ fn tables() -> &'static Tables {
         let k = std::env::var("EGGG_TEST_H48")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(2);
+            .unwrap_or(3);
         load_tables(&dir, k, eggg_solver::par::threads().min(8), false)
     })
 }
