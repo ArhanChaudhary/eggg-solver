@@ -121,7 +121,8 @@ struct Reduction {
 /// The resumable state of one phase-1 length level.
 struct Level1 {
     len: u8,
-    jobs: Vec<Vec<u8>>,
+    /// (colour pair, move prefix): see [`Search1::pair`].
+    jobs: Vec<(u8, Vec<u8>)>,
     next: usize,
 }
 
@@ -222,7 +223,7 @@ fn p1_run<F: FnMut(&[u8], u8) -> bool>(
         let m = allowed.trailing_zeros() as usize;
         allowed &= allowed - 1;
         let c = st.apply(m, t);
-        let dc = Mod3Table::decode(d, t.value(&c));
+        let dc = Mod3Table::decode(d, srch.value(&c));
         srch.nodes += 1;
         if dc >= left {
             continue;
@@ -285,7 +286,11 @@ struct Run<'a, 'r> {
     target: Option<usize>,
     stats: Stats,
     root: P1State,
-    d0: u8,
+    /// The root's exact distance in each pair's pattern table and (index 3) the staging table.
+    d0: [u8; 4],
+    /// The searches run per level: the three pairs' (with the pattern table), else one over
+    /// all pairs.
+    pairs: Vec<usize>,
     level: Level1,
     /// Candidates made so far (including those dropped as hopeless).
     made_cands: usize,
@@ -324,7 +329,16 @@ impl<'a> Solver<'a> {
         let threads = self.opts.threads.max(1);
         let done = AtomicBool::new(false);
         let root = P1State::from_cube(cube);
-        let d0 = self.t.p1.distance(&root);
+        let mut d0 = [0u8; 4];
+        let pairs: Vec<usize> = if self.t.p1.pat.is_some() {
+            vec![0, 1, 2]
+        } else {
+            vec![crate::phase1::ALL_PAIRS]
+        };
+        for &p in &pairs {
+            d0[p] = self.t.p1.distance_pair(&root, p);
+        }
+        let len0 = pairs.iter().map(|&p| d0[p]).min().unwrap();
         let mut run = Run {
             t: self.t,
             cube: *cube,
@@ -338,8 +352,9 @@ impl<'a> Solver<'a> {
             stats: Stats::default(),
             root,
             d0,
+            pairs,
             level: Level1 {
-                len: d0,
+                len: len0,
                 jobs: vec![],
                 next: 0,
             },
@@ -349,7 +364,7 @@ impl<'a> Solver<'a> {
             reds: vec![],
             red_index: HashMap::new(),
         };
-        run.level.jobs = run.level_jobs(d0);
+        run.level.jobs = run.level_jobs(len0);
         std::thread::scope(|scope| {
             // Watchdog that raises the stop flag at the deadline.
             let (stop_ref, done_ref, have_ref) = (&stop, &done, &have);
@@ -444,7 +459,7 @@ impl<'a, 'r> Run<'a, 'r> {
         }
     }
 
-    fn level_jobs(&self, len: u8) -> Vec<Vec<u8>> {
+    fn level_jobs(&self, len: u8) -> Vec<(u8, Vec<u8>)> {
         let depth = if len < 3 {
             0
         } else if len < 7 {
@@ -468,21 +483,31 @@ impl<'a, 'r> Run<'a, 'r> {
             }
             jobs = next;
         }
-        // Keep only prefixes that can still reach the goal in `len` moves.
+        // Per search, keep only prefixes that can still reach the goal in `len` moves.
         let t = &self.t.p1;
-        jobs.retain(|p| {
-            let mut st = self.root;
-            let mut d = self.d0;
-            for (i, &m) in p.iter().enumerate() {
-                st = st.apply(m as usize, t);
-                d = Mod3Table::decode(d, t.value(&st));
-                if d as usize > len as usize - i - 1 {
-                    return false;
-                }
+        let mut out = vec![];
+        for &pair in &self.pairs {
+            if self.d0[pair] > len {
+                continue;
             }
-            true
-        });
-        jobs
+            out.extend(
+                jobs.iter()
+                    .filter(|p| {
+                        let mut st = self.root;
+                        let mut d = self.d0[pair];
+                        for (i, &m) in p.iter().enumerate() {
+                            st = st.apply(m as usize, t);
+                            d = Mod3Table::decode(d, t.value_pair(&st, pair));
+                            if d as usize > len as usize - i - 1 {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .map(|p| (pair as u8, p.clone())),
+            );
+        }
+        out
     }
 
     /// Collect phase-1 endpoints until there are `want` candidates in total.
@@ -528,8 +553,9 @@ impl<'a, 'r> Run<'a, 'r> {
                                 }
                                 break;
                             }
-                            let prefix = &jobs[j];
-                            let (st, d) = root.after(prefix, d0, t);
+                            let (pair, ref prefix) = jobs[j];
+                            let pair = pair as usize;
+                            let (st, d) = root.after_pair(prefix, d0[pair], t, pair);
                             let mut eps = vec![];
                             let mut spill = vec![];
                             let mut srch = Search1::new(t, |p: &[u8], f| {
@@ -537,6 +563,7 @@ impl<'a, 'r> Run<'a, 'r> {
                                 true
                             });
                             srch.abort = Some(stop);
+                            srch.pair = pair;
                             srch.path.extend_from_slice(prefix);
                             let last = prefix.last().map(|&m| m as usize).unwrap_or(N_MOVES);
                             let left = len - prefix.len() as u8;
@@ -558,9 +585,10 @@ impl<'a, 'r> Run<'a, 'r> {
             let mut results = out.into_inner().unwrap();
             results.sort_by_key(|r| r.0);
             // Subtrees handed back go first, then the jobs not yet claimed.
-            let mut rest: Vec<Vec<u8>> = vec![];
+            let mut rest: Vec<(u8, Vec<u8>)> = vec![];
             for r in &mut results {
-                rest.append(&mut r.2);
+                let pair = jobs[r.0].0;
+                rest.extend(r.2.drain(..).map(|p| (pair, p)));
             }
             if rest.is_empty() {
                 self.level.next = next;
@@ -941,21 +969,48 @@ pub fn load_p1(dir: &std::path::Path, big: bool, threads: usize, verbose: bool) 
 
 /// Load or build all tables in `dir`.
 pub fn load_tables(dir: &std::path::Path, h48_k: u32, threads: usize, verbose: bool) -> Tables {
-    load_tables_with(dir, h48_k, false, false, threads, verbose)
+    load_tables_with(dir, h48_k, false, false, (None, None), threads, verbose)
+}
+
+/// Load (or build) the phase-1 pattern table into `p1`: the reduced one (0.9 GB) or the
+/// large one (`big`, 41 GB). Phase 1 then searches per colour pair.
+pub fn load_pat(
+    p1: &mut P1Tables,
+    dir: &std::path::Path,
+    big: bool,
+    threads: usize,
+    verbose: bool,
+) {
+    p1.pat = Some(crate::p1pat::load(dir, &p1.staging, big, threads, verbose));
+}
+
+/// Load (or build from the large staging table) the phase-1 move-mask table into `p1`: the
+/// large one (`big`, 18.9 GB) or the reduced one (0.8 GB).
+pub fn load_mask(p1: &mut P1Tables, dir: &std::path::Path, big: bool, verbose: bool) {
+    p1.mask = Some(crate::p1mask::load(dir, p1, big, verbose));
 }
 
 /// Load or build all tables in `dir`; `joint`: also the joint phase-2 table (1.05 GB);
-/// `p1_big`: the large phase-1 staging table (1.2 GB).
+/// `p1_big`: the large phase-1 staging table (1.2 GB); `p1_extra`: the phase-1 pattern table
+/// and move-mask table (each `Some(big)`: reduced or large; the masks need `p1_big`).
 pub fn load_tables_with(
     dir: &std::path::Path,
     h48_k: u32,
     joint: bool,
     p1_big: bool,
+    p1_extra: (Option<bool>, Option<bool>),
     threads: usize,
     verbose: bool,
 ) -> Tables {
     let t0 = Instant::now();
-    let p1 = load_p1(dir, p1_big, threads, verbose);
+    let mut p1 = load_p1(dir, p1_big, threads, verbose);
+    if let Some(big) = p1_extra.0 {
+        load_pat(&mut p1, dir, big, threads, verbose);
+    }
+    if let Some(big) = p1_extra.1 {
+        assert!(p1_big, "the move-mask table needs the large staging table");
+        load_mask(&mut p1, dir, big, verbose);
+    }
     let p2_path = dir.join("p2-tau.tab");
     let p2 = {
         let n = crate::phase2::N_TAU;
@@ -998,6 +1053,12 @@ pub fn load_tables_with(
     // Huge pages for the big tables, in parallel.
     std::thread::scope(|s| {
         s.spawn(|| p1.table.data.collapse());
+        if let Some(pt) = &p1.pat {
+            s.spawn(|| pt.table.data.collapse());
+        }
+        if let Some(m) = &p1.mask {
+            s.spawn(|| m.collapse());
+        }
         s.spawn(|| p2.tau_table.data.collapse());
         if let Some(j) = &p2.joint {
             s.spawn(|| j.table.collapse());

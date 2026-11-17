@@ -8,7 +8,15 @@ use eggg_solver::solver::load_tables_with;
 use rand::{Rng, SeedableRng};
 
 fn main() {
-    let t = load_tables_with(std::path::Path::new("tables"), 2, true, false, 8, false);
+    let t = load_tables_with(
+        std::path::Path::new("tables"),
+        2,
+        true,
+        false,
+        (None, None),
+        8,
+        false,
+    );
     let p2 = &t.p2;
     let j = p2.joint.as_ref().unwrap();
     let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(5);

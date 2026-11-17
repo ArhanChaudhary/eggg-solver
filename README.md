@@ -50,6 +50,16 @@ The larger phase-3 tables matter most with few threads, where phase 3 is a large
 the time (one thread: first solution after 6.2 s with `huge`, 1.4 s with `xl`, 0.5 s with
 `xxl`, on average); with many threads phase 1 dominates.
 
+Experimental phase-1 tables (same phase-1 endpoints, fewer table reads; see `src/p1mask.rs`
+and `src/p1pat.rs`): `--p1-mask small` (0.8 GB, generated in seconds) stores, per staging
+state, the moves that decrease the staging distance: deep in the tree almost every node is
+at distance = moves left, and then one read of its mask replaces ~20 reads of its children
+(10x fewer reads in all; phase 1 5x faster on the M2); `--p1-mask big` is the same without
+the symmetry reduction (18.9 GB). `--p1-pat small|big` (0.9 / 41 GB) runs one phase-1 search
+per colour pair, pruned by the distance to staged centres with that pair in a pattern phase
+2 can solve (0.53x reads, 1.4x faster on the M2); with `--p1-mask` too, the pair searches use
+masks of that distance (17.5 GB).
+
 ## How it works
 
 The cube is solved in a fixed frame with 27 moves (U R F D L B Uw Rw Fw and their powers);

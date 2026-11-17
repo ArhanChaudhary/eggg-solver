@@ -7,6 +7,8 @@ pub mod cube3;
 pub mod h48;
 pub mod moves;
 pub mod notation;
+pub mod p1mask;
+pub mod p1pat;
 pub mod p2joint;
 pub mod par;
 pub mod phase1;
