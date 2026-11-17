@@ -100,12 +100,23 @@ impl<T: Copy> std::ops::IndexMut<usize> for HugeBuf<T> {
     }
 }
 
+/// Prefetch the cache line of `p` into all cache levels (a hint: `p` need not be valid).
 #[inline(always)]
 pub fn prefetch<T>(p: *const T) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
     }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{0}]",
+            in(reg) p,
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
 }
 
 /// Distances stored modulo 3 in 2 bits per entry (value 3 = unreachable). The exact distance
