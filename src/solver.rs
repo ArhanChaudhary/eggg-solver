@@ -193,6 +193,35 @@ fn par_jobs(n: usize, threads: usize, stop: &AtomicBool, work: impl Fn(usize) + 
     });
 }
 
+/// A phase-2 candidate from a phase-1 endpoint (None if its centres cannot be solved).
+fn make_candidate(t: &Tables, cube: &Cube, moves1: &[u8], frame: usize) -> Option<Candidate> {
+    let mut c = *cube;
+    for &m in moves1 {
+        c = c.apply_perm(&MOVE_PERMS[m as usize]);
+    }
+    let x = standardise(&c, frame);
+    let centre = t.p2.centre_coord_of(&x);
+    let cd = t.p2.centre_dist[centre as usize];
+    if cd == crate::table::UNSEEN {
+        return None;
+    }
+    let tau = t.p2.tau_of(&x);
+    let dt = match &t.p2.joint {
+        Some(j) => j.distance(&t.p2, centre / 1680, &tau, centre & 1),
+        None => t.p2.tau_distance(&tau),
+    };
+    Some(Candidate {
+        moves1: moves1.to_vec(),
+        frame,
+        cube: x,
+        centre,
+        tau,
+        dt,
+        h2: cd.max(dt),
+        done2: 0,
+    })
+}
+
 pub struct Solver<'a> {
     pub t: &'a Tables,
     pub opts: Options,
@@ -474,49 +503,30 @@ impl<'a, 'r> Run<'a, 'r> {
             self.level.next = claimed.load(Ordering::Relaxed).min(jobs.len());
             let mut results = out.into_inner().unwrap();
             results.sort_by_key(|r| r.0);
+            // New (endpoint, frame) pairs, in job order; their candidates are made in
+            // parallel (standardising and the phase-2 bounds cost ~30 us each).
+            let mut todo: Vec<(Vec<u8>, usize)> = vec![];
             for (_, eps) in results {
                 for (moves, frames) in eps {
                     for f in 0..3 {
-                        if frames >> f & 1 == 1
-                            && self.seen_ep.insert((moves.clone(), f))
-                            && let Some(c) = self.make_candidate(&moves, f)
-                        {
-                            self.cands.push(c);
+                        if frames >> f & 1 == 1 && self.seen_ep.insert((moves.clone(), f)) {
+                            todo.push((moves.clone(), f));
                         }
                     }
                 }
             }
+            let made: Vec<Mutex<Option<Candidate>>> =
+                (0..todo.len()).map(|_| Mutex::new(None)).collect();
+            let (t, cube) = (self.t, &self.cube);
+            crate::par::for_chunks(todo.len(), 64, |r| {
+                for i in r {
+                    *made[i].lock().unwrap() = make_candidate(t, cube, &todo[i].0, todo[i].1);
+                }
+            });
+            self.cands
+                .extend(made.into_iter().filter_map(|m| m.into_inner().unwrap()));
         }
         self.stats.endpoints = self.cands.len();
-    }
-
-    fn make_candidate(&self, moves1: &[u8], frame: usize) -> Option<Candidate> {
-        let t = self.t;
-        let mut c = self.cube;
-        for &m in moves1 {
-            c = c.apply_perm(&MOVE_PERMS[m as usize]);
-        }
-        let x = standardise(&c, frame);
-        let centre = t.p2.centre_coord_of(&x);
-        let cd = t.p2.centre_dist[centre as usize];
-        if cd == crate::table::UNSEEN {
-            return None;
-        }
-        let tau = t.p2.tau_of(&x);
-        let dt = match &t.p2.joint {
-            Some(j) => j.distance(&t.p2, centre / 1680, &tau, centre & 1),
-            None => t.p2.tau_distance(&tau),
-        };
-        Some(Candidate {
-            moves1: moves1.to_vec(),
-            frame,
-            cube: x,
-            centre,
-            tau,
-            dt,
-            h2: cd.max(dt),
-            done2: 0,
-        })
     }
 
     /// Phase 2, level by level on the reduction length, until `want` reductions in total.
