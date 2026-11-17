@@ -1,8 +1,262 @@
-//! A 32-byte vector with an arbitrary byte gather (AVX2 when available, scalar otherwise).
+//! 32-byte vectors and the few byte operations the searches need, with AVX2 (x86-64),
+//! NEON (aarch64) and portable scalar implementations.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(C, align(32))]
 pub struct V32(pub [u8; 32]);
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+mod imp {
+    use super::V32;
+    use std::arch::x86_64::*;
+
+    #[inline(always)]
+    fn ld(a: &V32) -> __m256i {
+        unsafe { _mm256_load_si256(a.0.as_ptr() as *const __m256i) }
+    }
+
+    #[inline(always)]
+    fn st(v: __m256i) -> V32 {
+        let mut o = V32([0; 32]);
+        unsafe { _mm256_store_si256(o.0.as_mut_ptr() as *mut __m256i, v) };
+        o
+    }
+
+    #[inline(always)]
+    pub fn shuf(a: &V32, idx: &V32) -> V32 {
+        unsafe { st(_mm256_shuffle_epi8(ld(a), ld(idx))) }
+    }
+
+    #[inline(always)]
+    pub fn gather(a: &V32, idx: &V32) -> V32 {
+        unsafe {
+            let v = ld(a);
+            let i = ld(idx);
+            let lo = _mm256_permute2x128_si256(v, v, 0x00);
+            let hi = _mm256_permute2x128_si256(v, v, 0x11);
+            let x = _mm256_shuffle_epi8(lo, i);
+            let y = _mm256_shuffle_epi8(hi, i);
+            st(_mm256_blendv_epi8(x, y, _mm256_slli_epi16(i, 3)))
+        }
+    }
+
+    #[inline(always)]
+    pub fn movemask(a: &V32) -> u32 {
+        unsafe { _mm256_movemask_epi8(ld(a)) as u32 }
+    }
+
+    #[inline(always)]
+    pub fn add(a: &V32, b: &V32) -> V32 {
+        unsafe { st(_mm256_add_epi8(ld(a), ld(b))) }
+    }
+
+    #[inline(always)]
+    pub fn sub(a: &V32, b: &V32) -> V32 {
+        unsafe { st(_mm256_sub_epi8(ld(a), ld(b))) }
+    }
+
+    #[inline(always)]
+    pub fn min(a: &V32, b: &V32) -> V32 {
+        unsafe { st(_mm256_min_epu8(ld(a), ld(b))) }
+    }
+
+    #[inline(always)]
+    pub fn xor(a: &V32, b: &V32) -> V32 {
+        unsafe { st(_mm256_xor_si256(ld(a), ld(b))) }
+    }
+
+    #[inline(always)]
+    pub fn and(a: &V32, b: &V32) -> V32 {
+        unsafe { st(_mm256_and_si256(ld(a), ld(b))) }
+    }
+
+    #[inline(always)]
+    pub fn cmpeq(a: &V32, x: u8) -> V32 {
+        unsafe { st(_mm256_cmpeq_epi8(ld(a), _mm256_set1_epi8(x as i8))) }
+    }
+
+    /// Shift every byte left by N bits (bits leaving a byte may enter the next one; only bit
+    /// 7 of the result is meaningful).
+    #[inline(always)]
+    pub fn shl<const N: i32>(a: &V32) -> V32 {
+        unsafe { st(_mm256_slli_epi16::<N>(ld(a))) }
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+mod imp {
+    use super::V32;
+    use std::arch::aarch64::*;
+
+    #[inline(always)]
+    fn ld(a: &V32) -> (uint8x16_t, uint8x16_t) {
+        unsafe { (vld1q_u8(a.0.as_ptr()), vld1q_u8(a.0.as_ptr().add(16))) }
+    }
+
+    #[inline(always)]
+    fn st(v: (uint8x16_t, uint8x16_t)) -> V32 {
+        let mut o = V32([0; 32]);
+        unsafe {
+            vst1q_u8(o.0.as_mut_ptr(), v.0);
+            vst1q_u8(o.0.as_mut_ptr().add(16), v.1);
+        }
+        o
+    }
+
+    #[inline(always)]
+    fn map2(a: &V32, b: &V32, f: impl Fn(uint8x16_t, uint8x16_t) -> uint8x16_t) -> V32 {
+        let (a0, a1) = ld(a);
+        let (b0, b1) = ld(b);
+        st((f(a0, b0), f(a1, b1)))
+    }
+
+    /// pshufb: per 16-byte lane, index bit 7 gives 0, else the low nibble selects.
+    #[inline(always)]
+    pub fn shuf(a: &V32, idx: &V32) -> V32 {
+        unsafe {
+            let m = vdupq_n_u8(0x8f);
+            map2(a, idx, |t, i| vqtbl1q_u8(t, vandq_u8(i, m)))
+        }
+    }
+
+    #[inline(always)]
+    pub fn gather(a: &V32, idx: &V32) -> V32 {
+        unsafe {
+            let (a0, a1) = ld(a);
+            let t = uint8x16x2_t(a0, a1);
+            let (i0, i1) = ld(idx);
+            st((vqtbl2q_u8(t, i0), vqtbl2q_u8(t, i1)))
+        }
+    }
+
+    #[inline(always)]
+    pub fn movemask(a: &V32) -> u32 {
+        unsafe {
+            const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+            let w = vld1q_u8(W.as_ptr());
+            let (a0, a1) = ld(a);
+            let m0 = vandq_u8(vcltzq_s8(vreinterpretq_s8_u8(a0)), w);
+            let m1 = vandq_u8(vcltzq_s8(vreinterpretq_s8_u8(a1)), w);
+            let b0 = vaddv_u8(vget_low_u8(m0)) as u32 | (vaddv_u8(vget_high_u8(m0)) as u32) << 8;
+            let b1 = vaddv_u8(vget_low_u8(m1)) as u32 | (vaddv_u8(vget_high_u8(m1)) as u32) << 8;
+            b0 | b1 << 16
+        }
+    }
+
+    #[inline(always)]
+    pub fn add(a: &V32, b: &V32) -> V32 {
+        unsafe { map2(a, b, |x, y| vaddq_u8(x, y)) }
+    }
+
+    #[inline(always)]
+    pub fn sub(a: &V32, b: &V32) -> V32 {
+        unsafe { map2(a, b, |x, y| vsubq_u8(x, y)) }
+    }
+
+    #[inline(always)]
+    pub fn min(a: &V32, b: &V32) -> V32 {
+        unsafe { map2(a, b, |x, y| vminq_u8(x, y)) }
+    }
+
+    #[inline(always)]
+    pub fn xor(a: &V32, b: &V32) -> V32 {
+        unsafe { map2(a, b, |x, y| veorq_u8(x, y)) }
+    }
+
+    #[inline(always)]
+    pub fn and(a: &V32, b: &V32) -> V32 {
+        unsafe { map2(a, b, |x, y| vandq_u8(x, y)) }
+    }
+
+    #[inline(always)]
+    pub fn cmpeq(a: &V32, x: u8) -> V32 {
+        unsafe {
+            let c = vdupq_n_u8(x);
+            let (a0, a1) = ld(a);
+            st((vceqq_u8(a0, c), vceqq_u8(a1, c)))
+        }
+    }
+
+    #[inline(always)]
+    pub fn shl<const N: i32>(a: &V32) -> V32 {
+        unsafe {
+            let (a0, a1) = ld(a);
+            st((vshlq_n_u8::<N>(a0), vshlq_n_u8::<N>(a1)))
+        }
+    }
+}
+
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "avx2"),
+    all(target_arch = "aarch64", target_feature = "neon")
+)))]
+mod imp {
+    use super::V32;
+
+    #[inline(always)]
+    fn zip(a: &V32, b: &V32, f: impl Fn(u8, u8) -> u8) -> V32 {
+        V32(std::array::from_fn(|i| f(a.0[i], b.0[i])))
+    }
+
+    #[inline(always)]
+    pub fn shuf(a: &V32, idx: &V32) -> V32 {
+        V32(std::array::from_fn(|i| {
+            let x = idx.0[i];
+            if x & 0x80 != 0 {
+                0
+            } else {
+                a.0[(i & 16) + (x & 15) as usize]
+            }
+        }))
+    }
+
+    #[inline(always)]
+    pub fn gather(a: &V32, idx: &V32) -> V32 {
+        V32(std::array::from_fn(|i| a.0[(idx.0[i] & 31) as usize]))
+    }
+
+    #[inline(always)]
+    pub fn movemask(a: &V32) -> u32 {
+        (0..32).fold(0, |m, i| m | ((a.0[i] >> 7) as u32) << i)
+    }
+
+    #[inline(always)]
+    pub fn add(a: &V32, b: &V32) -> V32 {
+        zip(a, b, u8::wrapping_add)
+    }
+
+    #[inline(always)]
+    pub fn sub(a: &V32, b: &V32) -> V32 {
+        zip(a, b, u8::wrapping_sub)
+    }
+
+    #[inline(always)]
+    pub fn min(a: &V32, b: &V32) -> V32 {
+        zip(a, b, u8::min)
+    }
+
+    #[inline(always)]
+    pub fn xor(a: &V32, b: &V32) -> V32 {
+        zip(a, b, |x, y| x ^ y)
+    }
+
+    #[inline(always)]
+    pub fn and(a: &V32, b: &V32) -> V32 {
+        zip(a, b, |x, y| x & y)
+    }
+
+    #[inline(always)]
+    pub fn cmpeq(a: &V32, x: u8) -> V32 {
+        V32(std::array::from_fn(|i| if a.0[i] == x { 0xff } else { 0 }))
+    }
+
+    #[inline(always)]
+    pub fn shl<const N: i32>(a: &V32) -> V32 {
+        V32(a.0.map(|x| x << N))
+    }
+}
+
+pub use imp::{add, and, cmpeq, gather, min, movemask, shl, shuf, sub, xor};
 
 impl V32 {
     pub const ZERO: V32 = V32([0; 32]);
@@ -16,76 +270,27 @@ impl V32 {
     /// `out[i] = self[idx[i]]` for every i (indices < 32).
     #[inline(always)]
     pub fn gather(self, idx: &V32) -> V32 {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        unsafe {
-            use std::arch::x86_64::*;
-            let v = _mm256_load_si256(self.0.as_ptr() as *const __m256i);
-            let i = _mm256_load_si256(idx.0.as_ptr() as *const __m256i);
-            let lo = _mm256_permute2x128_si256(v, v, 0x00);
-            let hi = _mm256_permute2x128_si256(v, v, 0x11);
-            let a = _mm256_shuffle_epi8(lo, i);
-            let b = _mm256_shuffle_epi8(hi, i);
-            let sel = _mm256_slli_epi16(i, 3); // bit 4 -> bit 7
-            let r = _mm256_blendv_epi8(a, b, sel);
-            let mut out = V32::ZERO;
-            _mm256_store_si256(out.0.as_mut_ptr() as *mut __m256i, r);
-            out
-        }
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-        {
-            let mut out = [0u8; 32];
-            for i in 0..32 {
-                out[i] = self.0[(idx.0[i] & 31) as usize];
-            }
-            V32(out)
-        }
+        gather(&self, idx)
     }
 
     /// Bitmask of the bytes equal to `x` (bit i for byte i).
     #[inline(always)]
     pub fn eq_mask(self, x: u8) -> u32 {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        unsafe {
-            use std::arch::x86_64::*;
-            let v = _mm256_load_si256(self.0.as_ptr() as *const __m256i);
-            _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(x as i8))) as u32
-        }
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-        {
-            let mut m = 0;
-            for i in 0..32 {
-                m |= ((self.0[i] == x) as u32) << i;
-            }
-            m
-        }
+        movemask(&cmpeq(&self, x))
     }
 
     /// Bitmask of the bytes whose value has bit `b` set.
     #[inline(always)]
     pub fn bit_mask(self, b: u32) -> u32 {
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        unsafe {
-            use std::arch::x86_64::*;
-            let v = _mm256_load_si256(self.0.as_ptr() as *const __m256i);
-            let shifted = match b {
-                0 => _mm256_slli_epi16(v, 7),
-                1 => _mm256_slli_epi16(v, 6),
-                2 => _mm256_slli_epi16(v, 5),
-                3 => _mm256_slli_epi16(v, 4),
-                4 => _mm256_slli_epi16(v, 3),
-                5 => _mm256_slli_epi16(v, 2),
-                6 => _mm256_slli_epi16(v, 1),
-                _ => v,
-            };
-            _mm256_movemask_epi8(shifted) as u32
-        }
-        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
-        {
-            let mut m = 0;
-            for i in 0..32 {
-                m |= (((self.0[i] >> b) & 1) as u32) << i;
-            }
-            m
+        match b {
+            0 => movemask(&shl::<7>(&self)),
+            1 => movemask(&shl::<6>(&self)),
+            2 => movemask(&shl::<5>(&self)),
+            3 => movemask(&shl::<4>(&self)),
+            4 => movemask(&shl::<3>(&self)),
+            5 => movemask(&shl::<2>(&self)),
+            6 => movemask(&shl::<1>(&self)),
+            _ => movemask(&self),
         }
     }
 }
@@ -95,18 +300,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gather_matches_scalar() {
+    fn primitives_match_scalar() {
         let mut v = [0u8; 32];
         let mut idx = [0u8; 32];
+        let mut sh = [0u8; 32];
         for i in 0..32 {
-            v[i] = (i * 7 + 3) as u8;
+            v[i] = (i * 7 + 3) as u8 ^ ((i as u8) << 4);
             idx[i] = ((i * 13 + 5) % 32) as u8;
+            sh[i] = if i % 5 == 0 {
+                0x80
+            } else {
+                ((i * 11) as u8 & 0x3f) | ((i as u8 & 1) << 6)
+            };
         }
-        let r = V32(v).gather(&V32(idx));
+        let (a, b) = (V32(v), V32(idx));
+        let r = a.gather(&b);
         for i in 0..32 {
             assert_eq!(r.0[i], v[idx[i] as usize]);
         }
-        assert_eq!(V32(v).eq_mask(3), 1);
-        assert_eq!(V32(v).bit_mask(0).count_ones(), 16);
+        let s = shuf(&a, &V32(sh));
+        for i in 0..32 {
+            let want = if sh[i] & 0x80 != 0 {
+                0
+            } else {
+                v[(i & 16) + (sh[i] & 15) as usize]
+            };
+            assert_eq!(s.0[i], want, "shuf byte {i}");
+        }
+        let m = movemask(&a);
+        for i in 0..32 {
+            assert_eq!(m >> i & 1, (v[i] >> 7) as u32);
+        }
+        assert_eq!(a.eq_mask(v[3]) >> 3 & 1, 1);
+        for bit in 0..8 {
+            let bm = a.bit_mask(bit);
+            for i in 0..32 {
+                assert_eq!(bm >> i & 1, (v[i] >> bit & 1) as u32);
+            }
+        }
+        let mn = min(&a, &b);
+        let ad = add(&a, &b);
+        let sb = sub(&a, &b);
+        for i in 0..32 {
+            assert_eq!(mn.0[i], v[i].min(idx[i]));
+            assert_eq!(ad.0[i], v[i].wrapping_add(idx[i]));
+            assert_eq!(sb.0[i], v[i].wrapping_sub(idx[i]));
+        }
     }
 }
