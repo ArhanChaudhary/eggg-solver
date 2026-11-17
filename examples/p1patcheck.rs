@@ -103,9 +103,14 @@ fn main() {
         let t0 = Instant::now();
         load_pat(&mut p1, dir, pat == "big", 8, true);
         p1.pat.as_ref().unwrap().table.data.collapse();
-        if std::env::var("EGGG_P1_MASK").is_ok_and(|v| v == "virtual") {
-            // Counts only: per-pair searches with batches of pattern-decreasing moves.
-            p1.mask = Some(eggg_solver::p1mask::MaskTable::virtual_table());
+        match std::env::var("EGGG_P1_MASK").as_deref() {
+            // Per-pair searches with batches of pattern-decreasing moves: computed from the
+            // pattern table (virtual: directly; lazy: through the pair table's indexing), or
+            // the pair mask table (pair).
+            Ok("virtual") => p1.mask = Some(eggg_solver::p1mask::MaskTable::virtual_table()),
+            Ok("lazy") => p1.mask = Some(eggg_solver::p1mask::MaskTable::lazy_pair_table()),
+            Ok("pair") => load_mask(&mut p1, dir, false, true),
+            _ => {}
         }
         eprintln!(
             "pattern table loaded in {:.1} s",
@@ -114,6 +119,7 @@ fn main() {
         let (eps, nodes, el) = run(&p1, true, threads);
         report("pair searches", &eps, nodes, el, threads);
         if check {
+            p1.mask = None;
             let (want, nodes0, el0) = run(&p1, false, threads);
             report("plain search", &want, nodes0, el0, threads);
             assert!(eps == want, "different endpoint sets");

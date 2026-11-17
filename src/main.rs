@@ -169,7 +169,8 @@ struct TableArgs {
     p1_pat: Option<PatArg>,
     /// Phase-1 move-mask table (the distance-decreasing moves of each staging state; nodes
     /// at distance = moves left read one mask instead of ~20 child entries): none, the
-    /// symmetry-reduced one (0.8 GB) or the large one (18.9 GB). Implies --p1-big.
+    /// symmetry-reduced one (0.8 GB) or the large one (18.9 GB). Implies --p1-big. With
+    /// --p1-pat: the pair table instead (pattern-distance-decreasing moves, 17.5 GB).
     #[arg(long, value_enum)]
     p1_mask: Option<PatArg>,
 }

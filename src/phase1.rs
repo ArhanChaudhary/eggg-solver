@@ -913,10 +913,13 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 self.batch.clear();
                 return;
             }
-            if mt.kind == crate::p1mask::MaskKind::Reduced {
+            if matches!(
+                mt.kind,
+                crate::p1mask::MaskKind::Reduced | crate::p1mask::MaskKind::Pair
+            ) {
                 // The reduced table's index needs the class info (prefetched at the push).
                 for nd in cur.iter_mut() {
-                    (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.s);
+                    (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.s, self.pair);
                 }
             }
             for nd in &cur {
@@ -944,6 +947,17 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                             self.batch.clear();
                             return;
                         }
+                    }
+                } else if mt.kind == crate::p1mask::MaskKind::Pair {
+                    // The children's first index: the rank of the pair's positions.
+                    let flags = t.pat.as_ref().unwrap().flags(&nd.s.centres, self.pair);
+                    while a != 0 {
+                        let m = a.trailing_zeros() as usize;
+                        a &= a - 1;
+                        let g = unsafe { child_flags(&flags, m, t) };
+                        let i = t.staging.rank24(crate::simd::movemask(&g)) as u64;
+                        let c = nd.s.apply(m, t);
+                        self.push_batch(c, i, nd.left - 1, m, Some(m as u8));
                     }
                 } else {
                     let flags = nd.s.centre_flags();
@@ -991,7 +1005,13 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             if self.t.mask.is_some() && !self.stop {
                 self.run_batch();
             }
-        } else if self.t.big && self.t.mask.is_some() {
+        } else if self.t.big
+            && self
+                .t
+                .mask
+                .as_ref()
+                .is_some_and(|m| m.kind != crate::p1mask::MaskKind::Pair)
+        {
             self.dfs_t::<K_MASK>(s, d, left, last);
             if !self.stop {
                 self.run_batch();
@@ -1082,8 +1102,12 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         // move-mask table, which then gives the pattern-distance-decreasing moves.
         let batched = K == K_MASK || (K >= K_PAT && K <= K_PAT_BIG && self.t.mask.is_some());
         if batched && d == left {
-            let (ud, rl) = s.masks();
-            let i = self.t.staging.big_index(ud, rl);
+            let i = self
+                .t
+                .mask
+                .as_ref()
+                .unwrap()
+                .pre_index(self.t, s, self.pair);
             self.push_batch(*s, i, left, last, None);
             return;
         }
@@ -1197,7 +1221,12 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             if dc < left {
                 let c = s.apply(m, t);
                 if batched && dc == left - 1 && dc >= self.batch_min_left() {
-                    self.push_batch(c, idx[k], dc, m, Some(m as u8));
+                    let i = if K == K_MASK {
+                        idx[k]
+                    } else {
+                        t.mask.as_ref().unwrap().pre_index(t, &c, self.pair)
+                    };
+                    self.push_batch(c, i, dc, m, Some(m as u8));
                     if self.batch.len() >= BATCH {
                         self.run_batch();
                     }

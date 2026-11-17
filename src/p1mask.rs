@@ -13,6 +13,10 @@
 //! symmetry that takes its U/D mask to the class representative), with the masks over all 36
 //! outer block moves (8 bytes, 0.8 GB): the searched state's 27-move mask is the stored mask
 //! with each move conjugated by that symmetry (five byte lookups).
+//!
+//! For the per-pair searches (see [`crate::p1pat`]), the pair table holds the same for the
+//! pattern distance: by the reduced pattern index (3.5e9 states), the 36-move masks of the
+//! moves that decrease it (5 bytes, 17.5 GB).
 
 use crate::comb::comb_unrank;
 use crate::cube::{B, D, L, Perm, Turn};
@@ -35,6 +39,9 @@ pub enum MaskKind {
     Reduced,
     /// No table: masks computed from the staging table when needed (tests).
     Virtual,
+    /// 36-bit masks of pattern-distance-decreasing moves by the reduced pattern index
+    /// (5 bytes per entry, 17.5 GB), for the per-pair searches.
+    Pair,
 }
 
 pub struct MaskTable {
@@ -44,6 +51,10 @@ pub struct MaskTable {
     pub batch_leaves: bool,
     big: HugeBuf<u32>,
     red: HugeBuf<u64>,
+    /// The pair table: 5 bytes per entry (and 3 bytes of padding).
+    pair: HugeBuf<u8>,
+    /// The pair table's entries are computed when read, from the pattern table (tests).
+    lazy: bool,
     /// Per symmetry, per byte of a stored 36-bit mask: the searched state's 27-bit mask.
     conj: Vec<[[u32; 256]; 5]>,
 }
@@ -110,7 +121,19 @@ impl MaskTable {
             batch_leaves: std::env::var_os("EGGG_P1_BATCH_LEAVES").is_some(),
             big: HugeBuf::zeroed(1),
             red: HugeBuf::zeroed(1),
+            pair: HugeBuf::zeroed(1),
+            lazy: false,
             conj: vec![],
+        }
+    }
+
+    /// A pair "table" whose entries are computed when read, through the pair table's
+    /// indexing and conjugation (tests).
+    pub fn lazy_pair_table() -> MaskTable {
+        MaskTable {
+            lazy: true,
+            conj: Self::conj_tables(),
+            ..Self::empty(MaskKind::Pair)
         }
     }
 
@@ -148,7 +171,21 @@ impl MaskTable {
         match self.kind {
             MaskKind::Big => self.big.collapse(),
             MaskKind::Reduced => self.red.collapse(),
+            MaskKind::Pair => self.pair.collapse(),
             MaskKind::Virtual => {}
+        }
+    }
+
+    /// The first index of a batch node (state `s`, search over `pair`): the large staging
+    /// index, or for the pair table the rank of the pair's positions.
+    #[inline(always)]
+    pub fn pre_index(&self, t: &P1Tables, s: &P1State, pair: usize) -> u64 {
+        if self.kind == MaskKind::Pair {
+            let g = t.pat.as_ref().unwrap().flags(&s.centres, pair);
+            t.staging.rank24(crate::simd::movemask(&g)) as u64
+        } else {
+            let (ud, rl) = s.masks();
+            t.staging.big_index(ud, rl)
         }
     }
 
@@ -162,6 +199,7 @@ impl MaskTable {
             MaskKind::Reduced => {
                 crate::table::prefetch(t.staging.info_of_rank(i / N_SPLIT as u64));
             }
+            MaskKind::Pair => crate::table::prefetch(t.staging.info_of_rank(i)),
             MaskKind::Virtual => {}
         }
     }
@@ -169,8 +207,15 @@ impl MaskTable {
     /// The reduced table's index and symmetry for the node with large staging index `i`
     /// (its class info prefetched), the entry prefetched.
     #[inline(always)]
-    pub fn resolve(&self, t: &P1Tables, i: u64, s: &P1State) -> (u64, u8) {
+    pub fn resolve(&self, t: &P1Tables, i: u64, s: &P1State, pair: usize) -> (u64, u8) {
         let st = &t.staging;
+        if self.kind == MaskKind::Pair {
+            let pt = t.pat.as_ref().unwrap();
+            let info = unsafe { *st.info_of_rank(i) };
+            let j = pt.red_index(st, info, &pt.flags(&s.centres, pair));
+            crate::table::prefetch(unsafe { self.pair.as_ptr().add(5 * j as usize) });
+            return (j, info as u8);
+        }
         let info = unsafe { *st.info_of_rank(i / N_SPLIT as u64) };
         let j = st.fast_index_flags(info, &s.centre_flags());
         crate::table::prefetch(unsafe { self.red.as_ptr().add(j as usize) });
@@ -183,8 +228,19 @@ impl MaskTable {
     pub fn get(&self, t: &P1Tables, i: u64, sym: u8, s: &P1State, pair: usize) -> u32 {
         match self.kind {
             MaskKind::Big => self.big[i as usize],
-            MaskKind::Reduced => {
-                let e = self.red[i as usize];
+            MaskKind::Reduced | MaskKind::Pair => {
+                let e = if self.lazy {
+                    let pt = t.pat.as_ref().unwrap();
+                    let g = pt.red_state(&t.staging, i as usize);
+                    pair_mask_of(t, &g, pt.table.get(i), &moves36())
+                } else if self.kind == MaskKind::Pair {
+                    // SAFETY: 5 i + 8 is within the buffer (3 bytes of padding).
+                    unsafe {
+                        (self.pair.as_ptr().add(5 * i as usize) as *const u64).read_unaligned()
+                    }
+                } else {
+                    self.red[i as usize]
+                };
                 let c = unsafe { self.conj.get_unchecked(sym as usize) };
                 c[0][(e & 255) as usize]
                     | c[1][(e >> 8 & 255) as usize]
@@ -228,6 +284,33 @@ impl MaskTable {
         }
     }
 
+    /// The pair table, from the reduced pattern table (`t.pat`).
+    pub fn generate_pair(t: &P1Tables) -> MaskTable {
+        let pt = t.pat.as_ref().unwrap();
+        assert!(!pt.big);
+        let n = crate::p1pat::N_RED;
+        let mut pair = HugeBuf::<u8>::zeroed(5 * n + 3);
+        let ptr = pair.as_mut_slice().as_mut_ptr() as usize;
+        let mv = moves36();
+        crate::par::for_chunks(n, 1 << 12, |r| {
+            for i in r {
+                let e = pair_mask_of(t, &pt.red_state(&t.staging, i), pt.table.get(i as u64), &mv);
+                // SAFETY: each entry's 5 bytes are written by one thread only.
+                unsafe {
+                    let p = (ptr as *mut u8).add(5 * i);
+                    for k in 0..5 {
+                        *p.add(k) = (e >> (8 * k)) as u8;
+                    }
+                }
+            }
+        });
+        MaskTable {
+            pair,
+            conj: Self::conj_tables(),
+            ..Self::empty(MaskKind::Pair)
+        }
+    }
+
     /// The reduced table, from the large staging table (`t.big`).
     pub fn generate_reduced(t: &P1Tables) -> MaskTable {
         assert!(t.big);
@@ -256,6 +339,9 @@ impl MaskTable {
 pub fn load(dir: &std::path::Path, t: &P1Tables, big: bool, verbose: bool) -> MaskTable {
     if std::env::var_os("EGGG_P1_MASK_VIRTUAL").is_some() {
         return MaskTable::virtual_table();
+    }
+    if t.pat.is_some() {
+        return load_pair(dir, t, verbose);
     }
     let name = if big { "p1-mask-big" } else { "p1-mask" };
     let path = dir.join(format!("{name}.tab"));
@@ -298,6 +384,50 @@ pub fn load(dir: &std::path::Path, t: &P1Tables, big: bool, verbose: bool) -> Ma
     m
 }
 
+/// The mask over the 36 moves of pattern-distance-decreasing moves of the state with pair
+/// flags `g` (see `PatTable::flags`) and stored value `v`, from the reduced pattern table.
+fn pair_mask_of(t: &P1Tables, g: &V32, v: u8, moves: &[V32; N36]) -> u64 {
+    let pt = t.pat.as_ref().unwrap();
+    let st = &t.staging;
+    if v == 3 {
+        return 0;
+    }
+    let mut idx = [0u64; N36];
+    for (e, mv) in idx.iter_mut().zip(moves) {
+        let h = g.gather(mv);
+        let info = unsafe { *st.info(crate::simd::movemask(&h)) };
+        *e = pt.red_index(st, info, &h);
+        pt.table.prefetch(*e);
+    }
+    let want = (v + 2) % 3;
+    let mut mask = 0;
+    for (m, &e) in idx.iter().enumerate() {
+        if pt.table.get(e) == want {
+            mask |= 1 << m;
+        }
+    }
+    mask
+}
+
+/// Load (or generate from the reduced pattern table, ~17.5 GB, and save) the pair table.
+fn load_pair(dir: &std::path::Path, t: &P1Tables, verbose: bool) -> MaskTable {
+    let name = "p1-pair-mask";
+    let path = dir.join(format!("{name}.tab"));
+    let mut m = MaskTable::empty(MaskKind::Pair);
+    m.pair = HugeBuf::zeroed(5 * crate::p1pat::N_RED + 3);
+    if crate::table::load(&path, name, m.pair.as_bytes_mut()).is_ok() {
+        m.conj = MaskTable::conj_tables();
+        return m;
+    }
+    drop(m);
+    if verbose {
+        eprintln!("generating the phase-1 pair move-mask table (17.5 GB)...");
+    }
+    let m = MaskTable::generate_pair(t);
+    crate::table::save(&path, name, m.pair.as_bytes()).expect("saving table");
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +461,33 @@ mod tests {
                 let c = &conj[(info & 255) as usize];
                 let got = (0..5).fold(0, |a, k| a | c[k][(e >> (8 * k) & 255) as usize]);
                 assert_eq!(got, want);
+                s = s.apply((k * 5 + 1) % N_MOVES, &t);
+            }
+        }
+    }
+
+    /// The pair table's masks (through its indexing and conjugation, entries computed by the
+    /// generator's function) are the pattern-distance-decreasing moves (needs the large
+    /// staging and reduced pattern tables in ./tables; skipped without them).
+    #[test]
+    fn pair_masks_are_decreasing_moves() {
+        let dir = std::path::Path::new("tables");
+        if !dir.join("p1-staging-big.tab").exists() || !dir.join("p1-pat.tab").exists() {
+            return;
+        }
+        let mut t = crate::solver::load_p1(dir, true, 8, false);
+        crate::solver::load_pat(&mut t, dir, false, 8, false);
+        let v = MaskTable::virtual_table();
+        let lazy = MaskTable::lazy_pair_table();
+        let mut rng = rand::thread_rng();
+        for _ in 0..100 {
+            let mut s = P1State::from_cube(&Cube::random(&mut rng));
+            for k in 0..12 {
+                for pair in 0..3 {
+                    let i = lazy.pre_index(&t, &s, pair);
+                    let (j, sym) = lazy.resolve(&t, i, &s, pair);
+                    assert_eq!(lazy.get(&t, j, sym, &s, pair), v.get(&t, 0, 0, &s, pair));
+                }
                 s = s.apply((k * 5 + 1) % N_MOVES, &t);
             }
         }

@@ -184,7 +184,7 @@ impl PatTable {
     }
 
     /// Flags of the reduced table's state `i` (its class representative).
-    fn red_state(&self, st: &Staging, i: usize) -> V32 {
+    pub(crate) fn red_state(&self, st: &Staging, i: usize) -> V32 {
         let class = i / N_XQ;
         let x = i / N_Q % N_X;
         let q = i % N_Q;
