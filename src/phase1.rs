@@ -641,6 +641,12 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             }
             return;
         }
+        // Only the wide quarter turns change which axis a centre is on (and they flip the wing
+        // parity): from staged centres with odd wing parity, staged centres with even parity
+        // are at least three moves away.
+        if d == 0 && s.parity && left <= 2 {
+            return;
+        }
         let mut allowed = ALLOWED_AFTER[last];
         if left == 1 {
             // The last move must leave the wing permutation even, and the wings pairable in a
@@ -664,7 +670,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     continue;
                 }
                 let c = s.apply(m, self.t);
-                if Mod3Table::decode(d, self.t.value(&c)) != 0 {
+                // From staged centres the allowed (non-wide-quarter) moves keep them staged.
+                if d != 0 && Mod3Table::decode(d, self.t.value(&c)) != 0 {
                     continue;
                 }
                 for (f, fr) in self.t.frames.iter().enumerate() {
@@ -678,6 +685,25 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     self.path.pop();
                     if !go {
                         self.stop = true;
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+        if d == 0 {
+            // Staged parent: children are staged except after a wide quarter turn (distance 1).
+            while allowed != 0 {
+                let m = allowed.trailing_zeros() as usize;
+                allowed &= allowed - 1;
+                self.nodes += 1;
+                let dc = (WIDE_QUARTER >> m & 1) as u8;
+                if dc < left {
+                    let c = s.apply(m, self.t);
+                    self.path.push(m as u8);
+                    self.dfs(&c, dc, left - 1, m);
+                    self.path.pop();
+                    if self.stop {
                         return;
                     }
                 }
