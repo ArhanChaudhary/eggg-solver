@@ -16,7 +16,8 @@ for suite in mt st; do
     name=${ns%%=*}; build=$name; [[ $ns == *=* ]] && build=${ns#*=}
     [ $suite = mt ] && names+=("$name")
     if [ $suite = mt ]; then args="-N 10 -t 5 --seed 2026"; else args="-N 4 -t 12 -j 1 --seed 2027"; fi
-    cmds="$cmds echo == $name $suite; ./bin/eggg-$build bench $args --h48 $h48 $flags --tables ~/eggg/tables --json results/$name-$suite.json 2>&1 | grep -v 'bfs depth';"
+    hflag="--h48 $h48"; [[ $flags == *--h48* ]] && hflag=""
+    cmds="$cmds echo == $name $suite; ./bin/eggg-$build bench $args $hflag $flags --tables ~/eggg/tables --json results/$name-$suite.json 2>&1 | grep -v 'bfs depth';"
   done
 done
 $M2 "flock -x /tmp/m2-bench.lock bash -c \"$cmds\"" 2>&1 | grep -v "^\s*$" | grep -E "==|mean|first|final|nodes|positions|Mem|error"
