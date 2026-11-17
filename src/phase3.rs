@@ -64,7 +64,7 @@ impl P3Tables {
 }
 
 /// Quarter turns among the 18 outer moves.
-const QUARTER: u32 = {
+pub(crate) const QUARTER: u32 = {
     let mut m = 0u32;
     let mut i = 0;
     while i < 18 {
@@ -77,7 +77,7 @@ const QUARTER: u32 = {
 };
 
 /// Moves that may precede move `b` in a canonical sequence (`N_MOVES` = none follows).
-const ALLOWED_BEFORE: [u32; crate::moves::N_MOVES + 1] = {
+pub(crate) const ALLOWED_BEFORE: [u32; crate::moves::N_MOVES + 1] = {
     let mut t = [0u32; crate::moves::N_MOVES + 1];
     let mut b = 0;
     while b <= crate::moves::N_MOVES {
@@ -95,12 +95,12 @@ const ALLOWED_BEFORE: [u32; crate::moves::N_MOVES + 1] = {
 
 /// A phase-3 node: the cube and its inverse.
 #[derive(Clone, Copy)]
-struct Node {
-    v: C3,
-    y: C3,
+pub(crate) struct Node {
+    pub(crate) v: C3,
+    pub(crate) y: C3,
 }
 
-const KNOWN: usize = usize::MAX;
+pub(crate) const KNOWN: usize = usize::MAX;
 
 struct Kid {
     node: Node,
@@ -115,7 +115,7 @@ struct Kid {
 impl P3Tables {
     /// (corner-class distance, h48 index) of a cube.
     #[inline(always)]
-    fn probe(&self, v: &C3) -> (u8, usize) {
+    pub(crate) fn probe(&self, v: &C3) -> (u8, usize) {
         let cs = self.coords.cocsep[self.fast.cocsep(v)];
         let (eslot, msplit, eo) = self.fast.edges(v, (cs >> 8 & 255) as usize);
         (
@@ -152,14 +152,14 @@ pub struct Search3<'a> {
 /// A subtree of a phase-3 search (one child of the root), to be searched separately.
 #[derive(Clone)]
 pub struct Task {
-    node: Node,
-    left: u8,
-    last_f: usize,
-    last_b: usize,
-    hv: u8,
-    hy: u8,
-    front: Vec<u8>,
-    back: Vec<u8>,
+    pub(crate) node: Node,
+    pub(crate) left: u8,
+    pub(crate) last_f: usize,
+    pub(crate) last_b: usize,
+    pub(crate) hv: u8,
+    pub(crate) hy: u8,
+    pub(crate) front: Vec<u8>,
+    pub(crate) back: Vec<u8>,
 }
 
 impl<'a> Search3<'a> {
