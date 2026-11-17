@@ -592,10 +592,21 @@ impl<'a, 'r> Run<'a, 'r> {
 
     /// Phase 2, level by level on the reduction length, until `want` reductions in total.
     fn phase2(&mut self, want: usize) {
-        // Reductions are only worth producing if a phase 3 of 14 moves or more could still
-        // beat the best solution (14 moves: ~2e-4 of random 3x3 states, but that level has
-        // ~10x the reductions of the one below, and phase 3 checks them cheaply).
-        let cap = self.best_len().saturating_sub(15).min(64);
+        // Reductions are produced up to L12 = best - margin, i.e. while a phase 3 of
+        // margin - 1 moves could still beat the best solution. Each deeper level has ~16x the
+        // reductions of the one above and each is ~13x less likely to have a short enough
+        // phase 3, so every level adds about as many chances, for ~16x the phase-2 work: the
+        // margin goes from 15 to 13 as the run gets longer (phases 2 and 3 are then cheap
+        // next to phase 1). Measured on 20 positions x 30 s: 39.3 -> 39.0 moves.
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let margin = if elapsed < 3.0 {
+            15
+        } else if elapsed < 6.0 {
+            14
+        } else {
+            13
+        };
+        let cap = self.best_len().saturating_sub(margin).min(64);
         let mut t12 = self
             .cands
             .iter()
@@ -625,6 +636,10 @@ impl<'a, 'r> Run<'a, 'r> {
     /// candidates not searched keep the level for the next round).
     fn phase2_level(&mut self, t12: usize, need: usize) -> Vec<Reduction> {
         let t = self.t;
+        let best = self.best_len();
+        // Before a first solution phase 2 is not capped, so each search keeps at most 64
+        // solutions; after it, the cap bounds the searches and all their solutions count.
+        let max_sols = if self.best.is_some() { usize::MAX } else { 64 };
         let cands = &self.cands;
         let jobs: Vec<usize> = (0..cands.len())
             .filter(|&i| {
@@ -663,7 +678,7 @@ impl<'a, 'r> Run<'a, 'r> {
             let mut sols: Vec<Vec<u8>> = vec![];
             let mut keep = |p: &[u8]| {
                 sols.push(p.to_vec());
-                sols.len() < 64
+                sols.len() < max_sols
             };
             if t.p2.joint.is_some() {
                 srch.dfs_joint(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep);
@@ -683,6 +698,11 @@ impl<'a, 'r> Run<'a, 'r> {
                 let mut moves12 = c.moves1.clone();
                 moves12.extend(p.iter().map(|&m| rotate_move(m as usize, &rot_inv) as u8));
                 let h3 = Search3::new(&t.p3).lower_bound(&c3);
+                // A reduction whose phase 3 cannot beat the best solution never will (the
+                // best only gets shorter): most of the deep levels' reductions.
+                if moves12.len() + h3 as usize >= best {
+                    continue;
+                }
                 local.push(Reduction {
                     moves12,
                     len1: c.moves1.len(),
