@@ -76,8 +76,9 @@ allows; the pool grows while time remains. Once a solution exists, phase 2 only 
 reductions that a short enough phase 3 could still turn into a shorter solution: phase 3 of
 at most 14 moves at first, 13 after 3 s and 12 after 6 s. Each deeper level has ~16x the
 reductions and each is ~13x less likely to have a short enough phase 3, so every level adds
-about as many chances, and long runs keep improving (48 threads: 39.7 moves on average
-after 2 s, 39.0 after 30 s, 38.8 after 45-60 s on 20 random positions).
+about as many chances, and long runs keep improving. 48 threads, two sets of 20 random
+positions: 39.7 / 39.5 moves on average after 2 s, 39.0 / 39.1 after 30 s, 38.8 / 39.1
+after 60 s.
 
 ## Development
 
