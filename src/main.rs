@@ -69,6 +69,10 @@ struct LimitArgs {
     /// Stop as soon as a solution of at most this many moves is found.
     #[arg(short = 'l', long, value_name = "MOVES")]
     max_length: Option<usize>,
+    /// Give up after this many seconds even without a solution (by default the search goes on
+    /// until it has one; `bench` defaults to 4 times the time limit).
+    #[arg(long, value_name = "SECONDS")]
+    hard_limit: Option<f64>,
 }
 
 #[derive(Args, Clone)]
@@ -241,6 +245,7 @@ fn options(limits: &LimitArgs, search: &SearchArgs, threads: usize) -> Options {
     Options {
         time_limit: Duration::from_secs_f64(limits.time),
         target_length: limits.max_length,
+        hard_limit: limits.hard_limit.map(Duration::from_secs_f64),
         threads,
         endpoints: search.endpoints,
         reductions: search.reductions,
@@ -329,7 +334,9 @@ fn cmd_gen(a: GenArgs) -> Result<(), String> {
 fn cmd_bench(a: BenchArgs) -> Result<(), String> {
     let threads = setup_threads(a.search.threads);
     let tables = load_tables(&a.tables.dir(), a.tables.h48, threads, true);
-    let opts = options(&a.limits, &a.search, threads);
+    let mut opts = options(&a.limits, &a.search, threads);
+    opts.hard_limit
+        .get_or_insert(Duration::from_secs_f64(a.limits.time * 4.0));
     let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(a.seed);
     let checkpoints = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0];
     let checkpoints: Vec<f64> = checkpoints
@@ -387,19 +394,25 @@ fn cmd_bench(a: BenchArgs) -> Result<(), String> {
             );
         }
     }
-    let first_t: f64 = rows
+    let firsts: Vec<(f64, usize)> = rows.iter().filter_map(|r| r.0.first().copied()).collect();
+    let nf = firsts.len().max(1) as f64;
+    println!(
+        "  first solution: {:.3} moves at {:.3} s",
+        firsts.iter().map(|x| x.1 as f64).sum::<f64>() / nf,
+        firsts.iter().map(|x| x.0).sum::<f64>() / nf
+    );
+    let solved: Vec<f64> = rows
         .iter()
-        .map(|r| r.0.first().map(|x| x.0).unwrap_or(f64::NAN))
-        .sum::<f64>()
-        / n;
-    let first_l: f64 = rows
-        .iter()
-        .map(|r| r.0.first().map(|x| x.1 as f64).unwrap_or(f64::NAN))
-        .sum::<f64>()
-        / n;
-    let fin: f64 = rows.iter().map(|r| r.1 as f64).sum::<f64>() / n;
-    println!("  first solution: {:.3} moves at {:.3} s", first_l, first_t);
-    println!("  final: {:.3} moves", fin);
+        .filter(|r| r.1 > 0)
+        .map(|r| r.1 as f64)
+        .collect();
+    let fin = solved.iter().sum::<f64>() / solved.len().max(1) as f64;
+    println!(
+        "  final: {:.3} moves ({} of {} solved)",
+        fin,
+        solved.len(),
+        rows.len()
+    );
     let (n1, n2, n3) = rows.iter().fold((0u64, 0u64, 0u64), |a, r| {
         (a.0 + r.2.nodes1, a.1 + r.2.nodes2, a.2 + r.2.nodes3)
     });

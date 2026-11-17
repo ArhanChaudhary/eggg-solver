@@ -36,6 +36,9 @@ pub struct Options {
     pub time_limit: Duration,
     /// Stop as soon as a solution of at most this many moves is found.
     pub target_length: Option<usize>,
+    /// Stop after this long even without a solution (the time limit is soft until there is
+    /// one).
+    pub hard_limit: Option<Duration>,
     pub threads: usize,
     /// Phase-1 endpoints collected in the first round (multiplied by 4 each round).
     pub endpoints: usize,
@@ -48,6 +51,7 @@ impl Default for Options {
         Options {
             time_limit: Duration::from_secs(5),
             target_length: None,
+            hard_limit: None,
             threads: crate::par::threads(),
             endpoints: 128,
             reductions: 32,
@@ -224,6 +228,7 @@ impl<'a> Solver<'a> {
     pub fn solve(&mut self, cube: &Cube, report: &mut dyn FnMut(&Solution)) -> Option<Solution> {
         let start = Instant::now();
         let deadline = start + self.opts.time_limit;
+        let hard = self.opts.hard_limit;
         let stop = AtomicBool::new(false);
         let have = AtomicBool::new(false);
         if cube.to_facelets().is_solved() {
@@ -269,7 +274,10 @@ impl<'a> Solver<'a> {
             scope.spawn(move || {
                 while !done_ref.load(Ordering::Relaxed) {
                     // The limit is soft until there is a solution.
-                    if Instant::now() >= deadline && have_ref.load(Ordering::Relaxed) {
+                    let now = Instant::now();
+                    if (now >= deadline && have_ref.load(Ordering::Relaxed))
+                        || hard.is_some_and(|h| now >= start + h)
+                    {
                         stop_ref.store(true, Ordering::Relaxed);
                         break;
                     }
