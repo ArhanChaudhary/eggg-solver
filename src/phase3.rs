@@ -96,7 +96,10 @@ impl P3Tables {
     /// (corner-class distance, h48 index) of a cube.
     #[inline(always)]
     fn probe(&self, v: &C3) -> (u8, usize) {
-        let cs = self.coords.cocsep[self.fast.cocsep(v)];
+        let i = self.fast.cocsep(v);
+        debug_assert!(i < self.coords.cocsep.len());
+        // SAFETY: a cube's cocsep index is below N_COCSEP (the table's length).
+        let cs = unsafe { *self.coords.cocsep.get_unchecked(i) };
         let (eslot, msplit, eo) = self.fast.edges(v, (cs >> 8 & 255) as usize);
         (
             (cs & 255) as u8,
@@ -271,7 +274,7 @@ impl<'a> Search3<'a> {
                 let m = allowed.trailing_zeros() as usize;
                 allowed &= allowed - 1;
                 self.nodes += 1;
-                if n.v.apply(m).is_solved() {
+                if n.v.apply_c(&t.fast.moves[m]).is_solved() {
                     self.front.push(m as u8);
                     return true;
                 }
@@ -302,16 +305,17 @@ impl<'a> Search3<'a> {
                 let m = (face * 3 + pw) as usize;
                 self.nodes += 1;
                 let (node, own, other) = if back {
-                    let b = crate::moves::inverse_move(m);
+                    let b = &t.fast.moves[crate::moves::inverse_move(m)];
                     let node = Node {
-                        v: n.v.apply_inv(b),
-                        y: n.y.apply(b),
+                        v: n.v.apply_inv_c(b),
+                        y: n.y.apply_c(b),
                     };
                     (node, node.y, node.v)
                 } else {
+                    let c = &t.fast.moves[m];
                     let node = Node {
-                        v: n.v.apply(m),
-                        y: n.y.apply_inv(m),
+                        v: n.v.apply_c(c),
+                        y: n.y.apply_inv_c(c),
                     };
                     (node, node.v, node.y)
                 };
