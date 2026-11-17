@@ -78,6 +78,10 @@ static WING_EO: LazyLock<[[u8; 24]; 24]> = LazyLock::new(|| {
     t
 });
 
+/// The conjugations by the 24 rotations (built once: `Conj::new` is geometry work).
+static CONJS: std::sync::LazyLock<Vec<Conj>> =
+    std::sync::LazyLock::new(|| crate::cube::ROTATIONS.iter().map(|m| Conj::new(*m)).collect());
+
 impl Cube3 {
     pub const SOLVED: Cube3 = Cube3 {
         cp: [0, 1, 2, 3, 4, 5, 6, 7],
@@ -136,9 +140,8 @@ impl Cube3 {
         let face_colour: Vec<u8> = (0..6).map(|f| cols[f * 4]).collect();
         let mut x = *c;
         if face_colour != [0, 1, 2, 3, 4, 5] {
-            let cj = crate::cube::ROTATIONS
+            let cj = CONJS
                 .iter()
-                .map(|m| Conj::new(*m))
                 .find(|cj| {
                     let map = cj.colour_map();
                     (0..6).all(|f| map[face_colour[f] as usize] as usize == f)

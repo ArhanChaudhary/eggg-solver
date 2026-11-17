@@ -695,14 +695,14 @@ impl<'a, 'r> Run<'a, 'r> {
                 let Some(c3) = Cube3::from_reduced(&x) else {
                     continue;
                 };
-                let mut moves12 = c.moves1.clone();
-                moves12.extend(p.iter().map(|&m| rotate_move(m as usize, &rot_inv) as u8));
-                let h3 = Search3::new(&t.p3).lower_bound(&c3);
+                let h3 = t.p3.lower_bound(&c3);
                 // A reduction whose phase 3 cannot beat the best solution never will (the
                 // best only gets shorter): most of the deep levels' reductions.
-                if moves12.len() + h3 as usize >= best {
+                if c.moves1.len() + p.len() + h3 as usize >= best {
                     continue;
                 }
+                let mut moves12 = c.moves1.clone();
+                moves12.extend(p.iter().map(|&m| rotate_move(m as usize, &rot_inv) as u8));
                 local.push(Reduction {
                     moves12,
                     len1: c.moves1.len(),
