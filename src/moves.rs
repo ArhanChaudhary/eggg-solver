@@ -9,6 +9,7 @@
 
 use crate::cube::{
     B, Cube, D, F, FACE_NORMAL, L, Mat, Perm, R, ROTATIONS, Turn, U, face_of_normal, mat_apply,
+    mat_mul, mat_of_rot,
 };
 use crate::notation::Move;
 use std::sync::LazyLock;
@@ -106,6 +107,49 @@ pub fn frame_rotation(f: usize) -> Mat {
         .iter()
         .find(|m| mat_apply(m, src) == [1, 0, 0] && mat_apply(m, [1, 1, 1]) == [1, 1, 1])
         .unwrap()
+}
+
+/// Index of `t` in the 27-move set, if it is one of the moves.
+pub fn move_index(t: Turn) -> Option<usize> {
+    (0..N_MOVES).find(|&m| turn_of(m) == t)
+}
+
+/// The sequence "rotation `rot`, then `moves`" rewritten as moves of the 27-move set followed
+/// by a rotation, which is dropped (the cube may end in any orientation). Each move is
+/// conjugated by the rotation carried so far; a turn of the two layers on the D, L or B side
+/// becomes the opposite turn of the other two layers, and the rotation that makes up the
+/// difference is carried on to the moves after it. The length is unchanged.
+pub fn rewrite_rotated(rot: &Mat, moves: &[u8]) -> Vec<u8> {
+    let rev4 = |l: u8| (0..4).fold(0u8, |r, i| r | ((l >> i & 1) << (3 - i)));
+    let mut g = *rot;
+    moves
+        .iter()
+        .map(|&m| {
+            // "g, then t" equals "g^-1 t g, then g": a turn of the layers of axis b (the axis
+            // that row a of g picks out), reversed if g flips it.
+            let t = turn_of(m as usize);
+            let a = t.axis as usize;
+            let b = (0..3).find(|&j| g[a][j] != 0).unwrap();
+            let (mut layers, mut k) = if g[a][b] > 0 {
+                (t.layers, t.k)
+            } else {
+                (rev4(t.layers), (4 - t.k) % 4)
+            };
+            if layers == 3 {
+                // Two layers on the negative side: the rotation by k, then the positive two
+                // layers turned back by k.
+                g = mat_mul(&g, &mat_of_rot(b, k));
+                layers = 12;
+                k = (4 - k) % 4;
+            }
+            move_index(Turn {
+                axis: b as u8,
+                layers,
+                k,
+            })
+            .expect("rotated move outside the move set") as u8
+        })
+        .collect()
 }
 
 /// Image of move `m` under the spatial rotation `rot` (which must preserve the move set).

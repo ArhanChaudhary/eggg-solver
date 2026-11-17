@@ -12,9 +12,11 @@
 //! Rounds repeat with geometrically more endpoints and reductions while time remains, only
 //! looking for shorter solutions.
 
-use crate::cube::{Cube, Facelets, Mat};
+use crate::cube::{Cube, Facelets, Mat, ROTATIONS};
 use crate::cube3::Cube3;
-use crate::moves::{ALLOWED_AFTER, MOVE_PERMS, N_MOVES, frame_rotation, rotate_move};
+use crate::moves::{
+    ALLOWED_AFTER, MOVE_PERMS, N_MOVES, frame_rotation, inverse_move, rewrite_rotated, rotate_move,
+};
 use crate::phase1::{P1State, P1Tables, Search1};
 use crate::phase2::{P2Tables, Search2, standardise};
 use crate::phase3::{P3Tables, Search3, Task};
@@ -43,10 +45,13 @@ pub struct Options {
     /// one).
     pub hard_limit: Option<Duration>,
     pub threads: usize,
-    /// Phase-1 endpoints collected in the first round (multiplied by 4 each round).
+    /// Phase-1 endpoints collected in the first round (doubled each round).
     pub endpoints: usize,
-    /// Reductions collected in the first round (multiplied by 4 each round).
+    /// Reductions collected in the first round (doubled each round).
     pub reductions: usize,
+    /// Also search from the inverse of the cube (solutions of the inverse, reversed, solve
+    /// the cube; its short phase-1 endpoints are a second, independent pool).
+    pub inverse: bool,
 }
 
 impl Default for Options {
@@ -58,6 +63,7 @@ impl Default for Options {
             threads: crate::par::threads(),
             endpoints: 128,
             reductions: 32,
+            inverse: true,
         }
     }
 }
@@ -94,6 +100,8 @@ pub struct Stats {
 }
 
 struct Candidate {
+    /// Index of the search root (0: the cube, 1: its inverse).
+    side: usize,
     moves1: Vec<u8>,
     frame: usize,
     cube: Cube,
@@ -106,6 +114,7 @@ struct Candidate {
 }
 
 struct Reduction {
+    side: usize,
     moves12: Vec<u8>,
     len1: usize,
     frame: usize,
@@ -120,6 +129,14 @@ struct Level1 {
     len: u8,
     jobs: Vec<Vec<u8>>,
     next: usize,
+}
+
+/// A search root: the cube or its inverse, with its phase-1 progress.
+struct Side {
+    cube: Cube,
+    root: P1State,
+    d0: u8,
+    level: Level1,
 }
 
 /// Merge consecutive moves of the same face (moves of one axis commute).
@@ -173,6 +190,21 @@ pub fn verify(facelets: &Facelets, moves: &[u8]) -> bool {
         f.apply_turn(crate::moves::turn_of(m as usize))
     });
     end.is_solved()
+}
+
+/// A solution of the cube with these facelets from a solution `s` of its inverse: `s`
+/// reversed and inverted, conjugated by the rotation the inverse ends in (found by trying all
+/// 24). None if `s` does not solve the inverse.
+pub fn from_inverse_solution(facelets: &Facelets, s: &[u8]) -> Option<Vec<u8>> {
+    let inv: Vec<u8> = s
+        .iter()
+        .rev()
+        .map(|&m| inverse_move(m as usize) as u8)
+        .collect();
+    ROTATIONS
+        .iter()
+        .map(|r| rewrite_rotated(r, &inv))
+        .find(|t| verify(facelets, t))
 }
 
 /// Run `work(i)` for i in 0..n on `threads` threads, claiming indices in order.
@@ -235,7 +267,13 @@ fn p1_run<F: FnMut(&[u8], u8) -> bool>(
 }
 
 /// A phase-2 candidate from a phase-1 endpoint (None if its centres cannot be solved).
-fn make_candidate(t: &Tables, cube: &Cube, moves1: &[u8], frame: usize) -> Option<Candidate> {
+fn make_candidate(
+    t: &Tables,
+    side: usize,
+    cube: &Cube,
+    moves1: &[u8],
+    frame: usize,
+) -> Option<Candidate> {
     let mut c = *cube;
     for &m in moves1 {
         c = c.apply_perm(&MOVE_PERMS[m as usize]);
@@ -252,6 +290,7 @@ fn make_candidate(t: &Tables, cube: &Cube, moves1: &[u8], frame: usize) -> Optio
         None => t.p2.tau_distance(&tau),
     };
     Some(Candidate {
+        side,
         moves1: moves1.to_vec(),
         frame,
         cube: x,
@@ -281,9 +320,8 @@ struct Run<'a, 'r> {
     report: &'r mut dyn FnMut(&Solution),
     target: Option<usize>,
     stats: Stats,
-    root: P1State,
-    d0: u8,
-    level: Level1,
+    sides: Vec<Side>,
+    /// (endpoint, 3 * side + frame) pairs already made into candidates.
     seen_ep: HashSet<(Vec<u8>, usize)>,
     cands: Vec<Candidate>,
     reds: Vec<Reduction>,
@@ -317,8 +355,27 @@ impl<'a> Solver<'a> {
         }
         let threads = self.opts.threads.max(1);
         let done = AtomicBool::new(false);
-        let root = P1State::from_cube(cube);
-        let d0 = self.t.p1.distance(&root);
+        let mut cubes = vec![*cube];
+        if self.opts.inverse {
+            cubes.push(cube.inverse());
+        }
+        let sides = cubes
+            .into_iter()
+            .map(|c| {
+                let root = P1State::from_cube(&c);
+                let d0 = self.t.p1.distance(&root);
+                Side {
+                    cube: c,
+                    root,
+                    d0,
+                    level: Level1 {
+                        len: d0,
+                        jobs: vec![],
+                        next: 0,
+                    },
+                }
+            })
+            .collect();
         let mut run = Run {
             t: self.t,
             cube: *cube,
@@ -330,19 +387,15 @@ impl<'a> Solver<'a> {
             report,
             target: self.opts.target_length,
             stats: Stats::default(),
-            root,
-            d0,
-            level: Level1 {
-                len: d0,
-                jobs: vec![],
-                next: 0,
-            },
+            sides,
             seen_ep: HashSet::new(),
             cands: vec![],
             reds: vec![],
             red_index: HashMap::new(),
         };
-        run.level.jobs = run.level_jobs(d0);
+        for i in 0..run.sides.len() {
+            run.sides[i].level.jobs = run.level_jobs(i, run.sides[i].d0);
+        }
         std::thread::scope(|scope| {
             // Watchdog that raises the stop flag at the deadline.
             let (stop_ref, done_ref, have_ref) = (&stop, &done, &have);
@@ -407,7 +460,7 @@ impl<'a, 'r> Run<'a, 'r> {
                 &format!(
                     "phase 1: {} endpoints (length {}), nodes {}",
                     self.cands.len(),
-                    self.level.len,
+                    self.p1_len(),
                     self.stats.nodes1
                 ),
             );
@@ -431,7 +484,7 @@ impl<'a, 'r> Run<'a, 'r> {
             self.phase3_levels(t1 + budget);
             self.stats.time[2] += t1.elapsed();
             check += t1.elapsed();
-            if self.stopped() || self.level.len > 40 {
+            if self.stopped() || self.p1_len() > 40 {
                 return;
             }
             want1 *= 2;
@@ -439,7 +492,12 @@ impl<'a, 'r> Run<'a, 'r> {
         }
     }
 
-    fn level_jobs(&self, len: u8) -> Vec<Vec<u8>> {
+    /// Length of the shortest phase-1 level in progress over the sides.
+    fn p1_len(&self) -> u8 {
+        self.sides.iter().map(|s| s.level.len).min().unwrap()
+    }
+
+    fn level_jobs(&self, side: usize, len: u8) -> Vec<Vec<u8>> {
         let depth = if len < 3 {
             0
         } else if len < 7 {
@@ -465,9 +523,10 @@ impl<'a, 'r> Run<'a, 'r> {
         }
         // Keep only prefixes that can still reach the goal in `len` moves.
         let t = &self.t.p1;
+        let side = &self.sides[side];
         jobs.retain(|p| {
-            let mut st = self.root;
-            let mut d = self.d0;
+            let mut st = side.root;
+            let mut d = side.d0;
             for (i, &m) in p.iter().enumerate() {
                 st = st.apply(m as usize, t);
                 d = Mod3Table::decode(d, t.value(&st));
@@ -482,21 +541,23 @@ impl<'a, 'r> Run<'a, 'r> {
 
     /// Collect phase-1 endpoints until there are `want` candidates in total.
     fn phase1(&mut self, want: usize) {
-        while self.cands.len() < want && !self.stopped() && self.level.len <= 40 {
-            if self.level.next >= self.level.jobs.len() {
-                let len = self.level.len + 1;
-                self.level = Level1 {
-                    len,
-                    jobs: self.level_jobs(len),
-                    next: 0,
-                };
+        while self.cands.len() < want && !self.stopped() && self.p1_len() <= 40 {
+            // The side with the shortest level goes first (sides alternate level by level).
+            let si = (0..self.sides.len())
+                .min_by_key(|&i| self.sides[i].level.len)
+                .unwrap();
+            let side = &self.sides[si];
+            if side.level.next >= side.level.jobs.len() {
+                let len = side.level.len + 1;
+                let jobs = self.level_jobs(si, len);
+                self.sides[si].level = Level1 { len, jobs, next: 0 };
                 continue;
             }
             let need = want - self.cands.len();
             let t = &self.t.p1;
-            let (root, d0, len, stop) = (self.root, self.d0, self.level.len, self.stop);
-            let jobs = &self.level.jobs;
-            let first = self.level.next;
+            let (root, d0, len, stop) = (side.root, side.d0, side.level.len, self.stop);
+            let jobs = &side.level.jobs;
+            let first = side.level.next;
             let threads = self.threads;
             let claimed = AtomicUsize::new(first);
             let found = AtomicUsize::new(0);
@@ -562,12 +623,13 @@ impl<'a, 'r> Run<'a, 'r> {
             for r in &mut results {
                 rest.append(&mut r.2);
             }
+            let level = &mut self.sides[si].level;
             if rest.is_empty() {
-                self.level.next = next;
+                level.next = next;
             } else {
-                rest.extend(self.level.jobs.drain(next..));
-                self.level.jobs = rest;
-                self.level.next = 0;
+                rest.extend(level.jobs.drain(next..));
+                level.jobs = rest;
+                level.next = 0;
             }
             // New (endpoint, frame) pairs, in job order; their candidates are made in
             // parallel (standardising and the phase-2 bounds cost ~30 us each).
@@ -575,7 +637,8 @@ impl<'a, 'r> Run<'a, 'r> {
             for (_, eps, _) in results {
                 for (moves, frames) in eps {
                     for f in 0..3 {
-                        if frames >> f & 1 == 1 && self.seen_ep.insert((moves.clone(), f)) {
+                        if frames >> f & 1 == 1 && self.seen_ep.insert((moves.clone(), 3 * si + f))
+                        {
                             todo.push((moves.clone(), f));
                         }
                     }
@@ -583,10 +646,10 @@ impl<'a, 'r> Run<'a, 'r> {
             }
             let made: Vec<Mutex<Option<Candidate>>> =
                 (0..todo.len()).map(|_| Mutex::new(None)).collect();
-            let (t, cube) = (self.t, &self.cube);
+            let (t, cube) = (self.t, &self.sides[si].cube);
             crate::par::for_chunks(todo.len(), 64, |r| {
                 for i in r {
-                    *made[i].lock().unwrap() = make_candidate(t, cube, &todo[i].0, todo[i].1);
+                    *made[i].lock().unwrap() = make_candidate(t, si, cube, &todo[i].0, todo[i].1);
                 }
             });
             self.cands
@@ -608,7 +671,7 @@ impl<'a, 'r> Run<'a, 'r> {
             .unwrap_or(99);
         while self.reds.len() < want && !self.stopped() && t12 <= cap {
             for r in self.phase2_level(t12) {
-                let key = (r.frame, r.c3);
+                let key = (3 * r.side + r.frame, r.c3);
                 match self.red_index.get(&key) {
                     Some(&i) if self.reds[i].moves12.len() <= r.moves12.len() => {}
                     Some(&i) => self.reds[i] = r,
@@ -673,6 +736,7 @@ impl<'a, 'r> Run<'a, 'r> {
                 moves12.extend(p.iter().map(|&m| rotate_move(m as usize, &rot_inv) as u8));
                 let h3 = Search3::new(&t.p3).lower_bound(&c3);
                 local.push(Reduction {
+                    side: c.side,
                     moves12,
                     len1: c.moves1.len(),
                     frame: c.frame,
@@ -703,9 +767,18 @@ impl<'a, 'r> Run<'a, 'r> {
             sol3.iter()
                 .map(|&m| rotate_move(m as usize, &rot_inv) as u8),
         );
+        let mut moves = simplify(&moves);
+        let mut phases = [red.len1, red.moves12.len() - red.len1, sol3.len()];
+        if red.side == 1 {
+            // A solution of the inverse: its phases come in reverse order.
+            moves = from_inverse_solution(&self.cube.to_facelets(), &moves)
+                .expect("inverse solution converts");
+            moves = simplify(&moves);
+            phases.reverse();
+        }
         let sol = Solution {
-            moves: simplify(&moves),
-            phases: [red.len1, red.moves12.len() - red.len1, sol3.len()],
+            moves,
+            phases,
             elapsed: self.start.elapsed(),
         };
         debug_assert!(verify(&self.cube.to_facelets(), &sol.moves));
@@ -973,6 +1046,35 @@ pub fn load_tables_with(
 mod tests {
     use super::*;
     use rand::SeedableRng;
+
+    /// A solution of the inverse that ends in any orientation converts to a solution of the
+    /// cube of the same length.
+    #[test]
+    fn inverse_solutions_convert() {
+        use crate::cube::Turn;
+        use rand::Rng;
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(11);
+        for _ in 0..300 {
+            let s: Vec<u8> = (0..rng.gen_range(1..25))
+                .map(|_| rng.gen_range(0..N_MOVES) as u8)
+                .collect();
+            // The inverse: the solved cube rotated, then s undone, so s solves it up to
+            // that rotation.
+            let rots: Vec<Turn> = (0..rng.gen_range(0..4))
+                .map(|_| Turn::rotation(rng.gen_range(0..3), rng.gen_range(1..4)))
+                .collect();
+            let mut inv = Cube::SOLVED.apply_turns(&rots);
+            for &m in s.iter().rev() {
+                inv = inv.apply_perm(&MOVE_PERMS[inverse_move(m as usize)]);
+            }
+            assert!(verify(&inv.to_facelets(), &s));
+            let cube = inv.inverse();
+            assert_eq!(cube.inverse(), inv);
+            let t = from_inverse_solution(&cube.to_facelets(), &s).expect("converts");
+            assert_eq!(t.len(), s.len());
+            assert!(verify(&cube.to_facelets(), &t));
+        }
+    }
 
     /// Jobs cut short at random points, with their handed-back subtrees searched later, find
     /// exactly the endpoints of one uninterrupted search.

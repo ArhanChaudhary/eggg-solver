@@ -122,6 +122,9 @@ struct SearchArgs {
     /// Reductions collected per round.
     #[arg(long, default_value_t = Options::default().reductions)]
     reductions: usize,
+    /// Search from the cube only, not also from its inverse.
+    #[arg(long)]
+    no_inverse: bool,
 }
 
 #[derive(Args, Clone)]
@@ -263,6 +266,7 @@ fn options(limits: &LimitArgs, search: &SearchArgs, threads: usize) -> Options {
         threads,
         endpoints: search.endpoints,
         reductions: search.reductions,
+        inverse: !search.no_inverse,
     }
 }
 

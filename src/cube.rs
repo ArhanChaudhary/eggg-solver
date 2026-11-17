@@ -74,7 +74,8 @@ pub fn mat_mul(a: &Mat, b: &Mat) -> Mat {
 
 pub const IDENTITY: Mat = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
 
-fn mat_of_rot(axis: usize, k: u8) -> Mat {
+/// The matrix of the rotation by `k` quarter turns about the positive `axis`.
+pub fn mat_of_rot(axis: usize, k: u8) -> Mat {
     let cols = [
         rot([1, 0, 0], axis, k),
         rot([0, 1, 0], axis, k),
@@ -393,6 +394,22 @@ impl Cube {
 
     pub fn apply_turns(&self, ts: &[Turn]) -> Cube {
         ts.iter().fold(*self, |c, &t| c.apply_turn(t))
+    }
+
+    /// The inverse state: applying a move sequence to it gives the solved cube exactly when
+    /// the inverse sequence turns the solved cube into this one.
+    pub fn inverse(&self) -> Cube {
+        let mut c = Cube::SOLVED;
+        for s in 0..8 {
+            let p = self.cp[s] as usize;
+            c.cp[p] = s as u8;
+            c.co[p] = (3 - self.co[s]) % 3;
+        }
+        for s in 0..24 {
+            c.wp[self.wp[s] as usize] = s as u8;
+            c.ct[self.ct[s] as usize] = s as u8;
+        }
+        c
     }
 
     /// Colour (face index) of the centre in each centre slot.
