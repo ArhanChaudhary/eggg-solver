@@ -78,7 +78,8 @@ struct LimitArgs {
 /// Table sets by memory use (the joint phase-2 table pays off before a larger phase-3 table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Tier {
-    /// The largest tier that uses at most a third of the physical memory.
+    /// The largest tier that uses at most a third of the physical memory (xl and xxl only
+    /// once their phase-3 table exists: generating it takes ~20 minutes).
     Auto,
     /// ~0.16 GB: h48 h0 (slow: phase 2 has only the pairing table).
     Tiny,
@@ -90,6 +91,12 @@ enum Tier {
     Large,
     /// ~6.1 GB: h48 h7, the joint phase-2 table and the large phase-1 table.
     Huge,
+    /// ~17.5 GB: h48 h9, the joint phase-2 table and the large phase-1 table (phase 3 3.6x
+    /// faster than huge; single-threaded first solutions ~4x sooner).
+    Xl,
+    /// ~63 GB: h48 h11 (the largest), the joint phase-2 table and the large phase-1 table
+    /// (phase 3 11x faster than huge; single-threaded first solutions ~12x sooner).
+    Xxl,
 }
 
 impl Tier {
@@ -101,21 +108,36 @@ impl Tier {
             Tier::Medium => (5, true, false, 2.3e9),
             Tier::Large => (6, true, true, 4.2e9),
             Tier::Huge | Tier::Auto => (7, true, true, 6.1e9),
+            Tier::Xl => (9, true, true, 17.5e9),
+            Tier::Xxl => (11, true, true, 63.1e9),
         }
     }
 
-    fn resolve(self) -> Tier {
+    fn resolve(self, dir: &std::path::Path) -> Tier {
         if self != Tier::Auto {
             return self;
         }
+        // The xl and xxl phase-3 tables take ~20 minutes to generate: only used when present.
+        let present = |t: Tier| {
+            let k = t.tables().0 as usize;
+            let base = eggg_solver::h48::DEFAULT_BASE[k];
+            dir.join(format!("p3-h48-h{k}b{base}.tab")).exists()
+        };
         // SAFETY: sysconf has no preconditions.
         let ram = unsafe {
             libc::sysconf(libc::_SC_PHYS_PAGES) as f64 * libc::sysconf(libc::_SC_PAGESIZE) as f64
         };
-        [Tier::Huge, Tier::Large, Tier::Medium, Tier::Small]
-            .into_iter()
-            .find(|t| t.tables().3 <= ram / 3.0)
-            .unwrap_or(Tier::Tiny)
+        [
+            Tier::Xxl,
+            Tier::Xl,
+            Tier::Huge,
+            Tier::Large,
+            Tier::Medium,
+            Tier::Small,
+        ]
+        .into_iter()
+        .find(|&t| t.tables().3 <= ram / 3.0 && (t.tables().0 <= 7 || present(t)))
+        .unwrap_or(Tier::Tiny)
     }
 }
 
@@ -145,7 +167,7 @@ struct TableArgs {
 impl TableArgs {
     /// (h48 K, joint phase-2 table, large phase-1 table) from the tier and the overrides.
     fn config(&self) -> (u32, bool, bool) {
-        let (k, joint, big, _) = self.tier.resolve().tables();
+        let (k, joint, big, _) = self.tier.resolve(&self.dir()).tables();
         (
             self.h48.unwrap_or(k),
             joint || self.p2_joint,
@@ -160,7 +182,7 @@ impl TableArgs {
                 "tables: h48 h{k}{}{} ({:?} tier)",
                 if joint { ", joint phase 2" } else { "" },
                 if big { ", large phase 1" } else { "" },
-                self.tier.resolve()
+                self.tier.resolve(&self.dir())
             );
         }
         load_tables_with(&self.dir(), k, joint, big, threads, verbose)

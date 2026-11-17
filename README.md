@@ -28,7 +28,9 @@ best solution. The time limit is soft until a first solution exists (`--hard-lim
 
 Tables are generated on first use and saved in `--tables DIR` (default `$EGGG_TABLES`, else
 `./tables`); the large ones take a few minutes, once. `--tier` picks the set by memory use;
-the default, `auto`, takes the largest tier that fits in a third of the physical memory:
+the default, `auto`, takes the largest tier that fits in a third of the physical memory
+(`xl` and `xxl` only once their phase-3 table exists: generate it once with
+`eggg-solver gen --tier xl`, ~20 minutes):
 
 | tier | tables | memory |
 |---|---|---:|
@@ -37,11 +39,16 @@ the default, `auto`, takes the largest tier that fits in a third of the physical
 | `medium` | h48 h5, joint phase 2 | 2.3 GB |
 | `large` | h48 h6, joint phase 2, large phase 1 | 4.2 GB |
 | `huge` | h48 h7, joint phase 2, large phase 1 | 6.1 GB |
+| `xl` | h48 h9, joint phase 2, large phase 1 | 17.5 GB |
+| `xxl` | h48 h11 (the largest), joint phase 2, large phase 1 | 63 GB |
 
 The tables: phase-1 centre staging (symmetry-reduced, 25 MB; `--p1-big`: 1.2 GB without the
 reduction, faster lookups), phase-2 pairing permutation (60 MB; `--p2-joint`: the joint
 pairing x U/D centres x PLL parity table, 1.05 GB, far fewer phase-2 nodes), phase-3 H48
 (30 MB * 2^K for K edge-orientation bits, `--h48 K`). The three options override the tier.
+The larger phase-3 tables matter most with few threads, where phase 3 is a large share of
+the time (one thread: first solution after 6.2 s with `huge`, 1.4 s with `xl`, 0.5 s with
+`xxl`, on average); with many threads phase 1 dominates.
 
 ## How it works
 
