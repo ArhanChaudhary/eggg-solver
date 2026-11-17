@@ -687,7 +687,7 @@ impl<'a, 'r> Run<'a, 'r> {
 /// Load or build all tables in `dir`.
 pub fn load_tables(dir: &std::path::Path, h48_k: u32, threads: usize, verbose: bool) -> Tables {
     let t0 = Instant::now();
-    let p1_path = dir.join("p1-staging.tab");
+    let p1_path = dir.join("p1-staging2.tab");
     let p1 = {
         let staging = crate::phase1::Staging::new();
         let n = P1Tables::table_len();
@@ -701,7 +701,7 @@ pub fn load_tables(dir: &std::path::Path, h48_k: u32, threads: usize, verbose: b
                 table.data.byte_len(),
             )
         };
-        if crate::table::load(&p1_path, "p1-staging", bytes).is_err() {
+        if crate::table::load(&p1_path, "p1-staging2", bytes).is_err() {
             if verbose {
                 eprintln!("generating phase-1 staging table...");
             }
@@ -713,7 +713,7 @@ pub fn load_tables(dir: &std::path::Path, h48_k: u32, threads: usize, verbose: b
                     table.data.byte_len(),
                 )
             };
-            crate::table::save(&p1_path, "p1-staging", bytes).expect("saving table");
+            crate::table::save(&p1_path, "p1-staging2", bytes).expect("saving table");
         }
         P1Tables::with_table(staging, table)
     };

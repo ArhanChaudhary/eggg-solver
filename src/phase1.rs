@@ -228,8 +228,8 @@ impl Staging {
             + self.rank_t[2][c1][b2 as usize]
     }
 
-    /// Table index of the centre classes given the U/D-colour and R/L-colour position masks.
-    #[inline(always)]
+    /// Canonical table index of the centre classes given the U/D-colour and R/L-colour
+    /// position masks (the minimum over the class's stabiliser).
     pub fn index(&self, ud: u32, rl: u32) -> u64 {
         let info = self.a_info[self.rank24(ud) as usize];
         let class = (info >> 8) as usize;
@@ -237,17 +237,32 @@ impl Staging {
         let rem = !self.class_rep[class] & MASK24;
         let b = apply_mask(&self.sym_perm[s], rl);
         let mut u = self.unl[pext(b, rem) as usize];
-        let st = &self.stab[class];
-        if !st.is_empty() {
-            for &t in st {
-                let bt = apply_mask(&self.sym_perm[t as usize], b);
-                u = u.min(self.unl[pext(bt, rem) as usize]);
-            }
+        for &t in &self.stab[class] {
+            let bt = apply_mask(&self.sym_perm[t as usize], b);
+            u = u.min(self.unl[pext(bt, rem) as usize]);
         }
         (class * N_SPLIT + u as usize) as u64
     }
 
-    fn rep_of(&self, idx: u64) -> (u32, u32) {
+    /// The class info (class << 8 | symmetry to the representative) of a U/D mask; it is the
+    /// first, separately prefetchable, step of [`Staging::fast_index`].
+    #[inline(always)]
+    pub fn info(&self, ud: u32) -> *const u32 {
+        unsafe { self.a_info.as_ptr().add(self.rank24(ud) as usize) }
+    }
+
+    /// A table index of the centre classes, without minimising over the stabiliser: the
+    /// table holds the same value at every stabiliser variant.
+    #[inline(always)]
+    pub fn fast_index(&self, info: u32, rl: u32) -> u64 {
+        let class = (info >> 8) as usize;
+        let s = (info & 255) as usize;
+        let b = apply_mask(&self.sym_perm[s], rl);
+        let rem = !self.class_rep[class] & MASK24;
+        (class * N_SPLIT + self.unl[pext(b, rem) as usize] as usize) as u64
+    }
+
+    pub fn rep_of(&self, idx: u64) -> (u32, u32) {
         let class = idx as usize / N_SPLIT;
         let u = idx as usize % N_SPLIT;
         let rep = self.class_rep[class];
@@ -277,13 +292,32 @@ impl Staging {
 
     pub fn generate(&self, threads: usize) -> Vec<u8> {
         let n = N_CLASSES_A * N_SPLIT;
-        crate::table::bfs(n, &self.goals(), threads, |i, f| {
+        let mut depths = crate::table::bfs(n, &self.goals(), threads, |i, f| {
             let (ud, rl) = self.rep_of(i);
             for m in 0..N_MOVES {
                 let t = &self.move_perm[m];
                 f(self.index(apply_mask(t, ud), apply_mask(t, rl)));
             }
-        })
+        });
+        // Give every non-canonical entry (another stabiliser variant of a canonical one) the
+        // canonical entry's value. (The BFS's backward passes also visit non-canonical
+        // entries, whose depths are not reliable.)
+        let fix = std::sync::Mutex::new(vec![]);
+        crate::par::for_chunks(n, 1 << 16, |r| {
+            let mut local = vec![];
+            for i in r {
+                let (ud, rl) = self.rep_of(i as u64);
+                let j = self.index(ud, rl) as usize;
+                if j != i {
+                    local.push((i, j));
+                }
+            }
+            fix.lock().unwrap().extend(local);
+        });
+        for (i, j) in fix.into_inner().unwrap() {
+            depths[i] = depths[j];
+        }
+        depths
     }
 }
 
@@ -305,6 +339,8 @@ pub struct Frame {
     pub rl_pos: [u8; 8],
     /// Allowed patterns (bit i = position rl_pos[i] holds the pair's first colour).
     pub rl_ok: [u64; 4],
+    /// For each move, the slots whose wings end up in the low slots.
+    pub low_src: [[u8; 12]; N_MOVES],
 }
 
 impl Frame {
@@ -398,9 +434,13 @@ impl Frame {
         }
         let count: u32 = ok.iter().map(|w| w.count_ones()).sum();
         assert_eq!(count, 12);
+        let low_slots: [u8; 12] = low_slots.try_into().unwrap();
+        let low_src =
+            std::array::from_fn(|m| low_slots.map(|s| MOVE_PERMS[m].wing_src[s as usize]));
         Frame {
             p2_mask,
-            low_slots: low_slots.try_into().unwrap(),
+            low_src,
+            low_slots,
             high_pieces,
             rl_pos,
             rl_ok: ok,
@@ -417,6 +457,17 @@ impl Frame {
         }
         ((m ^ (m >> 1)) & 0x55_5555) == 0x55_5555
             && (m & self.high_pieces).count_ones().is_multiple_of(2)
+    }
+
+    /// [`Frame::wings_ok`] of the cube after move `m`, from the wings before it.
+    #[inline(always)]
+    pub fn wings_ok_after(&self, wings: &V32, m: usize) -> bool {
+        let mut x = 0u32;
+        for &s in &self.low_src[m] {
+            x |= 1 << wings.0[s as usize];
+        }
+        ((x ^ (x >> 1)) & 0x55_5555) == 0x55_5555
+            && (x & self.high_pieces).count_ones().is_multiple_of(2)
     }
 
     /// Is the special axis's centre pattern one phase 2 can solve (assuming staged centres)?
@@ -513,7 +564,10 @@ impl P1Tables {
     #[inline(always)]
     pub fn value(&self, s: &P1State) -> u8 {
         let (ud, rl) = s.masks();
-        self.table.get(self.staging.index(ud, rl))
+        self.table.get(
+            self.staging
+                .fast_index(unsafe { *self.staging.info(ud) }, rl),
+        )
     }
 
     /// Exact staging distance, by walking down the table.
@@ -589,30 +643,90 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         }
         let mut allowed = ALLOWED_AFTER[last];
         if left == 1 {
-            // The last move must leave the wing permutation even.
+            // The last move must leave the wing permutation even, and the wings pairable in a
+            // frame where it is not a phase-2 move: both are tested before the centres.
             allowed &= if s.parity {
                 WIDE_QUARTER
             } else {
                 !WIDE_QUARTER
             };
+            while allowed != 0 {
+                let m = allowed.trailing_zeros() as usize;
+                allowed &= allowed - 1;
+                self.nodes += 1;
+                let mut frames = 0u8;
+                for (f, fr) in self.t.frames.iter().enumerate() {
+                    if fr.p2_mask >> m & 1 == 0 && fr.wings_ok_after(&s.wings, m) {
+                        frames |= 1 << f;
+                    }
+                }
+                if frames == 0 {
+                    continue;
+                }
+                let c = s.apply(m, self.t);
+                if Mod3Table::decode(d, self.t.value(&c)) != 0 {
+                    continue;
+                }
+                for (f, fr) in self.t.frames.iter().enumerate() {
+                    if frames >> f & 1 == 1 && !fr.centres_ok(&c.centres) {
+                        frames &= !(1 << f);
+                    }
+                }
+                if frames != 0 {
+                    self.path.push(m as u8);
+                    let go = (self.on_endpoint)(&self.path, frames);
+                    self.path.pop();
+                    if !go {
+                        self.stop = true;
+                        return;
+                    }
+                }
+            }
+            return;
         }
+        // Stage 1: children, prefetch of their class info; stage 2: table indices, prefetched;
+        // stage 3: read the values; stage 4: descend into the children that can still reach
+        // the goal.
+        let mut kids: [std::mem::MaybeUninit<(P1State, u64, u8)>; N_MOVES] =
+            [const { std::mem::MaybeUninit::uninit() }; N_MOVES];
+        let mut infos: [*const u32; N_MOVES] = [std::ptr::null(); N_MOVES];
+        let mut rls = [0u32; N_MOVES];
+        let mut nk = 0;
         while allowed != 0 {
             let m = allowed.trailing_zeros() as usize;
             allowed &= allowed - 1;
             let c = s.apply(m, self.t);
-            self.nodes += 1;
-            if self.nodes & 4095 == 0
-                && self
-                    .abort
-                    .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
-            {
-                self.stop = true;
-                return;
-            }
-            let dc = Mod3Table::decode(d, self.t.value(&c));
-            if dc < left {
-                self.path.push(m as u8);
-                self.dfs(&c, dc, left - 1, m);
+            let (ud, rl) = c.masks();
+            let p = self.t.staging.info(ud);
+            crate::table::prefetch(p);
+            infos[nk] = p;
+            rls[nk] = rl;
+            kids[nk].write((c, 0, m as u8));
+            nk += 1;
+        }
+        for k in 0..nk {
+            let i = self.t.staging.fast_index(unsafe { *infos[k] }, rls[k]);
+            self.t.table.prefetch(i);
+            unsafe { kids[k].assume_init_mut() }.1 = i;
+        }
+        self.nodes += nk as u64;
+        if self
+            .abort
+            .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            self.stop = true;
+            return;
+        }
+        let mut dcs = [0u8; N_MOVES];
+        for k in 0..nk {
+            let (_, i, _) = unsafe { kids[k].assume_init_ref() };
+            dcs[k] = Mod3Table::decode(d, self.t.table.get(*i));
+        }
+        for k in 0..nk {
+            if dcs[k] < left {
+                let (c, _, m) = unsafe { kids[k].assume_init_ref() };
+                self.path.push(*m);
+                self.dfs(c, dcs[k], left - 1, *m as usize);
                 self.path.pop();
                 if self.stop {
                     return;
