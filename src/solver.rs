@@ -16,7 +16,7 @@ use crate::cube::{Cube, Facelets, Mat};
 use crate::cube3::Cube3;
 use crate::moves::{ALLOWED_AFTER, MOVE_PERMS, N_MOVES, frame_rotation, rotate_move};
 use crate::phase1::{P1State, P1Tables, Search1};
-use crate::phase2::{P2Tables, Search2, standardise};
+use crate::phase2::{P2Tables, Search2, first_moves, standardise};
 use crate::phase3::{P3Tables, Search3, Task};
 
 /// Phase-3 checks at least this deep are split into one job per child of the root.
@@ -652,6 +652,12 @@ impl<'a, 'r> Run<'a, 'r> {
                 .last()
                 .map(|&m| rotate_move(m as usize, &rot))
                 .unwrap_or(N_MOVES);
+            // Phase 2 may open with moves of phase 1's trailing axis (on its unused faces).
+            let tail: Vec<u8> = c.moves1[c.moves1.len().saturating_sub(3)..]
+                .iter()
+                .map(|&m| rotate_move(m as usize, &rot) as u8)
+                .collect();
+            let first = first_moves(&tail);
             let mut srch = Search2::new(&t.p2);
             srch.abort = Some(stop);
             let mut sols: Vec<Vec<u8>> = vec![];
@@ -660,9 +666,9 @@ impl<'a, 'r> Run<'a, 'r> {
                 sols.len() < 64
             };
             if t.p2.joint.is_some() {
-                srch.dfs_joint(c.centre, &c.tau, c.dt, l2, last1, &mut keep);
+                srch.dfs_joint(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep);
             } else {
-                srch.dfs(c.centre, &c.tau, c.dt, l2, last1, &mut keep);
+                srch.dfs(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep);
             }
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
             let mut local = vec![];
@@ -949,6 +955,192 @@ pub fn load_tables_with(
 mod tests {
     use super::*;
     use rand::SeedableRng;
+
+    /// Opening phase 2 with moves of phase 1's trailing axis, and phase 1 not reporting the
+    /// endpoints that this covers, gives exactly the old phase 1+2 sequences, each once.
+    #[test]
+    fn phase_boundary_is_one_to_one() {
+        use crate::phase1::trailing_run;
+        use crate::phase2::first_moves;
+        use rand::Rng;
+        let t = load_tables(std::path::Path::new("tables"), 3, 8, false);
+        // All endpoints of length `len` (with frames) under a frame rule, by a plain DFS.
+        fn endpoints(
+            t: &Tables,
+            s: &P1State,
+            d: u8,
+            left: u8,
+            path: &mut Vec<u8>,
+            new_rule: bool,
+            out: &mut Vec<(Vec<u8>, u8)>,
+        ) {
+            if left == 0 {
+                if d == 0 && !path.is_empty() {
+                    let run = if new_rule {
+                        trailing_run(path)
+                    } else {
+                        1 << path[path.len() - 1]
+                    };
+                    let f = t.p1.endpoint_frames(s, run);
+                    if f != 0 {
+                        out.push((path.clone(), f));
+                    }
+                }
+                return;
+            }
+            let last = path.last().map(|&m| m as usize).unwrap_or(N_MOVES);
+            let mut allowed = ALLOWED_AFTER[last];
+            while allowed != 0 {
+                let m = allowed.trailing_zeros() as usize;
+                allowed &= allowed - 1;
+                let c = s.apply(m, &t.p1);
+                let dc = Mod3Table::decode(d, t.p1.value(&c));
+                if dc < left {
+                    path.push(m as u8);
+                    endpoints(t, &c, dc, left - 1, path, new_rule, out);
+                    path.pop();
+                }
+            }
+        }
+        // Canonical form: each run of same-axis moves sorted by face (they commute).
+        fn canonical(mut v: Vec<u8>) -> Vec<u8> {
+            let mut i = 0;
+            while i < v.len() {
+                let axis = (v[i] / 3) % 3;
+                let mut j = i;
+                while j < v.len() && (v[j] / 3) % 3 == axis {
+                    j += 1;
+                }
+                v[i..j].sort_by_key(|&m| m / 3);
+                i = j;
+            }
+            v
+        }
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(5);
+        let mut total = 0;
+        for _ in 0..10 {
+            let mut cube = Cube::SOLVED;
+            for _ in 0..rng.gen_range(4..7) {
+                cube = cube.apply_perm(&MOVE_PERMS[rng.gen_range(0..N_MOVES)]);
+            }
+            let root = P1State::from_cube(&cube);
+            let d0 = t.p1.distance(&root);
+            if d0 < 2 {
+                continue;
+            }
+            let k = d0 as usize + 3;
+            let mut seqs: [Vec<(usize, Vec<u8>)>; 2] = [vec![], vec![]];
+            for (scheme, seq) in seqs.iter_mut().enumerate() {
+                let new_rule = scheme == 1;
+                for l1 in d0.max(1) as usize..=k {
+                    let mut eps = vec![];
+                    endpoints(&t, &root, d0, l1 as u8, &mut vec![], new_rule, &mut eps);
+                    if new_rule {
+                        // The real search reports the same endpoints.
+                        let mut got = vec![];
+                        let mut srch = Search1::new(&t.p1, |p: &[u8], f| {
+                            got.push((p.to_vec(), f));
+                            true
+                        });
+                        srch.dfs(&root, d0, l1 as u8, N_MOVES);
+                        drop(srch);
+                        let mut want = eps.clone();
+                        want.sort();
+                        got.sort();
+                        assert_eq!(got, want);
+                    }
+                    for (moves1, frames) in eps {
+                        for frame in 0..3 {
+                            if frames >> frame & 1 == 0 {
+                                continue;
+                            }
+                            let Some(c) = make_candidate(&t, &cube, &moves1, frame) else {
+                                continue;
+                            };
+                            let rot = frame_rotation(frame);
+                            let rot_inv = transpose(&rot);
+                            let rotated: Vec<u8> = moves1
+                                .iter()
+                                .map(|&m| rotate_move(m as usize, &rot) as u8)
+                                .collect();
+                            let last1 = *rotated.last().unwrap() as usize;
+                            let first = if new_rule {
+                                first_moves(&rotated)
+                            } else {
+                                ALLOWED_AFTER[last1]
+                            };
+                            for l2 in 0..=(k - l1) as u8 {
+                                let mut srch = Search2::new(&t.p2);
+                                srch.dfs(c.centre, &c.tau, c.dt, l2, last1, first, &mut |p| {
+                                    let mut v = moves1.clone();
+                                    v.extend(
+                                        p.iter().map(|&m| rotate_move(m as usize, &rot_inv) as u8),
+                                    );
+                                    seq.push((frame, canonical(v)));
+                                    true
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            let [old, new] = seqs;
+            let mut dedup = new.clone();
+            dedup.sort();
+            dedup.dedup();
+            assert_eq!(dedup.len(), new.len(), "the new scheme repeats a reduction");
+            let mut old = old;
+            old.sort();
+            let n = old.len();
+            old.dedup();
+            assert_eq!(old.len(), n, "the old scheme repeats a reduction");
+            // Every old reduction is a new one, or a new one followed by outer (3x3) moves
+            // that phase 3 makes anyway (old reductions whose trailing run held a phase-2
+            // outer move with no phase-2 moves after it).
+            let newset: HashSet<(usize, Vec<u8>)> = dedup.iter().cloned().collect();
+            let oldset: HashSet<(usize, Vec<u8>)> = old.iter().cloned().collect();
+            let extra: Vec<_> = newset.difference(&oldset).take(8).collect();
+            assert!(
+                extra.is_empty(),
+                "{} new-only reductions, e.g. {extra:?}",
+                newset.difference(&oldset).count()
+            );
+            // Shorter sequences with outer moves of the final run(s) moved to the end and
+            // dropped (up to `n` of them).
+            fn stripped(v: &[u8], n: usize, out: &mut Vec<Vec<u8>>) {
+                if n == 0 || v.is_empty() {
+                    return;
+                }
+                let axis = (v[v.len() - 1] / 3) % 3;
+                let start = v
+                    .iter()
+                    .rposition(|&m| (m / 3) % 3 != axis)
+                    .map_or(0, |i| i + 1);
+                for i in start..v.len() {
+                    if v[i] < 18 {
+                        let mut w = v.to_vec();
+                        w.remove(i);
+                        out.push(w.clone());
+                        stripped(&w, n - 1, out);
+                    }
+                }
+            }
+            let mut lost = 0;
+            for (frame, v) in old.iter().filter(|x| !newset.contains(*x)) {
+                let mut ws = vec![];
+                stripped(v, 3, &mut ws);
+                assert!(
+                    ws.into_iter()
+                        .any(|w| newset.contains(&(*frame, canonical(w)))),
+                    "old reduction {v:?} (frame {frame}) is not covered"
+                );
+                lost += 1;
+            }
+            assert!(lost < old.len());
+            total += old.len();
+        }
+        assert!(total > 100, "too few reductions to test ({total})");
+    }
 
     /// Jobs cut short at random points, with their handed-back subtrees searched later, find
     /// exactly the endpoints of one uninterrupted search.

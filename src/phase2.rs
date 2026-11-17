@@ -10,7 +10,7 @@
 
 use crate::comb::{comb_rank, perm_rank, perm_unrank};
 use crate::cube::{B, Cube, D, F, L, R, U};
-use crate::moves::{ALLOWED_AFTER, Conj, MOVE_PERMS, PHASE2_MASK, frame_rotation};
+use crate::moves::{ALLOWED_AFTER, Conj, MOVE_PERMS, N_MOVES, PHASE2_MASK, frame_rotation};
 use crate::phase1::Frame;
 use crate::table::{Mod3Table, UNSEEN};
 
@@ -356,6 +356,33 @@ pub fn standardise(c: &Cube, frame: usize) -> Cube {
     unreachable!("no rotation standardises the colour pairs")
 }
 
+/// Moves allowed to open phase 2 after the phase-1 moves `moves1` (already in the phase-2
+/// frame): any move on a face not used by phase 1's trailing run of same-axis moves. Moves of
+/// that axis may come in any order relative to the run: "P Uw | U ..." is the reduction
+/// "P U Uw | ...", whose endpoint phase 1 does not report for frames where U is a phase-2
+/// move (see `phase1::trailing_run`), so each reduction is produced exactly once.
+pub fn first_moves(moves1: &[u8]) -> u32 {
+    let mut faces = 0u32;
+    if let Some(&last) = moves1.last() {
+        let axis = (last / 3) % 3;
+        for &m in moves1.iter().rev().take_while(|&&m| (m / 3) % 3 == axis) {
+            faces |= 0b111 << (3 * (m as usize / 3));
+        }
+    }
+    ALLOWED_AFTER[N_MOVES] & !faces
+}
+
+/// The moves of each axis (U/D, R/L, F/B), a bit per move index.
+const AXIS_MOVES: [u32; 3] = [0x1c0e07, 0xe07038, 0x70381c0];
+
+/// Moves allowed after move `m` at a node whose own moves were restricted to `after`: the
+/// usual canonical order, and a restriction on `m`'s axis carries on along a run of moves of
+/// that axis (so phase 1's trailing run keeps its faces excluded until another axis).
+#[inline(always)]
+fn after_child(after: u32, m: usize) -> u32 {
+    ALLOWED_AFTER[m] & (after | !AXIS_MOVES[(m / 3) % 3])
+}
+
 /// Moves that may end phase 2 after move `last`: a wide half turn, but not one right after an
 /// outer turn on its own axis ("U Uw2" = "Uw2 U": the shorter reduction, with U left to
 /// phase 3, covers it).
@@ -387,8 +414,11 @@ impl<'a> Search2<'a> {
     }
 
     /// Explore below (centre coord, tau with exact tau distance `dt`); `last` is the previous
-    /// move (27-move index, `N_MOVES` for none). Calls `found` for each solution; stops when it
-    /// returns false. Returns false if stopped.
+    /// move (27-move index, `N_MOVES` for none) and `after` the moves allowed next
+    /// (`ALLOWED_AFTER[last]`, or at the root the moves allowed after phase 1, see
+    /// [`first_moves`]). Calls `found` for each solution; stops when it returns false. Returns
+    /// false if stopped.
+    #[allow(clippy::too_many_arguments)]
     pub fn dfs(
         &mut self,
         cc: u32,
@@ -396,6 +426,7 @@ impl<'a> Search2<'a> {
         dt: u8,
         left: u8,
         last: usize,
+        after: u32,
         found: &mut dyn FnMut(&[u8]) -> bool,
     ) -> bool {
         if left == 0 {
@@ -404,8 +435,7 @@ impl<'a> Search2<'a> {
             }
             return true;
         }
-        let allowed =
-            ALLOWED_AFTER[last] & PHASE2_MASK & if left == 1 { last_mask(last) } else { u32::MAX };
+        let allowed = after & PHASE2_MASK & if left == 1 { last_mask(last) } else { u32::MAX };
         for (i, &m) in P2_MOVES.iter().enumerate() {
             if allowed >> m & 1 == 0 {
                 continue;
@@ -428,7 +458,15 @@ impl<'a> Search2<'a> {
                 continue;
             }
             self.path.push(m);
-            let go = self.dfs(c2, &t2, d2, left - 1, m as usize, found);
+            let go = self.dfs(
+                c2,
+                &t2,
+                d2,
+                left - 1,
+                m as usize,
+                after_child(after, m as usize),
+                found,
+            );
             self.path.pop();
             if !go {
                 return false;
@@ -440,6 +478,7 @@ impl<'a> Search2<'a> {
 
 impl<'a> Search2<'a> {
     /// [`Search2::dfs`] with the joint table: `dj` is the exact joint distance.
+    #[allow(clippy::too_many_arguments)]
     pub fn dfs_joint(
         &mut self,
         cc: u32,
@@ -447,6 +486,7 @@ impl<'a> Search2<'a> {
         dj: u8,
         left: u8,
         last: usize,
+        after: u32,
         found: &mut dyn FnMut(&[u8]) -> bool,
     ) -> bool {
         if left == 0 {
@@ -457,8 +497,7 @@ impl<'a> Search2<'a> {
         }
         let t = self.t;
         let j = t.joint.as_ref().unwrap();
-        let allowed =
-            ALLOWED_AFTER[last] & PHASE2_MASK & if left == 1 { last_mask(last) } else { u32::MAX };
+        let allowed = after & PHASE2_MASK & if left == 1 { last_mask(last) } else { u32::MAX };
         // Stage 1: children with the centre bound, joint entries prefetched.
         let mut kids = [(0u32, [0u8; 16], 0usize, 0u8); 17];
         let mut nk = 0;
@@ -491,7 +530,15 @@ impl<'a> Search2<'a> {
                 continue;
             }
             self.path.push(m);
-            let go = self.dfs_joint(c2, &t2, d2, left - 1, m as usize, found);
+            let go = self.dfs_joint(
+                c2,
+                &t2,
+                d2,
+                left - 1,
+                m as usize,
+                after_child(after, m as usize),
+                found,
+            );
             self.path.pop();
             if !go {
                 return false;
@@ -529,6 +576,25 @@ mod tests {
             let tau = t.tau_of(&c);
             c = c.apply_perm(&MOVE_PERMS[P2_MOVES[i] as usize]);
             assert_eq!(t.tau_move(&tau, i), t.tau_of(&c));
+        }
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    #[test]
+    fn axis_moves_and_after_child() {
+        for m in 0..N_MOVES {
+            assert!(AXIS_MOVES[(m / 3) % 3] >> m & 1 == 1);
+            assert_eq!(AXIS_MOVES.iter().filter(|&&a| a >> m & 1 == 1).count(), 1);
+            // Without a phase-1 run, the usual canonical order.
+            for last in 0..=N_MOVES {
+                if ALLOWED_AFTER[last] >> m & 1 == 1 {
+                    assert_eq!(after_child(ALLOWED_AFTER[last], m), ALLOWED_AFTER[m]);
+                }
+            }
         }
     }
 }

@@ -1,7 +1,7 @@
 //! Joint phase-2 table checks: admissibility, dominance over tau, and the phase-2 gap and node
 //! counts on real phase-1 endpoints, with and without the joint table.
 use eggg_solver::cube::Cube;
-use eggg_solver::moves::{MOVE_PERMS, N_MOVES};
+use eggg_solver::moves::{ALLOWED_AFTER, MOVE_PERMS, N_MOVES};
 use eggg_solver::phase1::{P1State, Search1};
 use eggg_solver::phase2::{P2_MOVES, Search2, standardise};
 use eggg_solver::solver::load_tables_with;
@@ -63,10 +63,18 @@ fn main() {
             let mut s_old = Search2::new(p2);
             for d in hc.max(dt)..25 {
                 let mut found = false;
-                s_old.dfs(cc, &tau, dt, d, N_MOVES, &mut |_| {
-                    found = true;
-                    false
-                });
+                s_old.dfs(
+                    cc,
+                    &tau,
+                    dt,
+                    d,
+                    N_MOVES,
+                    ALLOWED_AFTER[N_MOVES],
+                    &mut |_| {
+                        found = true;
+                        false
+                    },
+                );
                 if found {
                     l2 = d;
                     break;
@@ -75,10 +83,18 @@ fn main() {
             let mut s_new = Search2::new(p2);
             for d in hc.max(dj)..25 {
                 let mut found = false;
-                s_new.dfs_joint(cc, &tau, dj, d, N_MOVES, &mut |_| {
-                    found = true;
-                    false
-                });
+                s_new.dfs_joint(
+                    cc,
+                    &tau,
+                    dj,
+                    d,
+                    N_MOVES,
+                    ALLOWED_AFTER[N_MOVES],
+                    &mut |_| {
+                        found = true;
+                        false
+                    },
+                );
                 if found {
                     assert_eq!(d, l2, "joint search found a different optimum");
                     break;
