@@ -162,6 +162,23 @@ struct TableArgs {
     /// whatever the tier.
     #[arg(long)]
     p1_big: bool,
+    /// Phase-1 pattern table (searches per colour pair, pruned by the distance to staged
+    /// centres with the pair in a pattern phase 2 can solve): none, the symmetry-reduced one
+    /// (0.9 GB) or the large one (41 GB).
+    #[arg(long, value_enum)]
+    p1_pat: Option<PatArg>,
+    /// Phase-1 move-mask table (the distance-decreasing moves of each staging state; nodes
+    /// at distance = moves left read one mask instead of ~20 child entries): none, the
+    /// symmetry-reduced one (0.8 GB) or the large one (18.9 GB). Implies --p1-big.
+    #[arg(long, value_enum)]
+    p1_mask: Option<PatArg>,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+enum PatArg {
+    None,
+    Small,
+    Big,
 }
 
 impl TableArgs {
@@ -185,7 +202,45 @@ impl TableArgs {
                 self.tier.resolve(&self.dir())
             );
         }
-        load_tables_with(&self.dir(), k, joint, big, threads, verbose)
+        let pat = match self.p1_pat {
+            None | Some(PatArg::None) => None,
+            Some(PatArg::Small) => Some(false),
+            Some(PatArg::Big) => Some(true),
+        };
+        if verbose && let Some(b) = pat {
+            eprintln!(
+                "phase-1 pattern table: {}",
+                if b {
+                    "large (41 GB)"
+                } else {
+                    "reduced (0.9 GB)"
+                }
+            );
+        }
+        let mask = match self.p1_mask {
+            None | Some(PatArg::None) => None,
+            Some(PatArg::Small) => Some(false),
+            Some(PatArg::Big) => Some(true),
+        };
+        if verbose && let Some(b) = mask {
+            eprintln!(
+                "phase-1 move-mask table: {}",
+                if b {
+                    "large (18.9 GB)"
+                } else {
+                    "reduced (0.8 GB)"
+                }
+            );
+        }
+        load_tables_with(
+            &self.dir(),
+            k,
+            joint,
+            big || mask.is_some(),
+            (pat, mask),
+            threads,
+            verbose,
+        )
     }
 
     fn dir(&self) -> PathBuf {
