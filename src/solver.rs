@@ -24,6 +24,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+/// Deepest phase-3 check (once there is a solution).
+const DMAX: usize = 17;
+/// Reductions are produced only if they could lead to a solution with a phase 3 this short.
+const DMIN: usize = 15;
+
 pub struct Tables {
     pub p1: P1Tables,
     pub p2: P2Tables,
@@ -212,7 +217,11 @@ struct Run<'a, 'r> {
     seen_ep: HashSet<(Vec<u8>, usize)>,
     cands: Vec<Candidate>,
     reds: Vec<Reduction>,
-    red_index: HashMap<(usize, Cube3), usize>,
+    red_index: HashMap<Cube3, usize>,
+    /// Widening of the caps before the first solution.
+    slack: usize,
+    /// Shortest phase-3 length a produced reduction is expected to need.
+    dmin: usize,
 }
 
 impl<'a> Solver<'a> {
@@ -266,6 +275,8 @@ impl<'a> Solver<'a> {
             cands: vec![],
             reds: vec![],
             red_index: HashMap::new(),
+            slack: 0,
+            dmin: DMIN,
         };
         run.level.jobs = run.level_jobs(d0);
         std::thread::scope(|scope| {
@@ -284,7 +295,7 @@ impl<'a> Solver<'a> {
                     std::thread::sleep(Duration::from_millis(1));
                 }
             });
-            run.rounds(self.opts.endpoints, self.opts.reductions);
+            run.run(self.opts.endpoints);
             done.store(true, Ordering::Relaxed);
         });
         self.stats = run.stats;
@@ -301,42 +312,114 @@ impl<'a, 'r> Run<'a, 'r> {
         self.best.as_ref().map(|b| b.len()).unwrap_or(usize::MAX)
     }
 
-    fn rounds(&mut self, endpoints: usize, reductions: usize) {
-        let (mut want1, mut want2) = (endpoints.max(1), reductions.max(1));
+    /// Lowest reduction length in the pool.
+    fn lstar(&self) -> Option<usize> {
+        self.reds.iter().map(|r| r.moves12.len()).min()
+    }
+
+    /// Target total of the phase-3 checks, and the deepest check allowed.
+    fn check_target(&self) -> (usize, usize) {
+        match &self.best {
+            Some(b) => (b.len() - 1, DMAX),
+            // Before the first solution every reduction may be checked to the depth cap; the
+            // lowest totals come first.
+            None => (usize::MAX, DMAX + self.slack),
+        }
+    }
+
+    /// Longest reductions worth producing.
+    fn production_cap(&self) -> usize {
+        match (&self.best, self.lstar()) {
+            (Some(b), _) => (b.len() - 1).saturating_sub(self.dmin),
+            (None, Some(l)) => l + 1 + self.slack,
+            (None, None) => usize::MAX,
+        }
+    }
+
+    /// Next phase-3 level: the lowest total at which some reduction has an open check.
+    fn next_check(&self) -> Option<usize> {
+        let (target, dmax) = self.check_target();
+        self.reds
+            .iter()
+            .filter_map(|r| {
+                let l = r.moves12.len();
+                let d = r.h3.max(r.done3) as usize;
+                (l + d <= target && d <= dmax).then_some(l + d)
+            })
+            .min()
+    }
+
+    /// Next phase-2 level: the lowest reduction length some candidate can still be searched at.
+    fn next_production(&self) -> Option<usize> {
+        let cap = self.production_cap();
+        self.cands
+            .iter()
+            .map(|c| c.moves1.len() + c.h2.max(c.done2) as usize)
+            .filter(|&t| t <= cap)
+            .min()
+    }
+
+    /// The scheduler: phase-3 checks first (they find solutions for far fewer nodes than
+    /// producing reductions does), then phase-2 searches below the production cap, then more
+    /// phase-1 endpoints.
+    fn run(&mut self, batch1: usize) {
         loop {
             if self.stopped() {
                 return;
             }
-            self.stats.rounds += 1;
-            let t0 = Instant::now();
-            self.phase1(want1);
+            if let Some(t) = self.next_check() {
+                debug(
+                    self.start,
+                    &format!(
+                        "phase 3: total {t} ({} reductions), nodes {}",
+                        self.reds.len(),
+                        self.stats.nodes3
+                    ),
+                );
+                if let Some((r, sol)) = self.phase3_level(t) {
+                    self.record(r, &sol);
+                }
+                continue;
+            }
+            if let Some(t) = self.next_production() {
+                let before = self.reds.len();
+                self.phase2_batch(t);
+                debug(
+                    self.start,
+                    &format!(
+                        "phase 2: level {t}: {} new reductions ({} total), nodes {}",
+                        self.reds.len() - before,
+                        self.reds.len(),
+                        self.stats.nodes2
+                    ),
+                );
+                continue;
+            }
+            let want = batch1.max(self.cands.len() / 4);
+            let cap = self.production_cap();
+            let useful = self.phase1(want);
             debug(
                 self.start,
                 &format!(
-                    "phase 1: {} endpoints (length {}), nodes {}",
+                    "phase 1: {} endpoints (length {}), {useful} under cap {cap}, nodes {}",
                     self.cands.len(),
                     self.level.len,
                     self.stats.nodes1
                 ),
             );
-            self.phase2(want2);
-            debug(
-                self.start,
-                &format!(
-                    "phase 2: {} reductions, nodes {}",
-                    self.reds.len(),
-                    self.stats.nodes2
-                ),
-            );
-            // Phase 3 may take about twice as long as this round's phases 1 and 2 before the
-            // pool grows again.
-            let budget = (t0.elapsed() * 2).max(Duration::from_millis(20));
-            self.phase3_levels(Instant::now() + budget);
-            if self.stopped() || self.level.len > 40 {
+            if useful == 0 {
+                // Nothing new can help within the caps: widen them.
+                if self.best.is_none() {
+                    self.slack += 1;
+                } else if self.dmin > 10 {
+                    self.dmin -= 1;
+                } else {
+                    return;
+                }
+            }
+            if self.level.len > 40 {
                 return;
             }
-            want1 *= 4;
-            want2 *= 4;
         }
     }
 
@@ -381,8 +464,11 @@ impl<'a, 'r> Run<'a, 'r> {
         jobs
     }
 
-    /// Collect phase-1 endpoints until there are `want` candidates in total.
-    fn phase1(&mut self, want: usize) {
+    /// Collect about `want` more phase-1 endpoints; returns how many of the new candidates can
+    /// reach the production cap.
+    fn phase1(&mut self, want: usize) -> usize {
+        let want = self.cands.len() + want;
+        let first_new = self.cands.len();
         while self.cands.len() < want && !self.stopped() && self.level.len <= 40 {
             if self.level.next >= self.level.jobs.len() {
                 let len = self.level.len + 1;
@@ -459,6 +545,11 @@ impl<'a, 'r> Run<'a, 'r> {
             }
         }
         self.stats.endpoints = self.cands.len();
+        let cap = self.production_cap();
+        self.cands[first_new..]
+            .iter()
+            .filter(|c| c.moves1.len() + c.h2 as usize <= cap)
+            .count()
     }
 
     fn make_candidate(&self, moves1: &[u8], frame: usize) -> Option<Candidate> {
@@ -487,43 +578,43 @@ impl<'a, 'r> Run<'a, 'r> {
         })
     }
 
-    /// Phase 2, level by level on the reduction length, until `want` reductions in total.
-    fn phase2(&mut self, want: usize) {
-        let cap = self.best_len().saturating_sub(12).min(64);
-        let mut t12 = self
-            .cands
-            .iter()
-            .map(|c| c.moves1.len() + c.h2.max(c.done2) as usize)
-            .min()
-            .unwrap_or(99);
-        while self.reds.len() < want && !self.stopped() && t12 <= cap {
-            for r in self.phase2_level(t12) {
-                let key = (r.frame, r.c3);
-                match self.red_index.get(&key) {
-                    Some(&i) if self.reds[i].moves12.len() <= r.moves12.len() => {}
-                    Some(&i) => self.reds[i] = r,
-                    None => {
-                        self.red_index.insert(key, self.reds.len());
-                        self.reds.push(r);
-                    }
+    /// Phase-2 searches at reduction length `t`, for a batch of the candidates whose next
+    /// open level it is (the cheapest-looking first), adding the reductions to the pool.
+    fn phase2_batch(&mut self, t: usize) {
+        let mut jobs: Vec<usize> = (0..self.cands.len())
+            .filter(|&i| {
+                let c = &self.cands[i];
+                c.moves1.len() + c.h2.max(c.done2) as usize == t
+            })
+            .collect();
+        jobs.sort_by_key(|&i| {
+            (
+                t - self.cands[i].moves1.len() - self.cands[i].h2 as usize,
+                i,
+            )
+        });
+        jobs.truncate((self.threads * 16).max(64));
+        let target = self.check_target().0;
+        for r in self.phase2_jobs(&jobs, t) {
+            if self.best.is_some() && r.moves12.len() + r.h3 as usize > target {
+                continue;
+            }
+            match self.red_index.get(&r.c3) {
+                Some(&i) if self.reds[i].moves12.len() <= r.moves12.len() => {}
+                Some(&i) => self.reds[i] = r,
+                None => {
+                    self.red_index.insert(r.c3, self.reds.len());
+                    self.reds.push(r);
                 }
             }
-            t12 += 1;
         }
         self.stats.reductions = self.reds.len();
     }
 
-    /// Phase-2 searches of total length `t12` for every candidate that can reach it.
-    fn phase2_level(&mut self, t12: usize) -> Vec<Reduction> {
+    /// Phase-2 searches of total length `t12` for the given candidates.
+    fn phase2_jobs(&mut self, jobs: &[usize], t12: usize) -> Vec<Reduction> {
         let t = self.t;
         let cands = &self.cands;
-        let jobs: Vec<usize> = (0..cands.len())
-            .filter(|&i| {
-                let c = &cands[i];
-                let l1 = c.moves1.len();
-                t12 >= l1 + c.h2 as usize && (t12 - l1) as u8 >= c.done2
-            })
-            .collect();
         let out = Mutex::new(vec![]);
         let nodes = AtomicU64::new(0);
         let stop = self.stop;
@@ -542,7 +633,7 @@ impl<'a, 'r> Run<'a, 'r> {
             let mut sols: Vec<Vec<u8>> = vec![];
             srch.dfs(c.centre, &c.tau, c.dt, l2, last1, &mut |p: &[u8]| {
                 sols.push(p.to_vec());
-                sols.len() < 64
+                sols.len() < 4096
             });
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
             let mut local = vec![];
@@ -566,16 +657,18 @@ impl<'a, 'r> Run<'a, 'r> {
                     done3: 0,
                 });
             }
-            out.lock().unwrap().push((j, local));
+            out.lock()
+                .unwrap()
+                .push((j, local, !stop.load(Ordering::Relaxed)));
         });
-        if !self.stopped() {
-            for &j in &jobs {
-                let c = &mut self.cands[j];
+        let mut v = out.into_inner().unwrap();
+        for &(j, _, complete) in &v {
+            if complete {
+                let c = &mut self.cands[jobs[j]];
                 c.done2 = c.done2.max((t12 - c.moves1.len()) as u8 + 1);
             }
         }
         self.stats.nodes2 += nodes.load(Ordering::Relaxed);
-        let mut v = out.into_inner().unwrap();
         v.sort_by_key(|x| x.0);
         v.into_iter().flat_map(|x| x.1).collect()
     }
@@ -606,44 +699,16 @@ impl<'a, 'r> Run<'a, 'r> {
         }
     }
 
-    /// Phase 3, level by level on the total length, below the best solution, until the
-    /// deadline (a level in progress then stops claiming reductions; finished ones are kept).
-    fn phase3_levels(&mut self, deadline: Instant) {
-        loop {
-            let best = self.best_len();
-            let lo = self
-                .reds
-                .iter()
-                .map(|r| r.moves12.len() + r.h3.max(r.done3) as usize)
-                .min()
-                .unwrap_or(usize::MAX);
-            if lo >= best || self.stopped() || Instant::now() >= deadline {
-                return;
-            }
-            debug(
-                self.start,
-                &format!("phase 3: total {lo}, nodes {}", self.stats.nodes3),
-            );
-            match self.phase3_level(lo, deadline) {
-                Some((r, sol)) => self.record(r, &sol),
-                None => {
-                    if Instant::now() >= deadline {
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
     /// Phase-3 searches of total length `total` over the reductions; the first solution found.
-    fn phase3_level(&mut self, total: usize, deadline: Instant) -> Option<(usize, Vec<u8>)> {
+    fn phase3_level(&mut self, total: usize) -> Option<(usize, Vec<u8>)> {
         let t = self.t;
         let reds = &self.reds;
+        let dmax = self.check_target().1;
         let mut jobs: Vec<usize> = (0..reds.len())
             .filter(|&i| {
                 let r = &reds[i];
                 let l12 = r.moves12.len();
-                total >= l12 + r.h3 as usize && total - l12 >= r.done3 as usize
+                l12 + r.h3.max(r.done3) as usize == total && total - l12 <= dmax
             })
             .collect();
         // Shallow searches first: any solution of this level is as good as any other.
@@ -654,13 +719,14 @@ impl<'a, 'r> Run<'a, 'r> {
         let finished = Mutex::new(vec![]);
         let stop = self.stop;
         par_jobs(jobs.len(), self.threads, stop, |j| {
-            if found.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            if found.load(Ordering::Relaxed) {
                 return;
             }
             let r = &reds[jobs[j]];
             let d = (total - r.moves12.len()) as u8;
             let mut srch = Search3::new(&t.p3);
             srch.abort = Some(stop);
+            srch.abort_level = Some(&found);
             let sol = srch.search_depth(&r.c3, d, N_MOVES);
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
             match sol {

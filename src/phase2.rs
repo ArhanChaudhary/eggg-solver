@@ -347,6 +347,18 @@ pub fn standardise(c: &Cube, frame: usize) -> Cube {
 #[allow(unused)]
 const _U: [usize; 2] = [B, N_MOVES];
 
+/// Moves that may end phase 2 after move `last`: a wide half turn, but not one right after an
+/// outer turn on its own axis ("U Uw2" = "Uw2 U": the shorter reduction, with U left to
+/// phase 3, covers it).
+#[inline(always)]
+fn last_mask(last: usize) -> u32 {
+    if last < 18 {
+        WIDE_HALF & !(1 << (19 + 3 * ((last / 3) % 3)))
+    } else {
+        WIDE_HALF
+    }
+}
+
 /// Depth-first phase-2 search for solutions of exactly `left` moves.
 pub struct Search2<'a> {
     pub t: &'a P2Tables,
@@ -384,7 +396,7 @@ impl<'a> Search2<'a> {
             return true;
         }
         let allowed =
-            ALLOWED_AFTER[last] & PHASE2_MASK & if left == 1 { WIDE_HALF } else { u32::MAX };
+            ALLOWED_AFTER[last] & PHASE2_MASK & if left == 1 { last_mask(last) } else { u32::MAX };
         for (i, &m) in P2_MOVES.iter().enumerate() {
             if allowed >> m & 1 == 0 {
                 continue;
