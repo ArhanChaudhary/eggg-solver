@@ -84,10 +84,11 @@ pub struct Staging {
     sym_perm: Vec<[[u32; 256]; 3]>,
     move_perm: Vec<[[u32; 256]; 3]>,
     /// Unlabelled rank of an 8-of-16 mask (x and its complement share a rank).
-    unl: Vec<u16>,
+    unl: Box<[u16; 1 << 16]>,
     unl_inv: Vec<u16>,
-    /// Byte-sliced colex rank of 8-of-24 masks.
-    rank_t: [[[u32; 256]; 9]; 3],
+    /// Byte-sliced colex rank of 8-of-24 masks, by byte and number of bits below it (sized
+    /// so that no count of the two lower bytes needs a bounds check; only 0..=8 are used).
+    rank_t: [[[u32; 256]; 17]; 3],
 }
 
 fn perm_tables(perm: &[u8; 24]) -> [[u32; 256]; 3] {
@@ -144,9 +145,9 @@ impl Staging {
                 perm_tables(&dst)
             })
             .collect();
-        let mut rank_t = [[[0u32; 256]; 9]; 3];
+        let mut rank_t = [[[0u32; 256]; 17]; 3];
         for k in 0..3 {
-            for c in 0..9 {
+            for c in 0..17 {
                 for v in 0..256usize {
                     let mut r = 0;
                     let mut t = 0;
@@ -191,7 +192,7 @@ impl Staging {
             stab.push(st);
         }
         assert_eq!(class_rep.len(), N_CLASSES_A);
-        let mut unl = vec![u16::MAX; 1 << 16];
+        let mut unl: Box<[u16; 1 << 16]> = vec![u16::MAX; 1 << 16].try_into().unwrap();
         let mut unl_inv = vec![];
         for x in 0u32..(1 << 16) {
             if x.count_ones() == 8 && unl[x as usize] == u16::MAX {
@@ -239,10 +240,10 @@ impl Staging {
         let s = (info & 255) as usize;
         let rem = !self.class_rep[class] & MASK24;
         let b = apply_mask(&self.sym_perm[s], rl);
-        let mut u = self.unl[pext(b, rem) as usize];
+        let mut u = self.unl[pext(b, rem) as u16 as usize];
         for &t in &self.stab[class] {
             let bt = apply_mask(&self.sym_perm[t as usize], b);
-            u = u.min(self.unl[pext(bt, rem) as usize]);
+            u = u.min(self.unl[pext(bt, rem) as u16 as usize]);
         }
         (class * N_SPLIT + u as usize) as u64
     }
@@ -262,7 +263,7 @@ impl Staging {
         let s = (info & 255) as usize;
         let b = apply_mask(&self.sym_perm[s], rl);
         let rem = !self.class_rep[class] & MASK24;
-        (class * N_SPLIT + self.unl[pext(b, rem) as usize] as usize) as u64
+        (class * N_SPLIT + self.unl[pext(b, rem) as u16 as usize] as usize) as u64
     }
 
     pub fn rep_of(&self, idx: u64) -> (u32, u32) {
@@ -277,7 +278,8 @@ impl Staging {
     /// unlabelled split of the other 16 positions between the R/L and F/B colours.
     #[inline(always)]
     pub fn big_index(&self, ud: u32, rl: u32) -> u64 {
-        self.rank24(ud) as u64 * N_SPLIT as u64 + self.unl[pext(rl, !ud & MASK24) as usize] as u64
+        self.rank24(ud) as u64 * N_SPLIT as u64
+            + self.unl[pext(rl, !ud & MASK24) as u16 as usize] as u64
     }
 
     pub fn big_len() -> usize {
@@ -559,9 +561,16 @@ impl P1State {
     }
 
     /// The centre masks of the child after move `m` (those of `self.apply(m, t)`).
+    ///
+    /// # Safety
+    /// `m < N_MOVES`.
     #[inline(always)]
-    pub fn child_masks(&self, m: usize, t: &P1Tables) -> (u32, u32) {
-        centre_masks(self.centres.gather(&t.centre_idx[m]))
+    unsafe fn child_masks(&self, m: usize, t: &P1Tables) -> (u32, u32) {
+        debug_assert!(m < N_MOVES);
+        centre_masks(
+            self.centres
+                .gather(unsafe { t.centre_idx.get_unchecked(m) }),
+        )
     }
 }
 
@@ -753,14 +762,17 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         let mut idx = [0u64; N_MOVES];
         let mut nk = 0;
         let mut a = allowed;
+        // SAFETY (the unchecked indexing below): the allowed moves are < N_MOVES, and so is
+        // the number of children before the last.
+        debug_assert!(allowed >> N_MOVES == 0);
         if BIG {
             while a != 0 {
                 let m = a.trailing_zeros() as usize;
                 a &= a - 1;
-                let (ud, rl) = s.child_masks(m, t);
+                let (ud, rl) = unsafe { s.child_masks(m, t) };
                 let i = t.staging.big_index(ud, rl);
                 t.table.prefetch(i);
-                idx[nk] = i;
+                unsafe { *idx.get_unchecked_mut(nk) = i };
                 nk += 1;
             }
         } else {
@@ -769,19 +781,21 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             while a != 0 {
                 let m = a.trailing_zeros() as usize;
                 a &= a - 1;
-                let (ud, rl) = s.child_masks(m, t);
+                let (ud, rl) = unsafe { s.child_masks(m, t) };
                 let p = t.staging.info(ud);
                 crate::table::prefetch(p);
-                infos[nk] = p;
-                rls[nk] = rl;
+                unsafe {
+                    *infos.get_unchecked_mut(nk) = p;
+                    *rls.get_unchecked_mut(nk) = rl;
+                }
                 nk += 1;
             }
-            for k in 0..nk {
-                let i = t.staging.fast_index(unsafe { *infos[k] }, rls[k]);
-                t.table.prefetch(i);
-                idx[k] = i;
+            for ((i, &p), &rl) in idx.iter_mut().zip(&infos[..nk]).zip(&rls) {
+                *i = t.staging.fast_index(unsafe { *p }, rl);
+                t.table.prefetch(*i);
             }
         }
+        let idx = &idx[..nk];
         self.nodes += nk as u64;
         if self
             .abort
@@ -797,10 +811,11 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         // cached, and reading all the values first is faster.
         let mut dcs = [0u8; N_MOVES];
         if !BIG {
-            for k in 0..nk {
-                dcs[k] = dec[t.table.get(idx[k]) as usize];
+            for (dc, &i) in dcs.iter_mut().zip(idx) {
+                *dc = dec[t.table.get(i) as usize];
             }
         }
+        let dcs = &dcs[..nk];
         for k in 0..nk {
             let m = allowed.trailing_zeros() as usize;
             allowed &= allowed - 1;
