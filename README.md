@@ -1,0 +1,71 @@
+# eggg-solver
+
+A fast three-phase 4x4x4 Rubik's cube solver in Rust. It looks for **short solutions in the
+outer block turn metric (OBTM), quickly**, and keeps improving its solution until a time limit.
+Output in WCA (`Rw`) or SiGN (`r`) notation.
+
+## Usage
+
+```sh
+cargo build --release
+# Solve a scramble (WCA or SiGN notation, rotations and inner slices allowed) for 5 seconds:
+target/release/eggg-solver solve "Rw U2 x Rw2 F' Bw D Lw' 2R B2 u'" -t 5
+# A 96-character facelet string (faces U R F D L B, each row by row):
+target/release/eggg-solver solve UUUU...BBBB
+# SiGN output, all cores, stop at the first solution of at most 40 moves:
+target/release/eggg-solver solve "..." -n sign -l 40
+# Random positions, from stdin (one per line), batch output:
+target/release/eggg-solver solve --random 10 -q
+# Generate the tables up front, or benchmark:
+target/release/eggg-solver gen
+target/release/eggg-solver bench -N 10 -t 5
+```
+
+Each improvement is printed as it is found (`time, length, phase lengths, moves`), then the
+best solution. The time limit is soft until a first solution exists (`--hard-limit` to cap it).
+
+### Tables and memory
+
+Tables are generated on first use and saved in `--tables DIR` (default `$EGGG_TABLES`, else
+`./tables`):
+
+| table | size | option |
+|---|---:|---|
+| phase-1 centre staging (symmetry-reduced, exact) | 25 MB | always |
+| phase-2 pairing permutation | 60 MB | always |
+| phase-2 joint table (pairing x U/D centres x PLL parity) | 1.05 GB | `--p2-joint` |
+| phase-3 H48 hK (3x3x3), K edge-orientation bits | 30 MB * 2^K (h6: 1.9 GB, h7: 3.9 GB) | `--h48 K` |
+
+Small machines: `--h48 0`..`4`, without `--p2-joint`. Large machines: `--h48 7` or `8`,
+`--p2-joint`.
+
+## How it works
+
+The cube is solved in a fixed frame with 27 moves (U R F D L B Uw Rw Fw and their powers);
+Dw, Lw and Bw are never needed (Dw is Uw plus a rotation) and the cube may end solved in any
+orientation, so the output needs no rotations.
+
+1. **Phase 1** (Tsai/TPR phases 1+2, merged): put every centre on a face of its colour pair's
+   axis, the centres of one axis into a pattern phase 2 can finish, make the wing permutation
+   even and the wings *pairable* (the 12 "low" wing slots of the phase-2 frame hold one wing of
+   each dedge, an even number of them "high"). One search tree serves all 18 combinations of
+   frame (which axis phase 2 turns only by half turns) and colour-to-axis assignment. Guided by
+   an exact staging table reduced by the 48 symmetries.
+2. **Phase 2** (TPR phase 3): pair the dedges and solve the centres with
+   U D F B R2 L2 Uw2 Rw2 Fw2, guided by an exact centre table and either the pairing
+   permutation table or the much tighter joint table.
+3. **Phase 3**: solve the reduced 3x3x3 in one IDA* search with H48 pruning tables (as in
+   nissy's H48 solver and egg-solver), from both ends of the solution at once.
+
+The driver collects many phase-1 endpoints and reductions and searches phase 3 level by
+level on the total length over all of them, so each solution found is the shortest the pool
+allows; the pool grows while time remains.
+
+## Development
+
+- `cargo test --release` (end-to-end tests use `./tables`, generating them if missing).
+- `scripts/bench.sh LABEL` / `scripts/m2-bench.sh NAME...` and `scripts/compare.py A B`:
+  benchmark suites (random positions, best length after a time limit, multi- and
+  single-threaded) and before/after tables.
+- `examples/` holds deterministic checks used during optimisation (`p1check`, `p3nodes`,
+  `p2jcheck`, ...).
