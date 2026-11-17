@@ -17,7 +17,10 @@ use crate::cube3::Cube3;
 use crate::moves::{ALLOWED_AFTER, MOVE_PERMS, N_MOVES, frame_rotation, rotate_move};
 use crate::phase1::{P1State, P1Tables, Search1};
 use crate::phase2::{P2Tables, Search2, standardise};
-use crate::phase3::{P3Tables, Search3};
+use crate::phase3::{P3Tables, Search3, Task};
+
+/// Phase-3 checks at least this deep are split into one job per child of the root.
+const SPLIT_DEPTH: u8 = 15;
 use crate::table::Mod3Table;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -303,6 +306,8 @@ impl<'a, 'r> Run<'a, 'r> {
 
     fn rounds(&mut self, endpoints: usize, reductions: usize) {
         let (mut want1, mut want2) = (endpoints.max(1), reductions.max(1));
+        // Time spent producing reductions (phases 1 and 2) and checking them (phase 3).
+        let (mut produce, mut check) = (Duration::ZERO, Duration::ZERO);
         loop {
             if self.stopped() {
                 return;
@@ -328,15 +333,19 @@ impl<'a, 'r> Run<'a, 'r> {
                     self.stats.nodes2
                 ),
             );
-            // Phase 3 may take about twice as long as this round's phases 1 and 2 before the
-            // pool grows again.
-            let budget = (t0.elapsed() * 2).max(Duration::from_millis(20));
-            self.phase3_levels(Instant::now() + budget);
+            produce += t0.elapsed();
+            // Phase 3 gets about 1.5 times the production time so far (shallow levels over the
+            // whole pool are cheap; deep ones wait for a bigger pool).
+            let t1 = Instant::now();
+            let budget =
+                (produce.mul_f64(1.5).saturating_sub(check)).max(Duration::from_millis(10));
+            self.phase3_levels(t1 + budget);
+            check += t1.elapsed();
             if self.stopped() || self.level.len > 40 {
                 return;
             }
-            want1 *= 4;
-            want2 *= 4;
+            want1 *= 2;
+            want2 *= 2;
         }
     }
 
@@ -474,7 +483,10 @@ impl<'a, 'r> Run<'a, 'r> {
             return None;
         }
         let tau = t.p2.tau_of(&x);
-        let dt = t.p2.tau_distance(&tau);
+        let dt = match &t.p2.joint {
+            Some(j) => j.distance(&t.p2, centre / 1680, &tau, centre & 1),
+            None => t.p2.tau_distance(&tau),
+        };
         Some(Candidate {
             moves1: moves1.to_vec(),
             frame,
@@ -489,7 +501,9 @@ impl<'a, 'r> Run<'a, 'r> {
 
     /// Phase 2, level by level on the reduction length, until `want` reductions in total.
     fn phase2(&mut self, want: usize) {
-        let cap = self.best_len().saturating_sub(12).min(64);
+        // Reductions are only worth producing if a phase 3 of 15 moves or more could still
+        // beat the best solution.
+        let cap = self.best_len().saturating_sub(16).min(64);
         let mut t12 = self
             .cands
             .iter()
@@ -540,10 +554,15 @@ impl<'a, 'r> Run<'a, 'r> {
             let mut srch = Search2::new(&t.p2);
             srch.abort = Some(stop);
             let mut sols: Vec<Vec<u8>> = vec![];
-            srch.dfs(c.centre, &c.tau, c.dt, l2, last1, &mut |p: &[u8]| {
+            let mut keep = |p: &[u8]| {
                 sols.push(p.to_vec());
                 sols.len() < 64
-            });
+            };
+            if t.p2.joint.is_some() {
+                srch.dfs_joint(c.centre, &c.tau, c.dt, l2, last1, &mut keep);
+            } else {
+                srch.dfs(c.centre, &c.tau, c.dt, l2, last1, &mut keep);
+            }
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
             let mut local = vec![];
             for p in sols {
@@ -639,7 +658,7 @@ impl<'a, 'r> Run<'a, 'r> {
     fn phase3_level(&mut self, total: usize, deadline: Instant) -> Option<(usize, Vec<u8>)> {
         let t = self.t;
         let reds = &self.reds;
-        let mut jobs: Vec<usize> = (0..reds.len())
+        let mut order: Vec<usize> = (0..reds.len())
             .filter(|&i| {
                 let r = &reds[i];
                 let l12 = r.moves12.len();
@@ -647,38 +666,70 @@ impl<'a, 'r> Run<'a, 'r> {
             })
             .collect();
         // Shallow searches first: any solution of this level is as good as any other.
-        jobs.sort_by_key(|&i| (std::cmp::Reverse(reds[i].moves12.len()), i));
+        order.sort_by_key(|&i| (std::cmp::Reverse(reds[i].moves12.len()), i));
+        // Deep searches are split into one task per child of the root, so that they spread
+        // over the threads; `parts[r]` counts the jobs of reduction r.
+        let mut jobs: Vec<(usize, Option<Task>)> = vec![];
+        let mut parts = vec![0usize; reds.len()];
+        let mut pruned = vec![];
+        for &i in &order {
+            let r = &reds[i];
+            let d = (total - r.moves12.len()) as u8;
+            if d >= SPLIT_DEPTH {
+                match Search3::new(&t.p3).tasks(&r.c3, d) {
+                    Some(ts) => {
+                        parts[i] = ts.len();
+                        jobs.extend(ts.into_iter().map(|task| (i, Some(task))));
+                    }
+                    None => pruned.push(i),
+                }
+            } else {
+                parts[i] = 1;
+                jobs.push((i, None));
+            }
+        }
         let result = Mutex::new(None::<(usize, Vec<u8>)>);
         let found = AtomicBool::new(false);
         let nodes = AtomicU64::new(0);
-        let finished = Mutex::new(vec![]);
+        let finished: Vec<AtomicUsize> = (0..reds.len()).map(|_| AtomicUsize::new(0)).collect();
         let stop = self.stop;
         par_jobs(jobs.len(), self.threads, stop, |j| {
             if found.load(Ordering::Relaxed) || Instant::now() >= deadline {
                 return;
             }
-            let r = &reds[jobs[j]];
+            let (i, task) = &jobs[j];
+            let r = &reds[*i];
             let d = (total - r.moves12.len()) as u8;
             let mut srch = Search3::new(&t.p3);
             srch.abort = Some(stop);
-            let sol = srch.search_depth(&r.c3, d, N_MOVES);
+            srch.abort_level = Some(&found);
+            let sol = match task {
+                Some(task) => srch.run_task(task),
+                None => srch.search_depth(&r.c3, d, N_MOVES),
+            };
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
             match sol {
                 Some(sol) => {
                     found.store(true, Ordering::Relaxed);
                     let mut g = result.lock().unwrap();
-                    if g.as_ref().is_none_or(|(k, _)| jobs[j] < *k) {
-                        *g = Some((jobs[j], sol));
+                    if g.as_ref().is_none_or(|(k, _)| *i < *k) {
+                        *g = Some((*i, sol));
                     }
                 }
-                None if !srch.aborted => finished.lock().unwrap().push(jobs[j]),
+                None if !srch.aborted => {
+                    finished[*i].fetch_add(1, Ordering::Relaxed);
+                }
                 None => {}
             }
         });
         self.stats.nodes3 += nodes.load(Ordering::Relaxed);
-        for j in finished.into_inner().unwrap() {
-            let r = &mut self.reds[j];
-            r.done3 = r.done3.max((total - r.moves12.len()) as u8 + 1);
+        for i in 0..self.reds.len() {
+            if (parts[i] > 0 && finished[i].load(Ordering::Relaxed) == parts[i])
+                || pruned.contains(&i)
+            {
+                let r = &mut self.reds[i];
+                r.done3 = r.done3.max((total - r.moves12.len()) as u8 + 1);
+            }
         }
         result.into_inner().unwrap()
     }
@@ -686,6 +737,17 @@ impl<'a, 'r> Run<'a, 'r> {
 
 /// Load or build all tables in `dir`.
 pub fn load_tables(dir: &std::path::Path, h48_k: u32, threads: usize, verbose: bool) -> Tables {
+    load_tables_with(dir, h48_k, false, threads, verbose)
+}
+
+/// Load or build all tables in `dir`; `joint`: also the joint phase-2 table (2.1 GB).
+pub fn load_tables_with(
+    dir: &std::path::Path,
+    h48_k: u32,
+    joint: bool,
+    threads: usize,
+    verbose: bool,
+) -> Tables {
     let t0 = Instant::now();
     let p1_path = dir.join("p1-staging2.tab");
     let p1 = {
@@ -747,6 +809,32 @@ pub fn load_tables(dir: &std::path::Path, h48_k: u32, threads: usize, verbose: b
             t
         }
     };
+    let mut p2 = p2;
+    if joint {
+        let mut j = crate::p2joint::Joint::new(&p2);
+        let path = dir.join("p2-joint2.tab");
+        j.table = crate::table::HugeBuf::zeroed(j.bytes() / 8);
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                j.table.as_mut_slice().as_mut_ptr() as *mut u8,
+                j.bytes(),
+            )
+        };
+        if crate::table::load(&path, "p2-joint2", bytes).is_err() {
+            if verbose {
+                eprintln!(
+                    "generating the joint phase-2 table ({:.1} GB)...",
+                    j.bytes() as f64 / 1e9
+                );
+            }
+            j.generate(&p2, threads, verbose);
+            let bytes = unsafe {
+                std::slice::from_raw_parts(j.table.as_slice().as_ptr() as *const u8, j.bytes())
+            };
+            crate::table::save(&path, "p2-joint2", bytes).expect("saving table");
+        }
+        p2.joint = Some(j);
+    }
     let p3 = P3Tables::load_or_build(dir, h48_k, threads, verbose);
     if verbose {
         eprintln!("tables ready in {:.1} s", t0.elapsed().as_secs_f64());
