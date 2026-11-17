@@ -20,12 +20,20 @@ def summary(d):
     pos = d["positions"]
     n = len(pos)
     out = {}
+    wall = sum(p["wall"] for p in pos)
+    nodes = sum(sum(p["nodes"]) for p in pos)
+    out["nodes/s"] = nodes / wall if wall else None
     for c in [0.25, 0.5, 1, 2, 5, 10, 12]:
         if c > d["time"] + 1e-9:
             continue
         vals = [at(p["history"], c) for p in pos]
-        out[f"length at {c} s"] = sum(vals) / n if all(v is not None for v in vals) else None
-    out["final length"] = sum(p["final"] for p in pos) / n
+        got = [v for v in vals if v is not None]
+        out[f"solved by {c} s"] = f"{len(got)}/{n}"
+        if len(got) == n:
+            out[f"length at {c} s"] = sum(got) / n
+    solved = [p for p in pos if p["final"] > 0]
+    out["solved"] = f"{len(solved)}/{n}"
+    out["final length (solved)"] = sum(p["final"] for p in solved) / len(solved) if solved else None
     firsts = [p["history"][0] for p in pos if p["history"]]
     if firsts:
         out["first solution (s)"] = sum(f[0] for f in firsts) / len(firsts)
@@ -37,6 +45,8 @@ def summary(d):
 def fmt(v):
     if v is None:
         return "-"
+    if isinstance(v, str):
+        return v
     if isinstance(v, float) and v >= 1e5:
         return f"{v:.3e}"
     return f"{v:.3f}"
@@ -50,5 +60,6 @@ for suite in ["mt", "st"]:
     print(f"\n{'Multi' if suite == 'mt' else 'Single'}-threaded ({len(a['positions'])} positions, {a['time']} s, {a['threads']} threads)\n")
     print(f"| metric | {before} | {after} |")
     print("|---|---:|---:|")
-    for k in sa:
+    keys = list(dict.fromkeys(list(sa) + list(sb)))
+    for k in keys:
         print(f"| {k} | {fmt(sa.get(k))} | {fmt(sb.get(k))} |")

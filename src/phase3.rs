@@ -117,11 +117,20 @@ impl P3Tables {
     #[inline(always)]
     fn probe(&self, v: &C3) -> (u8, usize) {
         let cs = self.coords.cocsep[self.fast.cocsep(v)];
+        (cs as u8, self.probe_edges(v, cs))
+    }
+
+    /// The cocsep entry (class << 16 | symmetry << 8 | corner distance) of a cube.
+    #[inline(always)]
+    fn corners(&self, v: &C3) -> u32 {
+        self.coords.cocsep[self.fast.cocsep(v)]
+    }
+
+    /// The h48 index of a cube, given its cocsep entry.
+    #[inline(always)]
+    fn probe_edges(&self, v: &C3, cs: u32) -> usize {
         let (eslot, msplit, eo) = self.fast.edges(v, (cs >> 8 & 255) as usize);
-        (
-            (cs & 255) as u8,
-            self.h48.index(cs >> 16, eslot, msplit, eo),
-        )
+        self.h48.index(cs >> 16, eslot, msplit, eo)
     }
 
     /// Bound of a cube (debugging aid).
@@ -180,7 +189,16 @@ impl<'a> Search3<'a> {
         }
         self.front.clear();
         self.back.clear();
-        if self.dfs(&n, depth, first_after, crate::moves::N_MOVES, hv, hy) {
+        if self.dfs(
+            &n,
+            depth,
+            first_after,
+            crate::moves::N_MOVES,
+            hv,
+            hy,
+            hy == depth,
+            hv == depth,
+        ) {
             let mut p = self.front.clone();
             p.extend(self.back.iter().rev());
             Some(p)
@@ -200,9 +218,22 @@ impl<'a> Search3<'a> {
     /// unknown middle solves it. `hv`/`hy` are lower bounds of the middle from both sides.
     ///
     /// A tight bound on the cube means the middle's last move is a quarter turn (the target
-    /// group contains the half turns), a tight bound on the inverse that its first move is: so
-    /// the search extends the side whose next move is restricted.
-    fn dfs(&mut self, n: &Node, left: u8, last_f: usize, last_b: usize, hv: u8, hy: u8) -> bool {
+    /// group contains the half turns), a tight bound on the inverse that its first move is.
+    /// These facts hold until that end of the middle is extended (`fq`: the next front move
+    /// must be a quarter turn, `bq`: the next back move), and the search extends whichever
+    /// side has fewer moves to try.
+    #[allow(clippy::too_many_arguments)]
+    fn dfs(
+        &mut self,
+        n: &Node,
+        left: u8,
+        last_f: usize,
+        last_b: usize,
+        hv: u8,
+        hy: u8,
+        fq: bool,
+        bq: bool,
+    ) -> bool {
         if self.aborted {
             return false;
         }
@@ -216,13 +247,10 @@ impl<'a> Search3<'a> {
         }
         let t = self.t;
         let outer = (1u32 << N_MOVES3) - 1;
-        let tight = hv == left || hy == left;
-        let back = hv == left && hy != left;
+        let fmask = ALLOWED_AFTER[last_f] & outer & if fq { QUARTER } else { u32::MAX };
+        let bmask = ALLOWED_BEFORE[last_b] & outer & if bq { QUARTER } else { u32::MAX };
         if left == 1 {
-            let mut allowed = ALLOWED_AFTER[last_f]
-                & ALLOWED_BEFORE[last_b]
-                & outer
-                & if tight { QUARTER } else { u32::MAX };
+            let mut allowed = fmask & bmask;
             while allowed != 0 {
                 let m = allowed.trailing_zeros() as usize;
                 allowed &= allowed - 1;
@@ -234,22 +262,21 @@ impl<'a> Search3<'a> {
             }
             return false;
         }
+        let back = bmask.count_ones() < fmask.count_ones();
+        let r = left - 1;
+        // The table cannot prune with more than base + 3 moves left.
+        let read = r <= t.h48.base + 3;
         let mut kids: [std::mem::MaybeUninit<Kid>; 18] =
             [const { std::mem::MaybeUninit::uninit() }; 18];
         let mut nk = 0;
         // Stage 1: children, corner-class bounds, prefetch of the table entries.
-        let mut allowed = if back {
-            ALLOWED_BEFORE[last_b]
-        } else {
-            ALLOWED_AFTER[last_f]
-        } & outer
-            & if tight { QUARTER } else { u32::MAX };
+        let mut allowed = if back { bmask } else { fmask };
         while allowed != 0 {
             let face = allowed.trailing_zeros() / 3;
             let fm = allowed >> (face * 3) & 7;
             allowed &= !(7 << (face * 3));
-            // The side not moved by a turn of this face gets the same coset for X and X'
-            // (X2 is in the target group), and its parent's for X2.
+            // The side not moved on the right gets the same coset for X and X' (X2 is in the
+            // target group), and its parent's for X2.
             let mut twin: Option<(u8, usize)> = None;
             for pw in 0..3 {
                 if fm >> pw & 1 == 0 {
@@ -271,10 +298,9 @@ impl<'a> Search3<'a> {
                     };
                     (node, node.v, node.y)
                 };
-                // `own`: the side that moved on the right (its coset changes); `other` moved
-                // on the left.
-                let (oc, oi) = t.probe(&own);
-                if oc >= left {
+                let ocs = t.corners(&own);
+                let oc = ocs as u8;
+                if oc > r {
                     continue;
                 }
                 let (xc, xi, xh) = if pw == 1 {
@@ -283,18 +309,31 @@ impl<'a> Search3<'a> {
                     match twin {
                         Some((c, i)) => (c, i, 0),
                         None => {
-                            let (c, i) = t.probe(&other);
+                            let xcs = t.corners(&other);
+                            let c = xcs as u8;
+                            let i = if read && c <= r {
+                                t.probe_edges(&other, xcs)
+                            } else {
+                                KNOWN
+                            };
+                            if i != KNOWN {
+                                t.h48.prefetch(i);
+                            }
                             twin = Some((c, i));
                             (c, i, 0)
                         }
                     }
                 };
-                if xc >= left || xh >= left {
+                if xc > r || xh > r {
                     continue;
                 }
-                t.h48.prefetch(oi);
-                if xi != KNOWN {
-                    t.h48.prefetch(xi);
+                let oi = if read {
+                    t.probe_edges(&own, ocs)
+                } else {
+                    KNOWN
+                };
+                if oi != KNOWN {
+                    t.h48.prefetch(oi);
                 }
                 let (iv, iy, hv0, hy0) = if back {
                     (xi, oi, xc.max(xh), oc)
@@ -312,32 +351,56 @@ impl<'a> Search3<'a> {
                 nk += 1;
             }
         }
-        // Stage 2: read the bounds and descend.
-        let r = left - 1;
+        // Stage 2: read every bound first (learned bounds: a child at v needs the parent and
+        // the child's same-face siblings to be at least v - 1 away).
+        let mut face_max = [0u8; 6];
+        let mut lb = 0u8;
+        for k in kids.iter_mut().take(nk) {
+            let k = unsafe { k.assume_init_mut() };
+            if k.iv != KNOWN {
+                k.hv = k.hv.max(t.h48.value(k.iv));
+            }
+            if k.iy != KNOWN {
+                k.hy = k.hy.max(t.h48.value(k.iy));
+            }
+            let v = k.hv.max(k.hy);
+            let f = (k.m / 3) as usize;
+            face_max[f] = face_max[f].max(v);
+            lb = lb.max(v);
+        }
+        if lb > left + 1 {
+            return false;
+        }
+        // Stage 3: descend.
         for k in kids.iter().take(nk) {
             let k = unsafe { k.assume_init_ref() };
-            let cv = if k.iv == KNOWN {
-                k.hv
-            } else {
-                t.h48.value(k.iv).max(k.hv)
-            };
-            if cv > r {
-                continue;
-            }
-            let cy = if k.iy == KNOWN {
-                k.hy
-            } else {
-                t.h48.value(k.iy).max(k.hy)
-            };
-            if cy > r {
+            if k.hv > r || k.hy > r || face_max[(k.m / 3) as usize] > left {
                 continue;
             }
             let found = if back {
                 self.back.push(k.m);
-                self.dfs(&k.node, r, last_f, k.m as usize, cv, cy)
+                self.dfs(
+                    &k.node,
+                    r,
+                    last_f,
+                    k.m as usize,
+                    k.hv,
+                    k.hy,
+                    fq || k.hy == r,
+                    k.hv == r,
+                )
             } else {
                 self.front.push(k.m);
-                self.dfs(&k.node, r, k.m as usize, last_b, cv, cy)
+                self.dfs(
+                    &k.node,
+                    r,
+                    k.m as usize,
+                    last_b,
+                    k.hv,
+                    k.hy,
+                    k.hy == r,
+                    bq || k.hv == r,
+                )
             };
             if found {
                 return true;

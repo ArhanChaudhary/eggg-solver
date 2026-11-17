@@ -91,6 +91,17 @@ impl<T: Copy> std::ops::IndexMut<usize> for HugeBuf<T> {
     }
 }
 
+/// Prefetch for data used once (non-temporal: keeps the small hot tables in cache).
+#[inline(always)]
+pub fn prefetch_nta<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_NTA);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
 #[inline(always)]
 pub fn prefetch<T>(p: *const T) {
     #[cfg(target_arch = "x86_64")]
