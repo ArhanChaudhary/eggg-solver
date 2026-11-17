@@ -5,6 +5,7 @@ pub mod comb;
 pub mod cube;
 pub mod cube3;
 pub mod h48;
+pub mod lanes1;
 pub mod moves;
 pub mod notation;
 pub mod p2joint;

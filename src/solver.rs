@@ -15,7 +15,16 @@
 use crate::cube::{Cube, Facelets, Mat};
 use crate::cube3::Cube3;
 use crate::moves::{ALLOWED_AFTER, MOVE_PERMS, N_MOVES, frame_rotation, rotate_move};
-use crate::phase1::{P1State, P1Tables, Search1};
+use crate::phase1::{P1State, P1Tables};
+
+/// Lanes per thread ($EGGG_LANES, default 4).
+fn lane_count() -> usize {
+    std::env::var("EGGG_LANES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4)
+        .max(1)
+}
 use crate::phase2::{P2Tables, Search2, standardise};
 use crate::phase3::{P3Tables, Search3, Task};
 
@@ -434,38 +443,45 @@ impl<'a, 'r> Run<'a, 'r> {
             std::thread::scope(|s| {
                 for _ in 0..self.threads {
                     s.spawn(|| {
-                        let mut local = vec![];
-                        let mut n = 0;
-                        while !stop.load(Ordering::Relaxed) && found.load(Ordering::Relaxed) < need
-                        {
-                            let j = claimed.fetch_add(1, Ordering::Relaxed);
-                            if j >= jobs.len() {
-                                break;
-                            }
-                            let prefix = &jobs[j];
-                            let mut st = root;
-                            let mut d = d0;
-                            for &m in prefix {
-                                st = st.apply(m as usize, t);
-                                d = Mod3Table::decode(d, t.value(&st));
-                            }
-                            let mut eps = vec![];
-                            let mut srch = Search1::new(t, |p: &[u8], f| {
-                                eps.push((p.to_vec(), f));
-                                true
-                            });
-                            srch.abort = Some(stop);
-                            srch.path.extend_from_slice(prefix);
-                            let last = prefix.last().map(|&m| m as usize).unwrap_or(N_MOVES);
-                            srch.dfs(&st, d, len - prefix.len() as u8, last);
-                            n += srch.nodes;
-                            found.fetch_add(
-                                eps.iter().map(|e| e.1.count_ones() as usize).sum(),
-                                Ordering::Relaxed,
-                            );
-                            local.push((j, eps));
-                        }
-                        nodes.fetch_add(n, Ordering::Relaxed);
+                        let mut flat: Vec<(usize, Vec<u8>, u8)> = vec![];
+                        let mut ln = crate::lanes1::Lanes1::new(t, lane_count(), root);
+                        ln.run(
+                            || {
+                                if stop.load(Ordering::Relaxed)
+                                    || found.load(Ordering::Relaxed) >= need
+                                {
+                                    return None;
+                                }
+                                let j = claimed.fetch_add(1, Ordering::Relaxed);
+                                let prefix = jobs.get(j)?;
+                                let mut st = root;
+                                let mut d = d0;
+                                for &m in prefix.iter() {
+                                    st = st.apply(m as usize, t);
+                                    d = Mod3Table::decode(d, t.value(&st));
+                                }
+                                Some((
+                                    j,
+                                    crate::lanes1::Job {
+                                        state: st,
+                                        d,
+                                        left: len - prefix.len() as u8,
+                                        prefix,
+                                    },
+                                ))
+                            },
+                            stop,
+                            |j, p, f| {
+                                flat.push((j, p.to_vec(), f));
+                                found.fetch_add(f.count_ones() as usize, Ordering::Relaxed);
+                            },
+                            |_| {},
+                        );
+                        let local: Vec<(usize, Vec<(Vec<u8>, u8)>)> = flat
+                            .into_iter()
+                            .map(|(j, p, f)| (j, vec![(p, f)]))
+                            .collect();
+                        nodes.fetch_add(ln.nodes, Ordering::Relaxed);
                         out.lock().unwrap().extend(local);
                     });
                 }
