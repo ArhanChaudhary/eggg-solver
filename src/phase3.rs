@@ -16,6 +16,12 @@ pub struct P3Tables {
 }
 
 impl P3Tables {
+    /// Lower bound of a cube's phase-3 length (H48 bound of the cube and of its inverse).
+    pub fn lower_bound(&self, c: &Cube3) -> u8 {
+        let v = C3::from_cube(c);
+        self.bound(&v).max(self.bound(&v.inverse()))
+    }
+
     pub fn load_or_build(dir: &std::path::Path, k: u32, threads: usize, verbose: bool) -> P3Tables {
         let coords = Coords::new();
         let base = DEFAULT_BASE[k as usize];
@@ -356,8 +362,7 @@ impl<'a> Search3<'a> {
     }
 
     pub fn lower_bound(&self, c: &Cube3) -> u8 {
-        let v = C3::from_cube(c);
-        self.t.bound(&v).max(self.t.bound(&v.inverse()))
+        self.t.lower_bound(c)
     }
 
     /// Look for a solution of exactly `depth` moves (callers search depths in increasing

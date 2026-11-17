@@ -22,10 +22,13 @@ use crate::phase3::{P3Tables, Search3, Task};
 /// Phase-3 checks at least this deep are split into one job per child of the root.
 const SPLIT_DEPTH: u8 = 15;
 use crate::table::Mod3Table;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+/// The deepest phase-2 level is best - DEEPEST_MARGIN (see `Run::phase2`).
+const DEEPEST_MARGIN: usize = 13;
 
 pub struct Tables {
     pub p1: P1Tables,
@@ -284,7 +287,10 @@ struct Run<'a, 'r> {
     root: P1State,
     d0: u8,
     level: Level1,
-    seen_ep: HashSet<(Vec<u8>, usize)>,
+    /// Candidates made so far (including those dropped as hopeless).
+    made_cands: usize,
+    /// Reductions stored so far (including those dropped since).
+    made_reds: usize,
     cands: Vec<Candidate>,
     reds: Vec<Reduction>,
     red_index: HashMap<(usize, Cube3), usize>,
@@ -337,7 +343,8 @@ impl<'a> Solver<'a> {
                 jobs: vec![],
                 next: 0,
             },
-            seen_ep: HashSet::new(),
+            made_cands: 0,
+            made_reds: 0,
             cands: vec![],
             reds: vec![],
             red_index: HashMap::new(),
@@ -406,9 +413,7 @@ impl<'a, 'r> Run<'a, 'r> {
                 self.start,
                 &format!(
                     "phase 1: {} endpoints (length {}), nodes {}",
-                    self.cands.len(),
-                    self.level.len,
-                    self.stats.nodes1
+                    self.made_cands, self.level.len, self.stats.nodes1
                 ),
             );
             let tp = Instant::now();
@@ -482,7 +487,7 @@ impl<'a, 'r> Run<'a, 'r> {
 
     /// Collect phase-1 endpoints until there are `want` candidates in total.
     fn phase1(&mut self, want: usize) {
-        while self.cands.len() < want && !self.stopped() && self.level.len <= 40 {
+        while self.made_cands < want && !self.stopped() && self.level.len <= 40 {
             if self.level.next >= self.level.jobs.len() {
                 let len = self.level.len + 1;
                 self.level = Level1 {
@@ -492,7 +497,7 @@ impl<'a, 'r> Run<'a, 'r> {
                 };
                 continue;
             }
-            let need = want - self.cands.len();
+            let need = want - self.made_cands;
             let t = &self.t.p1;
             let (root, d0, len, stop) = (self.root, self.d0, self.level.len, self.stop);
             let jobs = &self.level.jobs;
@@ -570,7 +575,9 @@ impl<'a, 'r> Run<'a, 'r> {
             for (_, eps, _) in results {
                 for (moves, frames) in eps {
                     for f in 0..3 {
-                        if frames >> f & 1 == 1 && self.seen_ep.insert((moves.clone(), f)) {
+                        // (Levels, jobs and handed-back subtrees are disjoint: no endpoint
+                        // comes twice.)
+                        if frames >> f & 1 == 1 {
                             todo.push((moves.clone(), f));
                         }
                     }
@@ -584,14 +591,46 @@ impl<'a, 'r> Run<'a, 'r> {
                     *made[i].lock().unwrap() = make_candidate(t, cube, &todo[i].0, todo[i].1);
                 }
             });
-            self.cands
-                .extend(made.into_iter().filter_map(|m| m.into_inner().unwrap()));
+            self.made_cands += todo.len();
+            // Once a solution exists, a candidate whose phase-2 bound already puts its
+            // reductions past the deepest level phase 2 will ever search is never needed.
+            let limit = self.useful_l12();
+            self.cands.extend(
+                made.into_iter()
+                    .filter_map(|m| m.into_inner().unwrap())
+                    .filter(|c| c.moves1.len() + c.h2 as usize <= limit),
+            );
         }
-        self.stats.endpoints = self.cands.len();
+        self.stats.endpoints = self.made_cands;
+    }
+
+    /// The longest reduction that could still lead to a shorter solution at the deepest
+    /// phase-2 level (`DEEPEST_MARGIN`); unlimited before the first solution.
+    fn useful_l12(&self) -> usize {
+        self.best_len().saturating_sub(DEEPEST_MARGIN)
+    }
+
+    /// Drop the candidates and reductions that can no longer lead to a shorter solution
+    /// (they only cost memory and scans in long runs).
+    fn compact(&mut self) {
+        if self.best.is_none() {
+            return;
+        }
+        let limit = self.useful_l12();
+        self.cands
+            .retain(|c| c.moves1.len() + c.h2.max(c.done2) as usize <= limit);
+        let best = self.best_len();
+        self.reds
+            .retain(|r| r.moves12.len() + (r.h3.max(r.done3) as usize) < best);
+        self.red_index.clear();
+        for (i, r) in self.reds.iter().enumerate() {
+            self.red_index.insert((r.frame, r.c3), i);
+        }
     }
 
     /// Phase 2, level by level on the reduction length, until `want` reductions in total.
     fn phase2(&mut self, want: usize) {
+        self.compact();
         // Reductions are produced up to L12 = best - margin, i.e. while a phase 3 of
         // margin - 1 moves could still beat the best solution. Each deeper level has ~16x the
         // reductions of the one above and each is ~13x less likely to have a short enough
@@ -604,7 +643,7 @@ impl<'a, 'r> Run<'a, 'r> {
         } else if elapsed < 6.0 {
             14
         } else {
-            13
+            DEEPEST_MARGIN
         };
         let cap = self.best_len().saturating_sub(margin).min(64);
         let mut t12 = self
@@ -613,8 +652,8 @@ impl<'a, 'r> Run<'a, 'r> {
             .map(|c| c.moves1.len() + c.h2.max(c.done2) as usize)
             .min()
             .unwrap_or(99);
-        while self.reds.len() < want && !self.stopped() && t12 <= cap {
-            for r in self.phase2_level(t12, want - self.reds.len()) {
+        while self.made_reds < want && !self.stopped() && t12 <= cap {
+            for r in self.phase2_level(t12, want - self.made_reds) {
                 let key = (r.frame, r.c3);
                 match self.red_index.get(&key) {
                     Some(&i) if self.reds[i].moves12.len() <= r.moves12.len() => {}
@@ -622,6 +661,7 @@ impl<'a, 'r> Run<'a, 'r> {
                     None => {
                         self.red_index.insert(key, self.reds.len());
                         self.reds.push(r);
+                        self.made_reds += 1;
                     }
                 }
             }
@@ -675,10 +715,35 @@ impl<'a, 'r> Run<'a, 'r> {
             let first = first_moves(&tail);
             let mut srch = Search2::new(&t.p2);
             srch.abort = Some(stop);
-            let mut sols: Vec<Vec<u8>> = vec![];
+            // Each solution becomes a reduction as soon as it is found, and only the ones that
+            // could still beat the best are kept (a deep level can have millions of solutions
+            // per search, nearly all hopeless).
+            let mut local = vec![];
+            let mut seen = 0usize;
             let mut keep = |p: &[u8]| {
-                sols.push(p.to_vec());
-                sols.len() < max_sols
+                seen += 1;
+                let mut x = c.cube;
+                for &m in p {
+                    x = x.apply_perm(&MOVE_PERMS[m as usize]);
+                }
+                if let Some(c3) = Cube3::from_reduced(&x) {
+                    let h3 = t.p3.lower_bound(&c3);
+                    // A reduction whose phase 3 cannot beat the best solution never will
+                    // (the best only gets shorter).
+                    if c.moves1.len() + p.len() + (h3 as usize) < best {
+                        let mut moves12 = c.moves1.clone();
+                        moves12.extend(p.iter().map(|&m| rotate_move(m as usize, &rot_inv) as u8));
+                        local.push(Reduction {
+                            moves12,
+                            len1: c.moves1.len(),
+                            frame: c.frame,
+                            c3,
+                            h3,
+                            done3: 0,
+                        });
+                    }
+                }
+                seen < max_sols
             };
             if t.p2.joint.is_some() {
                 srch.dfs_joint(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep);
@@ -686,32 +751,6 @@ impl<'a, 'r> Run<'a, 'r> {
                 srch.dfs(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep);
             }
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
-            let mut local = vec![];
-            for p in sols {
-                let mut x = c.cube;
-                for &m in &p {
-                    x = x.apply_perm(&MOVE_PERMS[m as usize]);
-                }
-                let Some(c3) = Cube3::from_reduced(&x) else {
-                    continue;
-                };
-                let mut moves12 = c.moves1.clone();
-                moves12.extend(p.iter().map(|&m| rotate_move(m as usize, &rot_inv) as u8));
-                let h3 = Search3::new(&t.p3).lower_bound(&c3);
-                // A reduction whose phase 3 cannot beat the best solution never will (the
-                // best only gets shorter): most of the deep levels' reductions.
-                if moves12.len() + h3 as usize >= best {
-                    continue;
-                }
-                local.push(Reduction {
-                    moves12,
-                    len1: c.moves1.len(),
-                    frame: c.frame,
-                    c3,
-                    h3,
-                    done3: 0,
-                });
-            }
             made.fetch_add(local.len(), Ordering::Relaxed);
             out.lock().unwrap().push((j, local));
         });
@@ -975,6 +1014,7 @@ pub fn load_tables_with(
 mod tests {
     use super::*;
     use rand::SeedableRng;
+    use std::collections::HashSet;
 
     /// Opening phase 2 with moves of phase 1's trailing axis, and phase 1 not reporting the
     /// endpoints that this covers, gives exactly the old phase 1+2 sequences, each once.
