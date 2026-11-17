@@ -72,8 +72,12 @@ orientation, so the output needs no rotations.
 
 The driver collects many phase-1 endpoints and reductions and searches phase 3 level by
 level on the total length over all of them, so each solution found is the shortest the pool
-allows; the pool grows while time remains, and once a solution exists phase 2 only produces
-reductions that a phase 3 of at most 14 moves would turn into a shorter one.
+allows; the pool grows while time remains. Once a solution exists, phase 2 only produces
+reductions that a short enough phase 3 could still turn into a shorter solution: phase 3 of
+at most 14 moves at first, 13 after 3 s and 12 after 6 s. Each deeper level has ~16x the
+reductions and each is ~13x less likely to have a short enough phase 3, so every level adds
+about as many chances, and long runs keep improving (48 threads: 39.7 moves on average
+after 2 s, 39.0 after 30 s, 38.8 after 45-60 s on 20 random positions).
 
 ## Development
 
