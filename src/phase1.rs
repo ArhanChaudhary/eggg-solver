@@ -78,7 +78,7 @@ pub fn pdep(x: u32, m: u32) -> u32 {
 /// Static data for the staging coordinate.
 pub struct Staging {
     /// For each rank of an 8-of-24 mask: class << 8 | symmetry taking it to the class rep.
-    a_info: Vec<u32>,
+    a_info: crate::table::HugeBuf<u32>,
     class_rep: Vec<u32>,
     /// Non-trivial stabiliser symmetries of each class (empty for most).
     stab: Vec<Vec<u8>>,
@@ -205,7 +205,12 @@ impl Staging {
         }
         assert_eq!(unl_inv.len(), N_SPLIT);
         Staging {
-            a_info,
+            a_info: {
+                // Huge pages: this table is read at random for every child.
+                let mut h = crate::table::HugeBuf::<u32>::zeroed(a_info.len());
+                h.as_mut_slice().copy_from_slice(&a_info);
+                h
+            },
             class_rep,
             stab,
             sym_perm,
@@ -268,6 +273,42 @@ impl Staging {
         let rep = self.class_rep[class];
         let rem = !rep & MASK24;
         (rep, pdep(self.unl_inv[u] as u32, rem))
+    }
+
+    /// Index into the large table (no spatial symmetry): the U/D mask's rank, and the
+    /// unlabelled split of the other 16 positions between the R/L and F/B colours.
+    #[inline(always)]
+    pub fn big_index(&self, ud: u32, rl: u32) -> u64 {
+        self.rank24(ud) as u64 * N_SPLIT as u64 + self.unl[pext(rl, !ud & MASK24) as usize] as u64
+    }
+
+    pub fn big_len() -> usize {
+        735_471 * N_SPLIT
+    }
+
+    /// Generate the large table (distance to staged centres, any assignment).
+    pub fn generate_big(&self, threads: usize) -> Vec<u8> {
+        let n = Self::big_len();
+        let uds: Vec<u32> = (0..735_471).map(|r| comb_unrank(r, 24, 8)).collect();
+        let ax = Staging::axis_masks();
+        let mut goals: Vec<u64> = vec![];
+        for a in 0..3 {
+            for b in 0..3 {
+                if a != b {
+                    goals.push(self.big_index(ax[a], ax[b]));
+                }
+            }
+        }
+        goals.sort();
+        goals.dedup();
+        crate::table::bfs(n, &goals, threads, |i, f| {
+            let ud = uds[i as usize / N_SPLIT];
+            let rl = pdep(self.unl_inv[i as usize % N_SPLIT] as u32, !ud & MASK24);
+            for m in 0..N_MOVES {
+                let t = &self.move_perm[m];
+                f(self.big_index(apply_mask(t, ud), apply_mask(t, rl)));
+            }
+        })
     }
 
     /// Face masks of the three axes (U+D, R+L, F+B centre positions).
@@ -523,6 +564,8 @@ impl P1State {
 pub struct P1Tables {
     pub staging: Staging,
     pub table: Mod3Table,
+    /// The table is the large one (no spatial symmetry reduction).
+    pub big: bool,
     pub frames: [Frame; 3],
     pub centre_idx: [V32; N_MOVES],
     pub wing_idx: [V32; N_MOVES],
@@ -551,6 +594,7 @@ impl P1Tables {
         P1Tables {
             staging,
             table,
+            big: false,
             frames,
             centre_idx,
             wing_idx,
@@ -564,6 +608,9 @@ impl P1Tables {
     #[inline(always)]
     pub fn value(&self, s: &P1State) -> u8 {
         let (ud, rl) = s.masks();
+        if self.big {
+            return self.table.get(self.staging.big_index(ud, rl));
+        }
         self.table.get(
             self.staging
                 .fast_index(unsafe { *self.staging.info(ud) }, rl),
@@ -697,17 +744,25 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             allowed &= allowed - 1;
             let c = s.apply(m, self.t);
             let (ud, rl) = c.masks();
-            let p = self.t.staging.info(ud);
-            crate::table::prefetch(p);
-            infos[nk] = p;
-            rls[nk] = rl;
-            kids[nk].write((c, 0, m as u8));
+            if self.t.big {
+                let i = self.t.staging.big_index(ud, rl);
+                self.t.table.prefetch(i);
+                kids[nk].write((c, i, m as u8));
+            } else {
+                let p = self.t.staging.info(ud);
+                crate::table::prefetch(p);
+                infos[nk] = p;
+                rls[nk] = rl;
+                kids[nk].write((c, 0, m as u8));
+            }
             nk += 1;
         }
-        for k in 0..nk {
-            let i = self.t.staging.fast_index(unsafe { *infos[k] }, rls[k]);
-            self.t.table.prefetch(i);
-            unsafe { kids[k].assume_init_mut() }.1 = i;
+        if !self.t.big {
+            for k in 0..nk {
+                let i = self.t.staging.fast_index(unsafe { *infos[k] }, rls[k]);
+                self.t.table.prefetch(i);
+                unsafe { kids[k].assume_init_mut() }.1 = i;
+            }
         }
         self.nodes += nk as u64;
         if self

@@ -45,6 +45,15 @@ impl<T: Copy> HugeBuf<T> {
         self.ptr
     }
 
+    /// Ask the kernel to back the buffer with huge pages now (MADV_COLLAPSE, Linux 6.1+);
+    /// tables are read at random, and 4 KiB pages make every lookup a TLB miss.
+    pub fn collapse(&self) {
+        const MADV_COLLAPSE: i32 = 25;
+        unsafe {
+            libc::madvise(self.ptr as *mut libc::c_void, self.bytes, MADV_COLLAPSE);
+        }
+    }
+
     pub fn as_slice(&self) -> &[T] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }

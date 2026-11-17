@@ -95,6 +95,8 @@ pub struct Stats {
     pub endpoints: usize,
     pub reductions: usize,
     pub rounds: usize,
+    /// Wall time spent in each phase.
+    pub time: [Duration; 3],
 }
 
 struct Candidate {
@@ -294,6 +296,19 @@ impl<'a> Solver<'a> {
                 }
             });
             run.rounds(self.opts.endpoints, self.opts.reductions);
+            if std::env::var_os("EGGG_DEBUG").is_some() {
+                let mut h1 = std::collections::BTreeMap::new();
+                for c in &run.cands {
+                    *h1.entry((c.moves1.len(), c.moves1.len() + c.h2 as usize))
+                        .or_insert(0usize) += 1;
+                }
+                let mut h12 = std::collections::BTreeMap::new();
+                for r in &run.reds {
+                    *h12.entry(r.moves12.len()).or_insert(0usize) += 1;
+                }
+                eprintln!("candidates by (L1, L1+h2): {h1:?}");
+                eprintln!("reductions by L12: {h12:?}");
+            }
             done.store(true, Ordering::Relaxed);
         });
         self.stats = run.stats;
@@ -320,7 +335,9 @@ impl<'a, 'r> Run<'a, 'r> {
             }
             self.stats.rounds += 1;
             let t0 = Instant::now();
+            let tp = Instant::now();
             self.phase1(want1);
+            self.stats.time[0] += tp.elapsed();
             debug(
                 self.start,
                 &format!(
@@ -330,7 +347,9 @@ impl<'a, 'r> Run<'a, 'r> {
                     self.stats.nodes1
                 ),
             );
+            let tp = Instant::now();
             self.phase2(want2);
+            self.stats.time[1] += tp.elapsed();
             debug(
                 self.start,
                 &format!(
@@ -346,6 +365,7 @@ impl<'a, 'r> Run<'a, 'r> {
             let budget =
                 (produce.mul_f64(1.5).saturating_sub(check)).max(Duration::from_millis(10));
             self.phase3_levels(t1 + budget);
+            self.stats.time[2] += t1.elapsed();
             check += t1.elapsed();
             if self.stopped() || self.level.len > 40 {
                 return;
@@ -780,6 +800,12 @@ pub fn load_tables(dir: &std::path::Path, h48_k: u32, threads: usize, verbose: b
     load_tables_with(dir, h48_k, false, threads, verbose)
 }
 
+/// Large phase-1 staging table instead of the symmetry-reduced one ($EGGG_P1_BIG, set by
+/// `--p1-big`).
+fn p1_big() -> bool {
+    std::env::var_os("EGGG_P1_BIG").is_some()
+}
+
 /// Load or build all tables in `dir`; `joint`: also the joint phase-2 table (2.1 GB).
 pub fn load_tables_with(
     dir: &std::path::Path,
@@ -789,10 +815,16 @@ pub fn load_tables_with(
     verbose: bool,
 ) -> Tables {
     let t0 = Instant::now();
-    let p1_path = dir.join("p1-staging2.tab");
+    let big = p1_big();
+    let (p1_name, p1_len) = if big {
+        ("p1-staging-big", crate::phase1::Staging::big_len())
+    } else {
+        ("p1-staging2", P1Tables::table_len())
+    };
+    let p1_path = dir.join(format!("{p1_name}.tab"));
     let p1 = {
         let staging = crate::phase1::Staging::new();
-        let n = P1Tables::table_len();
+        let n = p1_len;
         let mut table = Mod3Table {
             data: crate::table::HugeBuf::zeroed(n.div_ceil(32)),
             n: n as u64,
@@ -803,11 +835,15 @@ pub fn load_tables_with(
                 table.data.byte_len(),
             )
         };
-        if crate::table::load(&p1_path, "p1-staging2", bytes).is_err() {
+        if crate::table::load(&p1_path, p1_name, bytes).is_err() {
             if verbose {
-                eprintln!("generating phase-1 staging table...");
+                eprintln!("generating phase-1 staging table ({p1_name})...");
             }
-            let depths = staging.generate(threads);
+            let depths = if big {
+                staging.generate_big(threads)
+            } else {
+                staging.generate(threads)
+            };
             table = Mod3Table::from_depths(&depths);
             let bytes = unsafe {
                 std::slice::from_raw_parts(
@@ -815,9 +851,11 @@ pub fn load_tables_with(
                     table.data.byte_len(),
                 )
             };
-            crate::table::save(&p1_path, "p1-staging2", bytes).expect("saving table");
+            crate::table::save(&p1_path, p1_name, bytes).expect("saving table");
         }
-        P1Tables::with_table(staging, table)
+        let mut p1 = P1Tables::with_table(staging, table);
+        p1.big = big;
+        p1
     };
     let p2_path = dir.join("p2-tau.tab");
     let p2 = {
@@ -876,6 +914,15 @@ pub fn load_tables_with(
         p2.joint = Some(j);
     }
     let p3 = P3Tables::load_or_build(dir, h48_k, threads, verbose);
+    // Huge pages for the big tables, in parallel.
+    std::thread::scope(|s| {
+        s.spawn(|| p1.table.data.collapse());
+        s.spawn(|| p2.tau_table.data.collapse());
+        if let Some(j) = &p2.joint {
+            s.spawn(|| j.table.collapse());
+        }
+        s.spawn(|| p3.h48.data.collapse());
+    });
     if verbose {
         eprintln!("tables ready in {:.1} s", t0.elapsed().as_secs_f64());
     }
