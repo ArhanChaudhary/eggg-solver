@@ -154,7 +154,29 @@ impl Mod3Table {
     #[inline(always)]
     pub fn decode(d: u8, v: u8) -> u8 {
         // (v - (d - 1)) mod 3 gives 0, 1, 2 for d - 1, d, d + 1.
-        d + ((v + 4 - d % 3) % 3) - 1
+        const T: [[u8; 4]; 3] = {
+            let mut t = [[0u8; 4]; 3];
+            let mut r = 0;
+            while r < 3 {
+                let mut v = 0;
+                while v < 4 {
+                    t[r][v] = ((v + 4 - r) % 3) as u8;
+                    v += 1;
+                }
+                r += 1;
+            }
+            t
+        };
+        const MOD3: [u8; 32] = {
+            let mut t = [0u8; 32];
+            let mut i = 0;
+            while i < 32 {
+                t[i] = (i % 3) as u8;
+                i += 1;
+            }
+            t
+        };
+        d + T[MOD3[(d & 31) as usize] as usize][(v & 3) as usize] - 1
     }
 }
 
