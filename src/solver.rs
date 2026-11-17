@@ -17,7 +17,10 @@ use crate::cube3::Cube3;
 use crate::moves::{ALLOWED_AFTER, MOVE_PERMS, N_MOVES, frame_rotation, rotate_move};
 use crate::phase1::{P1State, P1Tables, Search1};
 use crate::phase2::{P2Tables, Search2, standardise};
-use crate::phase3::{P3Tables, Search3};
+use crate::phase3::{P3Tables, Search3, Task};
+
+/// Phase-3 checks at least this deep are split into one job per child of the root.
+const SPLIT_DEPTH: u8 = 15;
 use crate::table::Mod3Table;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -647,7 +650,7 @@ impl<'a, 'r> Run<'a, 'r> {
     fn phase3_level(&mut self, total: usize, deadline: Instant) -> Option<(usize, Vec<u8>)> {
         let t = self.t;
         let reds = &self.reds;
-        let mut jobs: Vec<usize> = (0..reds.len())
+        let mut order: Vec<usize> = (0..reds.len())
             .filter(|&i| {
                 let r = &reds[i];
                 let l12 = r.moves12.len();
@@ -655,38 +658,70 @@ impl<'a, 'r> Run<'a, 'r> {
             })
             .collect();
         // Shallow searches first: any solution of this level is as good as any other.
-        jobs.sort_by_key(|&i| (std::cmp::Reverse(reds[i].moves12.len()), i));
+        order.sort_by_key(|&i| (std::cmp::Reverse(reds[i].moves12.len()), i));
+        // Deep searches are split into one task per child of the root, so that they spread
+        // over the threads; `parts[r]` counts the jobs of reduction r.
+        let mut jobs: Vec<(usize, Option<Task>)> = vec![];
+        let mut parts = vec![0usize; reds.len()];
+        let mut pruned = vec![];
+        for &i in &order {
+            let r = &reds[i];
+            let d = (total - r.moves12.len()) as u8;
+            if d >= SPLIT_DEPTH {
+                match Search3::new(&t.p3).tasks(&r.c3, d) {
+                    Some(ts) => {
+                        parts[i] = ts.len();
+                        jobs.extend(ts.into_iter().map(|task| (i, Some(task))));
+                    }
+                    None => pruned.push(i),
+                }
+            } else {
+                parts[i] = 1;
+                jobs.push((i, None));
+            }
+        }
         let result = Mutex::new(None::<(usize, Vec<u8>)>);
         let found = AtomicBool::new(false);
         let nodes = AtomicU64::new(0);
-        let finished = Mutex::new(vec![]);
+        let finished: Vec<AtomicUsize> = (0..reds.len()).map(|_| AtomicUsize::new(0)).collect();
         let stop = self.stop;
         par_jobs(jobs.len(), self.threads, stop, |j| {
             if found.load(Ordering::Relaxed) || Instant::now() >= deadline {
                 return;
             }
-            let r = &reds[jobs[j]];
+            let (i, task) = &jobs[j];
+            let r = &reds[*i];
             let d = (total - r.moves12.len()) as u8;
             let mut srch = Search3::new(&t.p3);
             srch.abort = Some(stop);
-            let sol = srch.search_depth(&r.c3, d, N_MOVES);
+            srch.abort_level = Some(&found);
+            let sol = match task {
+                Some(task) => srch.run_task(task),
+                None => srch.search_depth(&r.c3, d, N_MOVES),
+            };
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
             match sol {
                 Some(sol) => {
                     found.store(true, Ordering::Relaxed);
                     let mut g = result.lock().unwrap();
-                    if g.as_ref().is_none_or(|(k, _)| jobs[j] < *k) {
-                        *g = Some((jobs[j], sol));
+                    if g.as_ref().is_none_or(|(k, _)| *i < *k) {
+                        *g = Some((*i, sol));
                     }
                 }
-                None if !srch.aborted => finished.lock().unwrap().push(jobs[j]),
+                None if !srch.aborted => {
+                    finished[*i].fetch_add(1, Ordering::Relaxed);
+                }
                 None => {}
             }
         });
         self.stats.nodes3 += nodes.load(Ordering::Relaxed);
-        for j in finished.into_inner().unwrap() {
-            let r = &mut self.reds[j];
-            r.done3 = r.done3.max((total - r.moves12.len()) as u8 + 1);
+        for i in 0..self.reds.len() {
+            if (parts[i] > 0 && finished[i].load(Ordering::Relaxed) == parts[i])
+                || pruned.contains(&i)
+            {
+                let r = &mut self.reds[i];
+                r.done3 = r.done3.max((total - r.moves12.len()) as u8 + 1);
+            }
         }
         result.into_inner().unwrap()
     }

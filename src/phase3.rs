@@ -142,7 +142,24 @@ pub struct Search3<'a> {
     pub nodes: u64,
     pub node_limit: u64,
     pub abort: Option<&'a AtomicBool>,
+    /// A second abort flag (another search of the same level found a solution).
+    pub abort_level: Option<&'a AtomicBool>,
     pub aborted: bool,
+    /// When set, the root's surviving children are collected as tasks instead of searched.
+    collect: Option<(u8, Vec<Task>)>,
+}
+
+/// A subtree of a phase-3 search (one child of the root), to be searched separately.
+#[derive(Clone)]
+pub struct Task {
+    node: Node,
+    left: u8,
+    last_f: usize,
+    last_b: usize,
+    hv: u8,
+    hy: u8,
+    front: Vec<u8>,
+    back: Vec<u8>,
 }
 
 impl<'a> Search3<'a> {
@@ -154,7 +171,9 @@ impl<'a> Search3<'a> {
             nodes: 0,
             node_limit: u64::MAX,
             abort: None,
+            abort_level: None,
             aborted: false,
+            collect: None,
         }
     }
 
@@ -186,6 +205,50 @@ impl<'a> Search3<'a> {
         }
     }
 
+    /// The subtrees of the search of exactly `depth` moves (one per surviving child of the
+    /// root), or `None` if the root itself is pruned. Searching every task is equivalent to
+    /// [`Search3::search_depth`] (with no restriction on the first move).
+    pub fn tasks(&mut self, c: &Cube3, depth: u8) -> Option<Vec<Task>> {
+        let v = C3::from_cube(c);
+        let n = Node { v, y: v.inverse() };
+        let (hv, hy) = (self.t.bound(&n.v), self.t.bound(&n.y));
+        if hv.max(hy) > depth || depth < 2 {
+            return None;
+        }
+        self.front.clear();
+        self.back.clear();
+        self.collect = Some((depth, vec![]));
+        self.dfs(
+            &n,
+            depth,
+            crate::moves::N_MOVES,
+            crate::moves::N_MOVES,
+            hv,
+            hy,
+        );
+        self.collect.take().map(|c| c.1)
+    }
+
+    /// Search one task; the full solution if found.
+    pub fn run_task(&mut self, task: &Task) -> Option<Vec<u8>> {
+        self.front.clone_from(&task.front);
+        self.back.clone_from(&task.back);
+        if self.dfs(
+            &task.node,
+            task.left,
+            task.last_f,
+            task.last_b,
+            task.hv,
+            task.hy,
+        ) {
+            let mut p = self.front.clone();
+            p.extend(self.back.iter().rev());
+            Some(p)
+        } else {
+            None
+        }
+    }
+
     /// Shortest solution of at most `max_len` moves.
     pub fn solve(&mut self, c: &Cube3, max_len: u8) -> Option<Vec<u8>> {
         let h = self.lower_bound(c);
@@ -204,7 +267,9 @@ impl<'a> Search3<'a> {
             return false;
         }
         if self.nodes > self.node_limit
-            || (self.nodes & 4095 == 0 && self.abort.is_some_and(|a| a.load(Ordering::Relaxed)))
+            || (self.nodes & 4095 == 0
+                && (self.abort.is_some_and(|a| a.load(Ordering::Relaxed))
+                    || self.abort_level.is_some_and(|a| a.load(Ordering::Relaxed))))
         {
             self.aborted = true;
             return false;
@@ -309,6 +374,7 @@ impl<'a> Search3<'a> {
         }
         // Stage 2: read the bounds and descend.
         let r = left - 1;
+        let back_side = back;
         for k in kids.iter().take(nk) {
             let k = unsafe { k.assume_init_ref() };
             let cv = if k.iv == KNOWN {
@@ -325,6 +391,32 @@ impl<'a> Search3<'a> {
                 t.h48.value(k.iy).max(k.hy)
             };
             if cy > r {
+                continue;
+            }
+            if let Some((root, tasks)) = &mut self.collect
+                && *root == left
+            {
+                let (mut front, mut back) = (self.front.clone(), self.back.clone());
+                let (lf, lb) = if back_side {
+                    (last_f, k.m as usize)
+                } else {
+                    (k.m as usize, last_b)
+                };
+                if back_side {
+                    back.push(k.m);
+                } else {
+                    front.push(k.m);
+                }
+                tasks.push(Task {
+                    node: k.node,
+                    left: r,
+                    last_f: lf,
+                    last_b: lb,
+                    hv: cv,
+                    hy: cy,
+                    front,
+                    back,
+                });
                 continue;
             }
             let found = if back {
