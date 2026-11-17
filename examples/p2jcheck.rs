@@ -58,6 +58,7 @@ fn main() {
             let tau = p2.tau_of(&x);
             let dt = p2.tau_distance(&tau);
             let dj = j.distance(p2, cc / 1680, &tau, cc & 1);
+            let df = j.distance_fb(p2, cc, &tau);
             let hc = p2.centre_dist[cc as usize];
             let mut l2 = 0;
             let mut s_old = Search2::new(p2);
@@ -81,12 +82,13 @@ fn main() {
                 }
             }
             let mut s_new = Search2::new(p2);
-            for d in hc.max(dj)..25 {
+            for d in hc.max(dj).max(df)..25 {
                 let mut found = false;
                 s_new.dfs_joint(
                     cc,
                     &tau,
                     dj,
+                    df,
                     d,
                     N_MOVES,
                     ALLOWED_AFTER[N_MOVES],
@@ -104,7 +106,7 @@ fn main() {
             n_new += s_new.nodes;
             sum_l2 += l2 as usize;
             sum_ht += hc.max(dt) as usize;
-            sum_hj += hc.max(dj) as usize;
+            sum_hj += hc.max(dj).max(df) as usize;
             cnt += 1;
         }
     }

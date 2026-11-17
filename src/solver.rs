@@ -99,7 +99,12 @@ struct Candidate {
     cube: Cube,
     centre: u32,
     tau: [u8; 16],
+    /// Exact tau distance, or with the joint table, the exact joint distance.
     dt: u8,
+    /// Exact joint distance of the F/B view (with the joint table).
+    df: u8,
+    /// Exact distance in the big joint table (with it).
+    db: u8,
     h2: u8,
     /// Phase-2 depths below this have been searched.
     done2: u8,
@@ -247,9 +252,16 @@ fn make_candidate(t: &Tables, cube: &Cube, moves1: &[u8], frame: usize) -> Optio
         return None;
     }
     let tau = t.p2.tau_of(&x);
-    let dt = match &t.p2.joint {
-        Some(j) => j.distance(&t.p2, centre / 1680, &tau, centre & 1),
-        None => t.p2.tau_distance(&tau),
+    let db = match &t.p2.big {
+        Some(b) => b.distance(&t.p2, centre, &tau),
+        None => 0,
+    };
+    let (dt, df) = match &t.p2.joint {
+        Some(j) => (
+            j.distance(&t.p2, centre / 1680, &tau, centre & 1),
+            j.distance_fb(&t.p2, centre, &tau),
+        ),
+        None => (t.p2.tau_distance(&tau), 0),
     };
     Some(Candidate {
         moves1: moves1.to_vec(),
@@ -258,7 +270,9 @@ fn make_candidate(t: &Tables, cube: &Cube, moves1: &[u8], frame: usize) -> Optio
         centre,
         tau,
         dt,
-        h2: cd.max(dt),
+        df,
+        db,
+        h2: cd.max(dt).max(df).max(db),
         done2: 0,
     })
 }
@@ -680,8 +694,10 @@ impl<'a, 'r> Run<'a, 'r> {
                 sols.push(p.to_vec());
                 sols.len() < max_sols
             };
-            if t.p2.joint.is_some() {
-                srch.dfs_joint(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep);
+            if t.p2.big.is_some() {
+                srch.dfs_big(c.centre, &c.tau, c.db, l2, last1, first, &mut keep);
+            } else if t.p2.joint.is_some() {
+                srch.dfs_joint(c.centre, &c.tau, c.dt, c.df, l2, last1, first, &mut keep);
             } else {
                 srch.dfs(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep);
             }
@@ -915,6 +931,20 @@ pub fn load_tables_with(
     threads: usize,
     verbose: bool,
 ) -> Tables {
+    load_tables_full(dir, h48_k, joint, p1_big, false, threads, verbose)
+}
+
+/// [`load_tables_with`], and `p2_big`: the big joint phase-2 table (U/D and F/B centres,
+/// 18.4 GB; generating it takes about an hour on 48 threads).
+pub fn load_tables_full(
+    dir: &std::path::Path,
+    h48_k: u32,
+    joint: bool,
+    p1_big: bool,
+    p2_big: bool,
+    threads: usize,
+    verbose: bool,
+) -> Tables {
     let t0 = Instant::now();
     let p1 = load_p1(dir, p1_big, threads, verbose);
     let p2_path = dir.join("p2-tau.tab");
@@ -955,6 +985,24 @@ pub fn load_tables_with(
         }
         p2.joint = Some(j);
     }
+    if p2_big {
+        let mut b = crate::p2big::Big::new(&p2);
+        let path = dir.join("p2-big-udfb.tab");
+        b.table = crate::table::HugeBuf::zeroed(b.bytes() / 8);
+        let bytes = b.table.as_bytes_mut();
+        if crate::table::load(&path, "p2-big-udfb", bytes).is_err() {
+            if verbose {
+                eprintln!(
+                    "generating the big joint phase-2 table ({:.1} GB)...",
+                    b.bytes() as f64 / 1e9
+                );
+            }
+            b.generate(&p2, threads, verbose);
+            let bytes = b.table.as_bytes();
+            crate::table::save(&path, "p2-big-udfb", bytes).expect("saving table");
+        }
+        p2.big = Some(b);
+    }
     let p3 = P3Tables::load_or_build(dir, h48_k, threads, verbose);
     // Huge pages for the big tables, in parallel.
     std::thread::scope(|s| {
@@ -962,6 +1010,9 @@ pub fn load_tables_with(
         s.spawn(|| p2.tau_table.data.collapse());
         if let Some(j) = &p2.joint {
             s.spawn(|| j.table.collapse());
+        }
+        if let Some(b) = &p2.big {
+            s.spawn(|| b.table.collapse());
         }
         s.spawn(|| p3.h48.data.collapse());
     });

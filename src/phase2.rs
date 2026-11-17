@@ -42,6 +42,8 @@ pub struct P2Tables {
     pub tau_table: Mod3Table,
     /// Optional joint table over tau, the U/D pattern and the PLL bit (much tighter).
     pub joint: Option<crate::p2joint::Joint>,
+    /// Optional joint table over tau, the U/D and F/B patterns and the PLL bit (tighter still).
+    pub big: Option<crate::p2big::Big>,
 }
 
 fn orbit_mask(c: &Cube, pos: &[usize; 8], colour: u8) -> u8 {
@@ -125,6 +127,7 @@ impl P2Tables {
             pl_inv,
             ph,
             joint: None,
+            big: None,
             tau_table: Mod3Table {
                 data: crate::table::HugeBuf::zeroed(1),
             },
@@ -153,6 +156,13 @@ impl P2Tables {
     #[cfg(test)]
     pub(crate) fn base_for_tests() -> P2Tables {
         P2Tables::base()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_centres_for_tests() -> P2Tables {
+        let mut t = P2Tables::base();
+        t.build_centres();
+        t
     }
 
     pub fn centre_coord_of(&self, c: &Cube) -> u32 {
@@ -477,13 +487,16 @@ impl<'a> Search2<'a> {
 }
 
 impl<'a> Search2<'a> {
-    /// [`Search2::dfs`] with the joint table: `dj` is the exact joint distance.
+    /// [`Search2::dfs`] with the joint table: `dj` and `df` are the exact joint distances of
+    /// the state and of its F/B view (the table read for the F/B centre pattern; the two
+    /// bounds together expand ~7x fewer nodes than the U/D one alone at deep levels).
     #[allow(clippy::too_many_arguments)]
     pub fn dfs_joint(
         &mut self,
         cc: u32,
         tau: &[u8; 16],
         dj: u8,
+        df: u8,
         left: u8,
         last: usize,
         after: u32,
@@ -498,8 +511,8 @@ impl<'a> Search2<'a> {
         let t = self.t;
         let j = t.joint.as_ref().unwrap();
         let allowed = after & PHASE2_MASK & if left == 1 { last_mask(last) } else { u32::MAX };
-        // Stage 1: children with the centre bound, joint entries prefetched.
-        let mut kids = [(0u32, [0u8; 16], 0usize, 0u8); 17];
+        // Stage 1: children with the centre bound, joint entries (both views) prefetched.
+        let mut kids = [(0u32, [0u8; 16], 0usize, 0usize, 0u8); 17];
         let mut nk = 0;
         for (i, &m) in P2_MOVES.iter().enumerate() {
             if allowed >> m & 1 == 0 {
@@ -512,6 +525,86 @@ impl<'a> Search2<'a> {
             let t2 = t.tau_move(tau, i);
             let idx = j.index(c2 / 1680, &t2, c2 & 1);
             j.prefetch(idx);
+            let idf = j.index_fb(c2, &t2);
+            j.prefetch(idf);
+            kids[nk] = (c2, t2, idx, idf, m);
+            nk += 1;
+        }
+        self.nodes += nk as u64;
+        if self
+            .abort
+            .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return false;
+        }
+        // Stage 2: read, decode, descend.
+        for k in 0..nk {
+            let (c2, t2, idx, idf, m) = kids[k];
+            let d2 = Mod3Table::decode(dj, j.get(idx));
+            if d2 >= left {
+                continue;
+            }
+            let f2 = Mod3Table::decode(df, j.get(idf));
+            if f2 >= left {
+                continue;
+            }
+            self.path.push(m);
+            let go = self.dfs_joint(
+                c2,
+                &t2,
+                d2,
+                f2,
+                left - 1,
+                m as usize,
+                after_child(after, m as usize),
+                found,
+            );
+            self.path.pop();
+            if !go {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl<'a> Search2<'a> {
+    /// [`Search2::dfs`] with the big joint table (U/D and F/B patterns): `db` is the exact
+    /// distance it gives.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dfs_big(
+        &mut self,
+        cc: u32,
+        tau: &[u8; 16],
+        db: u8,
+        left: u8,
+        last: usize,
+        after: u32,
+        found: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> bool {
+        if left == 0 {
+            if cc_is_goal(self.t, cc) && db == 0 {
+                return found(&self.path);
+            }
+            return true;
+        }
+        let t = self.t;
+        let b = t.big.as_ref().unwrap();
+        let allowed = after & PHASE2_MASK & if left == 1 { last_mask(last) } else { u32::MAX };
+        // Stage 1: children with the centre bound, table entries prefetched.
+        let mut kids = [(0u32, [0u8; 16], 0usize, 0u8); 17];
+        let mut nk = 0;
+        for (i, &m) in P2_MOVES.iter().enumerate() {
+            if allowed >> m & 1 == 0 {
+                continue;
+            }
+            let c2 = t.centre_move[cc as usize][i];
+            if t.centre_dist[c2 as usize] >= left {
+                continue;
+            }
+            let t2 = t.tau_move(tau, i);
+            let idx = b.index(c2, &t2);
+            b.prefetch(idx);
             kids[nk] = (c2, t2, idx, m);
             nk += 1;
         }
@@ -525,12 +618,12 @@ impl<'a> Search2<'a> {
         // Stage 2: read, decode, descend.
         for k in 0..nk {
             let (c2, t2, idx, m) = kids[k];
-            let d2 = Mod3Table::decode(dj, j.get(idx));
+            let d2 = Mod3Table::decode(db, b.get(idx));
             if d2 >= left {
                 continue;
             }
             self.path.push(m);
-            let go = self.dfs_joint(
+            let go = self.dfs_big(
                 c2,
                 &t2,
                 d2,

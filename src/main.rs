@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eggg_solver::cube::{Cube, Facelets};
 use eggg_solver::notation::{Style, format_moves, parse_moves};
-use eggg_solver::solver::{Options, Solution, Solver, Tables, load_tables_with, verify};
+use eggg_solver::solver::{Options, Solution, Solver, Tables, load_tables_full, verify};
 use rand::SeedableRng;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -162,6 +162,10 @@ struct TableArgs {
     /// whatever the tier.
     #[arg(long)]
     p1_big: bool,
+    /// Use the big joint phase-2 table (tau x U/D x F/B centres x PLL parity, 18.4 GB;
+    /// generated on first use, about an hour on 48 threads).
+    #[arg(long)]
+    p2_big: bool,
 }
 
 impl TableArgs {
@@ -179,13 +183,18 @@ impl TableArgs {
         let (k, joint, big) = self.config();
         if verbose {
             eprintln!(
-                "tables: h48 h{k}{}{} ({:?} tier)",
+                "tables: h48 h{k}{}{}{} ({:?} tier)",
                 if joint { ", joint phase 2" } else { "" },
+                if self.p2_big {
+                    ", big joint phase 2"
+                } else {
+                    ""
+                },
                 if big { ", large phase 1" } else { "" },
                 self.tier.resolve(&self.dir())
             );
         }
-        load_tables_with(&self.dir(), k, joint, big, threads, verbose)
+        load_tables_full(&self.dir(), k, joint, big, self.p2_big, threads, verbose)
     }
 
     fn dir(&self) -> PathBuf {
