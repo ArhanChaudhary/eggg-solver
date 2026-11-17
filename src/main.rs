@@ -89,9 +89,19 @@ struct TableArgs {
     /// phase-2 nodes.
     #[arg(long)]
     p2_joint: bool,
+    /// Use the large phase-1 staging table (1.2 GB, no symmetry reduction; faster lookups).
+    #[arg(long)]
+    p1_big: bool,
 }
 
 impl TableArgs {
+    fn apply(&self) {
+        if self.p1_big {
+            // SAFETY: set before any threads are started.
+            unsafe { std::env::set_var("EGGG_P1_BIG", "1") };
+        }
+    }
+
     fn dir(&self) -> PathBuf {
         self.tables
             .clone()
@@ -281,6 +291,7 @@ fn solve_one(
 }
 
 fn cmd_solve(a: SolveArgs) -> Result<(), String> {
+    a.tables.apply();
     let threads = setup_threads(a.search.threads);
     let positions = read_positions(&a.input)?;
     let tables = load_tables_with(
@@ -334,6 +345,7 @@ fn positions_label_useful(l: &str) -> bool {
 }
 
 fn cmd_gen(a: GenArgs) -> Result<(), String> {
+    a.tables.apply();
     let threads = setup_threads(a.threads);
     let t = Instant::now();
     let _ = load_tables_with(
@@ -348,6 +360,7 @@ fn cmd_gen(a: GenArgs) -> Result<(), String> {
 }
 
 fn cmd_bench(a: BenchArgs) -> Result<(), String> {
+    a.tables.apply();
     let threads = setup_threads(a.search.threads);
     let tables = load_tables_with(
         &a.tables.dir(),
@@ -439,6 +452,16 @@ fn cmd_bench(a: BenchArgs) -> Result<(), String> {
         (a.0 + r.2.nodes1, a.1 + r.2.nodes2, a.2 + r.2.nodes3)
     });
     let wall: f64 = rows.iter().map(|r| r.3).sum();
+    let tp: Vec<f64> = (0..3)
+        .map(|i| rows.iter().map(|r| r.2.time[i].as_secs_f64()).sum::<f64>())
+        .collect();
+    let tt: f64 = tp.iter().sum::<f64>().max(1e-9);
+    println!(
+        "  time split: phase 1 {:.0}%, phase 2 {:.0}%, phase 3 {:.0}%",
+        100.0 * tp[0] / tt,
+        100.0 * tp[1] / tt,
+        100.0 * tp[2] / tt
+    );
     println!(
         "  nodes/position: p1 {:.3e} p2 {:.3e} p3 {:.3e}  ({:.3e} nodes/s)",
         n1 as f64 / n,
@@ -454,12 +477,15 @@ fn cmd_bench(a: BenchArgs) -> Result<(), String> {
             }
             let hist: Vec<String> = r.0.iter().map(|(t, l)| format!("[{t:.4},{l}]")).collect();
             s.push_str(&format!(
-                "{{\"final\":{},\"wall\":{:.4},\"nodes\":[{},{},{}],\"history\":[{}]}}",
+                "{{\"final\":{},\"wall\":{:.4},\"nodes\":[{},{},{}],\"time\":[{:.4},{:.4},{:.4}],\"history\":[{}]}}",
                 r.1,
                 r.3,
                 r.2.nodes1,
                 r.2.nodes2,
                 r.2.nodes3,
+                r.2.time[0].as_secs_f64(),
+                r.2.time[1].as_secs_f64(),
+                r.2.time[2].as_secs_f64(),
                 hist.join(",")
             ));
         }
@@ -473,6 +499,7 @@ fn cmd_bench(a: BenchArgs) -> Result<(), String> {
 }
 
 fn cmd_bench3(a: Bench3Args) -> Result<(), String> {
+    a.tables.apply();
     use eggg_solver::cube3::Cube3;
     use eggg_solver::phase3::Search3;
     use rand::Rng;
