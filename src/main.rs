@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use eggg_solver::cube::{Cube, Facelets};
 use eggg_solver::notation::{Style, format_moves, parse_moves};
 use eggg_solver::solver::{Options, Solution, Solver, Tables, load_tables_with, verify};
@@ -75,31 +75,99 @@ struct LimitArgs {
     hard_limit: Option<f64>,
 }
 
+/// Table sets by memory use (the joint phase-2 table pays off before a larger phase-3 table).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Tier {
+    /// The largest tier that uses at most a third of the physical memory.
+    Auto,
+    /// ~0.16 GB: h48 h0 (slow: phase 2 has only the pairing table).
+    Tiny,
+    /// ~0.35 GB: h48 h3.
+    Small,
+    /// ~2.3 GB: h48 h5 and the joint phase-2 table.
+    Medium,
+    /// ~4.2 GB: h48 h6, the joint phase-2 table and the large phase-1 table.
+    Large,
+    /// ~6.1 GB: h48 h7, the joint phase-2 table and the large phase-1 table.
+    Huge,
+}
+
+impl Tier {
+    /// (h48 K, joint phase-2 table, large phase-1 table, measured peak memory in bytes).
+    fn tables(self) -> (u32, bool, bool, f64) {
+        match self {
+            Tier::Tiny => (0, false, false, 0.16e9),
+            Tier::Small => (3, false, false, 0.35e9),
+            Tier::Medium => (5, true, false, 2.3e9),
+            Tier::Large => (6, true, true, 4.2e9),
+            Tier::Huge | Tier::Auto => (7, true, true, 6.1e9),
+        }
+    }
+
+    fn resolve(self) -> Tier {
+        if self != Tier::Auto {
+            return self;
+        }
+        // SAFETY: sysconf has no preconditions.
+        let ram = unsafe {
+            libc::sysconf(libc::_SC_PHYS_PAGES) as f64 * libc::sysconf(libc::_SC_PAGESIZE) as f64
+        };
+        [Tier::Huge, Tier::Large, Tier::Medium, Tier::Small]
+            .into_iter()
+            .find(|t| t.tables().3 <= ram / 3.0)
+            .unwrap_or(Tier::Tiny)
+    }
+}
+
 #[derive(Args, Clone)]
 #[command(next_help_heading = "Tables")]
 struct TableArgs {
     /// Directory of the pruning tables (default: $EGGG_TABLES, else ./tables). Missing tables
-    /// are generated and saved there.
+    /// are generated and saved there (once; the large ones take a few minutes).
     #[arg(long, value_name = "DIR")]
     tables: Option<PathBuf>,
-    /// Phase-3 H48 table: number of edge-orientation bits (0-11; table size 30 MB * 2^K).
-    #[arg(long, value_name = "K", default_value_t = 2)]
-    h48: u32,
-    /// Use the joint phase-2 table (tau x U/D centres x PLL parity, 1.05 GB): far fewer
-    /// phase-2 nodes.
+    /// Table set by memory use.
+    #[arg(long, value_enum, default_value_t = Tier::Auto)]
+    tier: Tier,
+    /// Override the tier's phase-3 H48 table: edge-orientation bits (0-11; 30 MB * 2^K).
+    #[arg(long, value_name = "K")]
+    h48: Option<u32>,
+    /// Use the joint phase-2 table (tau x U/D centres x PLL parity, 1.05 GB) whatever the
+    /// tier: far fewer phase-2 nodes.
     #[arg(long)]
     p2_joint: bool,
-    /// Use the large phase-1 staging table (1.2 GB, no symmetry reduction; faster lookups).
+    /// Use the large phase-1 staging table (1.2 GB, no symmetry reduction; faster lookups)
+    /// whatever the tier.
     #[arg(long)]
     p1_big: bool,
 }
 
 impl TableArgs {
-    fn apply(&self) {
-        if self.p1_big {
+    /// (h48 K, joint phase-2 table, large phase-1 table) from the tier and the overrides.
+    fn config(&self) -> (u32, bool, bool) {
+        let (k, joint, big, _) = self.tier.resolve().tables();
+        (
+            self.h48.unwrap_or(k),
+            joint || self.p2_joint,
+            big || self.p1_big,
+        )
+    }
+
+    fn load(&self, threads: usize, verbose: bool) -> Tables {
+        let (k, joint, big) = self.config();
+        if big {
             // SAFETY: set before any threads are started.
             unsafe { std::env::set_var("EGGG_P1_BIG", "1") };
         }
+        if verbose {
+            eprintln!(
+                "tables: h48 h{k}{}{} ({:?} tier)",
+                if joint { ", joint phase 2" } else { "" },
+                if big { ", large phase 1" } else { "" },
+                self.tier.resolve()
+            );
+        }
+        load_tables_with(&self.dir(), k, joint, threads, verbose)
     }
 
     fn dir(&self) -> PathBuf {
@@ -291,16 +359,9 @@ fn solve_one(
 }
 
 fn cmd_solve(a: SolveArgs) -> Result<(), String> {
-    a.tables.apply();
     let threads = setup_threads(a.search.threads);
     let positions = read_positions(&a.input)?;
-    let tables = load_tables_with(
-        &a.tables.dir(),
-        a.tables.h48,
-        a.tables.p2_joint,
-        threads,
-        !a.output.quiet,
-    );
+    let tables = a.tables.load(threads, !a.output.quiet);
     let opts = options(&a.limits, &a.search, threads);
     let style = a.output.notation;
     for p in positions {
@@ -345,30 +406,16 @@ fn positions_label_useful(l: &str) -> bool {
 }
 
 fn cmd_gen(a: GenArgs) -> Result<(), String> {
-    a.tables.apply();
     let threads = setup_threads(a.threads);
     let t = Instant::now();
-    let _ = load_tables_with(
-        &a.tables.dir(),
-        a.tables.h48,
-        a.tables.p2_joint,
-        threads,
-        true,
-    );
+    let _ = a.tables.load(threads, true);
     eprintln!("all tables present ({:.1} s)", t.elapsed().as_secs_f64());
     Ok(())
 }
 
 fn cmd_bench(a: BenchArgs) -> Result<(), String> {
-    a.tables.apply();
     let threads = setup_threads(a.search.threads);
-    let tables = load_tables_with(
-        &a.tables.dir(),
-        a.tables.h48,
-        a.tables.p2_joint,
-        threads,
-        true,
-    );
+    let tables = a.tables.load(threads, true);
     let mut opts = options(&a.limits, &a.search, threads);
     opts.hard_limit
         .get_or_insert(Duration::from_secs_f64(a.limits.time * 4.0));
@@ -499,18 +546,11 @@ fn cmd_bench(a: BenchArgs) -> Result<(), String> {
 }
 
 fn cmd_bench3(a: Bench3Args) -> Result<(), String> {
-    a.tables.apply();
     use eggg_solver::cube3::Cube3;
     use eggg_solver::phase3::Search3;
     use rand::Rng;
     let threads = setup_threads(a.threads);
-    let tables = load_tables_with(
-        &a.tables.dir(),
-        a.tables.h48,
-        a.tables.p2_joint,
-        threads,
-        true,
-    );
+    let tables = a.tables.load(threads, true);
     let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(a.seed);
     let cubes: Vec<Cube3> = (0..a.count)
         .map(|_| {
@@ -561,7 +601,7 @@ fn cmd_bench3(a: Bench3Args) -> Result<(), String> {
     let cpu: f64 = r.iter().map(|x| x.4).sum();
     println!(
         "h48 h{}: {} cubes, mean length {:.2}, mean root bound {:.2}, mean nodes {:.3e}, {:.3} s/cube (thread time), {:.3e} nodes/s/thread, wall {:.2} s",
-        a.tables.h48,
+        a.tables.config().0,
         r.len(),
         r.iter().map(|x| x.2 as f64).sum::<f64>() / n,
         r.iter().map(|x| x.1 as f64).sum::<f64>() / n,

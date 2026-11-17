@@ -27,17 +27,21 @@ best solution. The time limit is soft until a first solution exists (`--hard-lim
 ### Tables and memory
 
 Tables are generated on first use and saved in `--tables DIR` (default `$EGGG_TABLES`, else
-`./tables`):
+`./tables`); the large ones take a few minutes, once. `--tier` picks the set by memory use;
+the default, `auto`, takes the largest tier that fits in a third of the physical memory:
 
-| table | size | option |
-|---|---:|---|
-| phase-1 centre staging (symmetry-reduced, exact) | 25 MB | always |
-| phase-2 pairing permutation | 60 MB | always |
-| phase-2 joint table (pairing x U/D centres x PLL parity) | 1.05 GB | `--p2-joint` |
-| phase-3 H48 hK (3x3x3), K edge-orientation bits | 30 MB * 2^K (h6: 1.9 GB, h7: 3.9 GB) | `--h48 K` |
+| tier | tables | memory |
+|---|---|---:|
+| `tiny` | h48 h0 | 0.16 GB |
+| `small` | h48 h3 | 0.35 GB |
+| `medium` | h48 h5, joint phase 2 | 2.3 GB |
+| `large` | h48 h6, joint phase 2, large phase 1 | 4.2 GB |
+| `huge` | h48 h7, joint phase 2, large phase 1 | 6.1 GB |
 
-Small machines: `--h48 0`..`4`, without `--p2-joint`. Large machines: `--h48 7` or `8`,
-`--p2-joint`.
+The tables: phase-1 centre staging (symmetry-reduced, 25 MB; `--p1-big`: 1.2 GB without the
+reduction, faster lookups), phase-2 pairing permutation (60 MB; `--p2-joint`: the joint
+pairing x U/D centres x PLL parity table, 1.05 GB, far fewer phase-2 nodes), phase-3 H48
+(30 MB * 2^K for K edge-orientation bits, `--h48 K`). The three options override the tier.
 
 ## How it works
 
