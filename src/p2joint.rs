@@ -15,6 +15,7 @@ use crate::comb::{FACT, perm_rank};
 use crate::cube::{EDGE_POS, GEO, ROTATIONS, centre_slot, mat_apply};
 use crate::moves::MOVE_PERMS;
 use crate::phase2::{P2_MOVES, P2Tables};
+use crate::simd::V32;
 use crate::table::HugeBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -32,6 +33,10 @@ struct Sym {
     e: [u8; 12],
     /// Image of a U/D pattern rank.
     ud: [u8; 70],
+    /// [`conj`] as two byte shuffles (low lane): gather the edges by the inverse position
+    /// permutation, then relabel them.
+    e_inv: V32,
+    e_map: V32,
 }
 
 pub struct Joint {
@@ -105,6 +110,15 @@ fn perm8_unrank(mut r: usize) -> [u8; 8] {
     out
 }
 
+/// The edge part of [`conj`] (entries 12.. undefined), with byte shuffles.
+#[inline(always)]
+fn conj_edges(tau: &[u8; 16], s: &Sym) -> [u8; 16] {
+    let mut v = V32::ZERO;
+    v.0[..16].copy_from_slice(tau);
+    let t = crate::simd::shuf(&s.e_map, &crate::simd::shuf(&v, &s.e_inv));
+    t.0[..16].try_into().unwrap()
+}
+
 fn conj(tau: &[u8; 16], s: &Sym) -> [u8; 16] {
     let mut t = *tau;
     for e in 0..12 {
@@ -160,8 +174,23 @@ impl Joint {
             // map neighbours of a symmetric image to complemented images: the symmetry group
             // must include the complement.
             let udc: [u8; 70] = std::array::from_fn(|r| p2.rank70(!p2.unrank70(ud[r])));
-            syms.push(Sym { e, ud });
-            syms.push(Sym { e, ud: udc });
+            let (mut e_inv, mut e_map) = (V32([0x80; 32]), V32([0; 32]));
+            for i in 0..12 {
+                e_inv.0[e[i] as usize] = i as u8;
+                e_map.0[i] = e[i];
+            }
+            syms.push(Sym {
+                e,
+                ud,
+                e_inv,
+                e_map,
+            });
+            syms.push(Sym {
+                e,
+                ud: udc,
+                e_inv,
+                e_map,
+            });
         }
         // Classes of (pattern, prefix).
         let mut cls = vec![u32::MAX; N_RAW];
@@ -229,7 +258,7 @@ impl Joint {
         let r = if s == 0 {
             rest_rank(tau)
         } else {
-            rest_rank(&conj(tau, &self.syms[s]))
+            rest_rank(&conj_edges(tau, &self.syms[s]))
         };
         ((c >> 3) as usize * N_REST + r) * 2 + pll as usize
     }
@@ -453,6 +482,20 @@ impl Joint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conj_edges_matches_conj() {
+        let p2 = P2Tables::base_for_tests();
+        let j = Joint::new(&p2);
+        let mut rng = rand::thread_rng();
+        use rand::Rng;
+        for _ in 0..2000 {
+            let (_, tau, _) = j.state(rng.gen_range(0..j.n));
+            for s in &j.syms {
+                assert_eq!(conj_edges(&tau, s)[..12], conj(&tau, s)[..12]);
+            }
+        }
+    }
 
     #[test]
     fn canonical_decodes_to_its_orbit() {
