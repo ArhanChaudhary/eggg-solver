@@ -14,6 +14,7 @@ use crate::simd::V32;
 use crate::simd::{add, and, movemask, shuf, xor};
 
 /// Per-move constants.
+#[derive(Clone, Copy)]
 pub struct MoveC {
     /// Position gather indices (corners in lane 0, edges in lane 1).
     pub idx: C3,
@@ -112,7 +113,12 @@ impl V32 {
     /// The cube after move m (applied on the right: positions move).
     #[inline(always)]
     pub fn apply(&self, m: usize) -> C3 {
-        let c = &MOVEC[m];
+        self.apply_c(&MOVEC[m])
+    }
+
+    /// [`V32::apply`], given the move's constants.
+    #[inline(always)]
+    pub fn apply_c(&self, c: &MoveC) -> C3 {
         let g = shuf(self, &c.idx);
         let a = Self::fix_twist(add(&g, &c.add));
         xor(&a, &c.xor)
@@ -121,7 +127,12 @@ impl V32 {
     /// For the inverse cube y = x^-1: the inverse of x after move m, i.e. m^-1 * y.
     #[inline(always)]
     pub fn apply_inv(&self, m: usize) -> C3 {
-        let c = &MOVEC[m];
+        self.apply_inv_c(&MOVEC[m])
+    }
+
+    /// [`V32::apply_inv`], given the move's constants.
+    #[inline(always)]
+    pub fn apply_inv_c(&self, c: &MoveC) -> C3 {
         let r = shuf(&c.rel, self);
         // Corners: add the old twist; edges: xor the old flip.
         let tw = and(self, &TWMASK);
@@ -170,18 +181,27 @@ const FLMASK: C3 = {
     V32(a)
 };
 
-/// Shuffle-based H48 coordinate tables.
+/// Per symmetry: piece -> E flag (0x80) | M flag (0x40) | flip contribution (0x10), lane 1,
+/// the position flip contribution (lane 1), and the position permutation gather.
+#[derive(Clone, Copy, Debug)]
+struct SymC {
+    pt: C3,
+    pb: C3,
+    pperm: C3,
+}
+
+/// Shuffle-based H48 coordinate tables. (The tables are sized for their index types, so that
+/// the hot paths need no bounds checks.)
 pub struct H48Fast {
+    /// The move constants.
+    pub moves: [MoveC; N_MOVES3],
     /// TETRAD flag (0x80) of a corner piece, indexed by piece; lane 0 only.
     tetrad: C3,
     /// co index from the two twist bit masks: co_t[lo7 | hi7 << 7].
-    co_t: Vec<u16>,
-    /// Per symmetry: piece -> E flag (0x80) | M flag (0x40) | flip contribution (0x10), lane 1,
-    /// the position flip contribution (lane 1), and the position permutation gather.
-    pt: Vec<C3>,
-    pb: Vec<C3>,
-    pperm: Vec<C3>,
-    rank495: Vec<u16>,
+    co_t: Box<[u16; 1 << 14]>,
+    /// Per symmetry (48 used).
+    syms: Box<[SymC; 256]>,
+    rank495: Box<[u16; 4096]>,
     rank70: [u8; 256],
 }
 
@@ -191,7 +211,7 @@ impl H48Fast {
         for p in 0..8 {
             tetrad.0[p] = TETRAD[p] << 7;
         }
-        let mut co_t = vec![0u16; 1 << 14];
+        let mut co_t: Box<[u16; 1 << 14]> = vec![0u16; 1 << 14].try_into().unwrap();
         for lo in 0..128usize {
             for hi in 0..128usize {
                 if lo & hi != 0 {
@@ -206,10 +226,13 @@ impl H48Fast {
             }
         }
         let s = &co.syms;
-        let mut pt = vec![];
-        let mut pb = vec![];
-        let mut pperm = vec![];
-        for k in 0..48 {
+        let zero = SymC {
+            pt: V32([0; 32]),
+            pb: V32([0; 32]),
+            pperm: V32([0x80; 32]),
+        };
+        let mut syms: Box<[SymC; 256]> = vec![zero; 256].try_into().unwrap();
+        for (k, sc) in syms.iter_mut().enumerate().take(48) {
             let mut a = V32([0; 32]);
             let mut b = V32([0; 32]);
             let mut g = V32([0x80; 32]);
@@ -221,11 +244,13 @@ impl H48Fast {
                 // position p moves to s(p): gather index of the new position s(p) is p.
                 g.0[16 + sp] = p as u8;
             }
-            pt.push(a);
-            pb.push(b);
-            pperm.push(g);
+            *sc = SymC {
+                pt: a,
+                pb: b,
+                pperm: g,
+            };
         }
-        let mut rank495 = vec![0u16; 4096];
+        let mut rank495: Box<[u16; 4096]> = vec![0u16; 4096].try_into().unwrap();
         for m in 0u32..4096 {
             if m.count_ones() == 4 {
                 rank495[m as usize] = crate::comb::comb_rank(m) as u16;
@@ -238,11 +263,10 @@ impl H48Fast {
             }
         }
         H48Fast {
+            moves: std::array::from_fn(|m| MOVEC[m]),
             tetrad,
             co_t,
-            pt,
-            pb,
-            pperm,
+            syms,
             rank495,
             rank70,
         }
@@ -261,14 +285,15 @@ impl H48Fast {
     /// (eslot, msplit, eo11) of the cube conjugated by symmetry k.
     #[inline(always)]
     pub fn edges(&self, v: &C3, k: usize) -> (u32, u32, u32) {
-        let z = shuf(&self.pt[k], v);
-        let z = xor(&xor(&z, &and(v, &FLMASK)), &self.pb[k]);
-        let z = shuf(&z, &self.pperm[k]);
+        let sc = &self.syms[k & 255];
+        let z = shuf(&sc.pt, v);
+        let z = xor(&xor(&z, &and(v, &FLMASK)), &sc.pb);
+        let z = shuf(&z, &sc.pperm);
         let e = movemask(&z) >> 16 & 0xfff;
         let m = movemask(&crate::simd::shl::<1>(&z)) >> 16 & 0xfff;
         let o = movemask(&crate::simd::shl::<3>(&z)) >> 16 & 0x7ff;
         let eslot = self.rank495[e as usize] as u32;
-        let msplit = self.rank70[crate::phase1::pext(m, !e & 0xfff) as usize] as u32;
+        let msplit = self.rank70[crate::phase1::pext(m, !e & 0xfff) as u8 as usize] as u32;
         (eslot, msplit, o)
     }
 }

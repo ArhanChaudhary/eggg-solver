@@ -82,12 +82,16 @@ pub struct Staging {
     stab: Vec<Vec<u8>>,
     /// Mask permutation tables: sym_perm[s][byte][value].
     sym_perm: Vec<[[u32; 256]; 3]>,
+    /// The symmetries as byte gathers (position i of the image is position sym_gather[s][i]
+    /// of the source; positions 24.. fixed), padded to 256 so that any info byte indexes it.
+    sym_gather: Box<[V32; 256]>,
     move_perm: Vec<[[u32; 256]; 3]>,
     /// Unlabelled rank of an 8-of-16 mask (x and its complement share a rank).
-    unl: Vec<u16>,
+    unl: Box<[u16; 1 << 16]>,
     unl_inv: Vec<u16>,
-    /// Byte-sliced colex rank of 8-of-24 masks.
-    rank_t: [[[u32; 256]; 9]; 3],
+    /// Byte-sliced colex rank of 8-of-24 masks, by byte and number of bits below it (sized
+    /// so that no count of the two lower bytes needs a bounds check; only 0..=8 are used).
+    rank_t: [[[u32; 256]; 17]; 3],
 }
 
 fn perm_tables(perm: &[u8; 24]) -> [[u32; 256]; 3] {
@@ -144,9 +148,9 @@ impl Staging {
                 perm_tables(&dst)
             })
             .collect();
-        let mut rank_t = [[[0u32; 256]; 9]; 3];
+        let mut rank_t = [[[0u32; 256]; 17]; 3];
         for k in 0..3 {
-            for c in 0..9 {
+            for c in 0..17 {
                 for v in 0..256usize {
                     let mut r = 0;
                     let mut t = 0;
@@ -191,7 +195,7 @@ impl Staging {
             stab.push(st);
         }
         assert_eq!(class_rep.len(), N_CLASSES_A);
-        let mut unl = vec![u16::MAX; 1 << 16];
+        let mut unl: Box<[u16; 1 << 16]> = vec![u16::MAX; 1 << 16].try_into().unwrap();
         let mut unl_inv = vec![];
         for x in 0u32..(1 << 16) {
             if x.count_ones() == 8 && unl[x as usize] == u16::MAX {
@@ -202,6 +206,14 @@ impl Staging {
             }
         }
         assert_eq!(unl_inv.len(), N_SPLIT);
+        let mut sym_gather: Box<[V32; 256]> = vec![V32(std::array::from_fn(|i| i as u8)); 256]
+            .try_into()
+            .unwrap();
+        for (g, p) in sym_gather.iter_mut().zip(&syms) {
+            for j in 0..24 {
+                g.0[p[j] as usize] = j as u8;
+            }
+        }
         Staging {
             a_info: {
                 // Huge pages: this table is read at random for every child.
@@ -212,6 +224,7 @@ impl Staging {
             class_rep,
             stab,
             sym_perm,
+            sym_gather,
             move_perm,
             unl,
             unl_inv,
@@ -239,10 +252,10 @@ impl Staging {
         let s = (info & 255) as usize;
         let rem = !self.class_rep[class] & MASK24;
         let b = apply_mask(&self.sym_perm[s], rl);
-        let mut u = self.unl[pext(b, rem) as usize];
+        let mut u = self.unl[pext(b, rem) as u16 as usize];
         for &t in &self.stab[class] {
             let bt = apply_mask(&self.sym_perm[t as usize], b);
-            u = u.min(self.unl[pext(bt, rem) as usize]);
+            u = u.min(self.unl[pext(bt, rem) as u16 as usize]);
         }
         (class * N_SPLIT + u as usize) as u64
     }
@@ -262,7 +275,17 @@ impl Staging {
         let s = (info & 255) as usize;
         let b = apply_mask(&self.sym_perm[s], rl);
         let rem = !self.class_rep[class] & MASK24;
-        (class * N_SPLIT + self.unl[pext(b, rem) as usize] as usize) as u64
+        (class * N_SPLIT + self.unl[pext(b, rem) as u16 as usize] as usize) as u64
+    }
+
+    /// [`Staging::fast_index`] from the flags of the centres (see [`P1State::centre_flags`]).
+    #[inline(always)]
+    fn fast_index_flags(&self, info: u32, flags: &V32) -> u64 {
+        let class = (info >> 8) as usize;
+        let h = flags.gather(&self.sym_gather[(info & 255) as usize]);
+        let b = crate::simd::movemask(&h);
+        let rem = crate::simd::movemask(&crate::simd::add(&h, &h));
+        (class * N_SPLIT + self.unl[pext(b, rem) as u16 as usize] as usize) as u64
     }
 
     pub fn rep_of(&self, idx: u64) -> (u32, u32) {
@@ -277,7 +300,13 @@ impl Staging {
     /// unlabelled split of the other 16 positions between the R/L and F/B colours.
     #[inline(always)]
     pub fn big_index(&self, ud: u32, rl: u32) -> u64 {
-        self.rank24(ud) as u64 * N_SPLIT as u64 + self.unl[pext(rl, !ud & MASK24) as usize] as u64
+        self.big_index_n(ud, !ud & MASK24, rl)
+    }
+
+    /// [`Staging::big_index`], given also the complement `nud` of the U/D mask.
+    #[inline(always)]
+    fn big_index_n(&self, ud: u32, nud: u32, rl: u32) -> u64 {
+        self.rank24(ud) as u64 * N_SPLIT as u64 + self.unl[pext(rl, nud) as u16 as usize] as u64
     }
 
     pub fn big_len() -> usize {
@@ -552,12 +581,67 @@ impl P1State {
         })
     }
 
+    /// The U/D-colour and R/L-colour position masks of the centres.
     #[inline(always)]
     pub fn masks(&self) -> (u32, u32) {
-        let rl = self.centres.bit_mask(1) & MASK24;
-        let fb = self.centres.bit_mask(2) & MASK24;
-        (!(rl | fb) & MASK24, rl)
+        centre_masks(self.centres)
     }
+
+    /// Per centre position, bit 7 set for an R/L colour and bit 6 for any colour but U/D
+    /// (zero at positions 24.., which every move leaves in place).
+    #[inline(always)]
+    fn centre_flags(&self) -> V32 {
+        const LUT: V32 = {
+            let mut t = [0u8; 32];
+            let mut i = 0;
+            while i < 32 {
+                t[i] = match i & 15 {
+                    2 | 3 => 0xc0,
+                    4 | 5 => 0x40,
+                    _ => 0,
+                };
+                i += 1;
+            }
+            V32(t)
+        };
+        const LOW24: V32 = {
+            let mut t = [0u8; 32];
+            let mut i = 0;
+            while i < 24 {
+                t[i] = 0xff;
+                i += 1;
+            }
+            V32(t)
+        };
+        crate::simd::and(&crate::simd::shuf(&LUT, &self.centres), &LOW24)
+    }
+}
+
+/// The [`P1State::centre_flags`] of the child after move `m`, from the parent's.
+///
+/// # Safety
+/// `m < N_MOVES`.
+#[inline(always)]
+unsafe fn child_flags(flags: &V32, m: usize, t: &P1Tables) -> V32 {
+    debug_assert!(m < N_MOVES);
+    flags.gather(unsafe { t.centre_idx.get_unchecked(m) })
+}
+
+/// The U/D-colour, other-colour and R/L-colour position masks of centres, from their
+/// [`P1State::centre_flags`].
+#[inline(always)]
+fn flag_masks(g: &V32) -> (u32, u32, u32) {
+    let rl = crate::simd::movemask(g);
+    let nud = crate::simd::movemask(&crate::simd::add(g, g));
+    debug_assert!((rl | nud) >> 24 == 0);
+    (!nud & MASK24, nud, rl)
+}
+
+#[inline(always)]
+fn centre_masks(centres: V32) -> (u32, u32) {
+    let rl = centres.bit_mask(1) & MASK24;
+    let fb = centres.bit_mask(2) & MASK24;
+    (!(rl | fb) & MASK24, rl)
 }
 
 pub struct P1Tables {
@@ -574,7 +658,12 @@ pub struct P1Tables {
 impl P1Tables {
     pub fn with_table(staging: Staging, table: Mod3Table) -> P1Tables {
         let frames = [Frame::new(0), Frame::new(1), Frame::new(2)];
-        let centre_idx = std::array::from_fn(|m| V32::from_slice(&MOVE_PERMS[m].centre_src));
+        // Positions 24.. map to themselves (see P1State::centre_flags).
+        let centre_idx = std::array::from_fn(|m| {
+            let mut v = V32(std::array::from_fn(|i| i as u8));
+            v.0[..24].copy_from_slice(&MOVE_PERMS[m].centre_src);
+            v
+        });
         let wing_dst = std::array::from_fn(|m| {
             let mut d = V32::ZERO;
             for t in 0..24 {
@@ -670,6 +759,15 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
 
     /// Search below `s` (exact staging distance `d`) for paths of exactly `left` more moves.
     pub fn dfs(&mut self, s: &P1State, d: u8, left: u8, last: usize) {
+        if self.t.big {
+            self.dfs_t::<true>(s, d, left, last)
+        } else {
+            self.dfs_t::<false>(s, d, left, last)
+        }
+    }
+
+    /// [`Search1::dfs`], for the large (`BIG`) or the small table.
+    fn dfs_t<const BIG: bool>(&mut self, s: &P1State, d: u8, left: u8, last: usize) {
         if left == 0 {
             if d == 0 {
                 let frames = self.t.endpoint_frames(s, last);
@@ -723,39 +821,50 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             }
             return;
         }
-        // Stage 1: children, prefetch of their class info; stage 2: table indices, prefetched;
-        // stage 3: read the values; stage 4: descend into the children that can still reach
-        // the goal.
-        let mut kids: [std::mem::MaybeUninit<(P1State, u64, u8)>; N_MOVES] =
-            [const { std::mem::MaybeUninit::uninit() }; N_MOVES];
-        let mut infos: [*const u32; N_MOVES] = [std::ptr::null(); N_MOVES];
-        let mut rls = [0u32; N_MOVES];
+        let t = self.t;
+        // Stage 1: the children's centre masks, and a prefetch of their table entry (large
+        // table) or class info (small table); stage 2 (small table): table indices,
+        // prefetched; stage 3: in move order, descend into the children that can still reach
+        // the goal. Only the table indices are kept: the few children descended into are
+        // rebuilt from `s`.
+        let mut idx = [0u64; N_MOVES];
         let mut nk = 0;
-        while allowed != 0 {
-            let m = allowed.trailing_zeros() as usize;
-            allowed &= allowed - 1;
-            let c = s.apply(m, self.t);
-            let (ud, rl) = c.masks();
-            if self.t.big {
-                let i = self.t.staging.big_index(ud, rl);
-                self.t.table.prefetch(i);
-                kids[nk].write((c, i, m as u8));
-            } else {
-                let p = self.t.staging.info(ud);
+        let mut a = allowed;
+        let flags = s.centre_flags();
+        // SAFETY (the unchecked indexing below): the allowed moves are < N_MOVES, and so is
+        // the number of children before the last.
+        debug_assert!(allowed >> N_MOVES == 0);
+        if BIG {
+            while a != 0 {
+                let m = a.trailing_zeros() as usize;
+                a &= a - 1;
+                let (ud, nud, rl) = flag_masks(&unsafe { child_flags(&flags, m, t) });
+                let i = t.staging.big_index_n(ud, nud, rl);
+                t.table.prefetch(i);
+                unsafe { *idx.get_unchecked_mut(nk) = i };
+                nk += 1;
+            }
+        } else {
+            let mut infos: [*const u32; N_MOVES] = [std::ptr::null(); N_MOVES];
+            let mut gs = [V32::ZERO; N_MOVES];
+            while a != 0 {
+                let m = a.trailing_zeros() as usize;
+                a &= a - 1;
+                let g = unsafe { child_flags(&flags, m, t) };
+                let p = t.staging.info(flag_masks(&g).0);
                 crate::table::prefetch(p);
-                infos[nk] = p;
-                rls[nk] = rl;
-                kids[nk].write((c, 0, m as u8));
+                unsafe {
+                    *infos.get_unchecked_mut(nk) = p;
+                    *gs.get_unchecked_mut(nk) = g;
+                }
+                nk += 1;
             }
-            nk += 1;
-        }
-        if !self.t.big {
-            for k in 0..nk {
-                let i = self.t.staging.fast_index(unsafe { *infos[k] }, rls[k]);
-                self.t.table.prefetch(i);
-                unsafe { kids[k].assume_init_mut() }.1 = i;
+            for ((i, &p), g) in idx.iter_mut().zip(&infos[..nk]).zip(&gs) {
+                *i = t.staging.fast_index_flags(unsafe { *p }, g);
+                t.table.prefetch(*i);
             }
         }
+        let idx = &idx[..nk];
         self.nodes += nk as u64;
         if self
             .abort
@@ -764,16 +873,30 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             self.stop = true;
             return;
         }
+        // The exact distance of a child from its stored value.
+        let dec = [0, 1, 2, 3].map(|v| Mod3Table::decode(d, v));
+        // With the large table, each value is read just before it is needed, so that the first
+        // subtrees overlap the later children's table reads; the small table is mostly
+        // cached, and reading all the values first is faster.
         let mut dcs = [0u8; N_MOVES];
-        for k in 0..nk {
-            let (_, i, _) = unsafe { kids[k].assume_init_ref() };
-            dcs[k] = Mod3Table::decode(d, self.t.table.get(*i));
+        if !BIG {
+            for (dc, &i) in dcs.iter_mut().zip(idx) {
+                *dc = dec[t.table.get(i) as usize];
+            }
         }
+        let dcs = &dcs[..nk];
         for k in 0..nk {
-            if dcs[k] < left {
-                let (c, _, m) = unsafe { kids[k].assume_init_ref() };
-                self.path.push(*m);
-                self.dfs(c, dcs[k], left - 1, *m as usize);
+            let m = allowed.trailing_zeros() as usize;
+            allowed &= allowed - 1;
+            let dc = if BIG {
+                dec[t.table.get(idx[k]) as usize]
+            } else {
+                dcs[k]
+            };
+            if dc < left {
+                let c = s.apply(m, t);
+                self.path.push(m as u8);
+                self.dfs_t::<BIG>(&c, dc, left - 1, m);
                 self.path.pop();
                 if self.stop {
                     return;
@@ -802,6 +925,34 @@ mod tests {
                 let t = perm_tables(p);
                 assert_eq!(st.index(apply_mask(&t, ud), apply_mask(&t, rl)), i);
                 assert_eq!(st.index(apply_mask(&t, ud), apply_mask(&t, fb)), i);
+            }
+        }
+    }
+
+    #[test]
+    fn child_masks_match_apply() {
+        let t = P1Tables::with_table(Staging::new(), Mod3Table::from_depths(&[0]));
+        let mut rng = rand::thread_rng();
+        for _ in 0..50 {
+            let mut s = P1State::from_cube(&Cube::random(&mut rng));
+            for step in 0..20 {
+                let flags = s.centre_flags();
+                for m in 0..N_MOVES {
+                    let c = s.apply(m, &t);
+                    let (ud, rl) = c.masks();
+                    let g = unsafe { child_flags(&flags, m, &t) };
+                    assert_eq!(flag_masks(&g), (ud, !ud & MASK24, rl));
+                    assert_eq!(
+                        t.staging.big_index_n(ud, !ud & MASK24, rl),
+                        t.staging.big_index(ud, rl)
+                    );
+                    let info = unsafe { *t.staging.info(ud) };
+                    assert_eq!(
+                        t.staging.fast_index_flags(info, &g),
+                        t.staging.fast_index(info, rl)
+                    );
+                }
+                s = s.apply((step * 7 + 3) % N_MOVES, &t);
             }
         }
     }
