@@ -16,7 +16,7 @@ use crate::cube::{Cube, Facelets, Mat};
 use crate::cube3::Cube3;
 use crate::moves::{ALLOWED_AFTER, MOVE_PERMS, N_MOVES, frame_rotation, rotate_move};
 use crate::phase1::{P1State, P1Tables, Search1};
-use crate::phase2::{P2Tables, Search2, first_moves, standardise};
+use crate::phase2::{MAX_BIG_SRC, P2Tables, Search2, first_moves, standardise};
 use crate::phase3::{P3Tables, Search3, Task};
 
 /// Phase-3 checks at least this deep are split into one job per child of the root.
@@ -26,9 +26,6 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-
-/// The deepest phase-2 level is best - DEEPEST_MARGIN (see `Run::phase2`).
-const DEEPEST_MARGIN: usize = 13;
 
 pub struct Tables {
     pub p1: P1Tables,
@@ -50,7 +47,13 @@ pub struct Options {
     pub endpoints: usize,
     /// Reductions collected in the first round (doubled each round).
     pub reductions: usize,
+    /// Phase-2 cap schedule: (from this many seconds, margin); phase 2 produces reductions
+    /// up to L12 = best - margin. Sorted by time.
+    pub margins: Vec<(f64, usize)>,
 }
+
+/// The default phase-2 cap schedule (see `Run::phase2`).
+pub const DEFAULT_MARGINS: [(f64, usize); 3] = [(0.0, 15), (3.0, 14), (6.0, 13)];
 
 impl Default for Options {
     fn default() -> Self {
@@ -61,6 +64,7 @@ impl Default for Options {
             threads: crate::par::threads(),
             endpoints: 128,
             reductions: 32,
+            margins: DEFAULT_MARGINS.to_vec(),
         }
     }
 }
@@ -102,7 +106,14 @@ struct Candidate {
     cube: Cube,
     centre: u32,
     tau: [u8; 16],
+    /// Exact tau distance, or with the joint table, the exact joint distance.
     dt: u8,
+    /// Exact joint distance of the F/B view (with the joint table and without the big one;
+    /// LAZY until the first search).
+    df: u8,
+    /// Exact distances from the large joint tables' bounds (`P2Tables::big_src`; LAZY until
+    /// the first search).
+    db: [u8; MAX_BIG_SRC],
     h2: u8,
     /// Phase-2 depths below this have been searched.
     done2: u8,
@@ -262,9 +273,34 @@ fn make_candidate(t: &Tables, cube: &Cube, moves1: &[u8], frame: usize) -> Optio
         centre,
         tau,
         dt,
+        df: LAZY,
+        db: [LAZY; MAX_BIG_SRC],
         h2: cd.max(dt),
         done2: 0,
     })
+}
+
+/// A phase-2 distance not computed yet.
+const LAZY: u8 = 0xff;
+
+/// The further phase-2 bounds of a candidate, computed on its first search (most endpoints
+/// are never searched): (F/B-view joint distance, large joint tables' distances) for the
+/// tables the search uses, else LAZY.
+fn late_bounds(t: &Tables, c: &Candidate) -> (u8, [u8; MAX_BIG_SRC]) {
+    let p2 = &t.p2;
+    if !p2.bigs.is_empty() {
+        let mut db = c.db;
+        for (k, d) in db.iter_mut().enumerate().take(p2.big_src.len()) {
+            if *d == LAZY {
+                *d = p2.big_distance(k, c.centre, &c.tau);
+            }
+        }
+        return (c.df, db);
+    }
+    match &p2.joint {
+        Some(j) if c.df == LAZY => (j.distance_fb(p2, c.centre, &c.tau), c.db),
+        _ => (c.df, c.db),
+    }
 }
 
 pub struct Solver<'a> {
@@ -299,6 +335,7 @@ struct Run<'a, 'r> {
     cands: Vec<Candidate>,
     reds: Vec<Reduction>,
     red_index: HashMap<(usize, Cube3), usize>,
+    margins: Vec<(f64, usize)>,
 }
 
 impl<'a> Solver<'a> {
@@ -340,6 +377,7 @@ impl<'a> Solver<'a> {
         }
         let len0 = pairs.iter().map(|&p| d0[p]).min().unwrap();
         let mut run = Run {
+            margins: self.opts.margins.clone(),
             t: self.t,
             cube: *cube,
             threads,
@@ -633,9 +671,11 @@ impl<'a, 'r> Run<'a, 'r> {
     }
 
     /// The longest reduction that could still lead to a shorter solution at the deepest
-    /// phase-2 level (`DEEPEST_MARGIN`); unlimited before the first solution.
+    /// phase-2 level (the smallest margin of the schedule); unlimited before the first
+    /// solution.
     fn useful_l12(&self) -> usize {
-        self.best_len().saturating_sub(DEEPEST_MARGIN)
+        let deepest = self.margins.iter().map(|m| m.1).min().unwrap_or(13);
+        self.best_len().saturating_sub(deepest)
     }
 
     /// Drop the candidates and reductions that can no longer lead to a shorter solution
@@ -666,13 +706,12 @@ impl<'a, 'r> Run<'a, 'r> {
         // margin goes from 15 to 13 as the run gets longer (phases 2 and 3 are then cheap
         // next to phase 1). Measured on 20 positions x 30 s: 39.3 -> 39.0 moves.
         let elapsed = self.start.elapsed().as_secs_f64();
-        let margin = if elapsed < 3.0 {
-            15
-        } else if elapsed < 6.0 {
-            14
-        } else {
-            DEEPEST_MARGIN
-        };
+        let margin = self
+            .margins
+            .iter()
+            .take_while(|m| m.0 <= elapsed)
+            .last()
+            .map_or(DEFAULT_MARGINS[0].1, |m| m.1);
         let cap = self.best_len().saturating_sub(margin).min(64);
         let mut t12 = self
             .cands
@@ -721,6 +760,9 @@ impl<'a, 'r> Run<'a, 'r> {
         let stop = self.stop;
         let made = AtomicUsize::new(0);
         let ran: Vec<AtomicBool> = (0..jobs.len()).map(|_| AtomicBool::new(false)).collect();
+        let late: Vec<Mutex<(u8, [u8; MAX_BIG_SRC])>> = (0..jobs.len())
+            .map(|_| Mutex::new((LAZY, [LAZY; MAX_BIG_SRC])))
+            .collect();
         par_jobs(jobs.len(), self.threads, stop, |j| {
             if made.load(Ordering::Relaxed) >= need {
                 return;
@@ -728,6 +770,14 @@ impl<'a, 'r> Run<'a, 'r> {
             ran[j].store(true, Ordering::Relaxed);
             let c = &cands[jobs[j]];
             let l2 = (t12 - c.moves1.len()) as u8;
+            let (df, db) = late_bounds(t, c);
+            *late[j].lock().unwrap() = (df, db);
+            if std::iter::once(&df)
+                .chain(&db)
+                .any(|&v| v != LAZY && l2 < v)
+            {
+                return;
+            }
             let rot = frame_rotation(c.frame);
             let rot_inv = transpose(&rot);
             let last1 = c
@@ -773,8 +823,10 @@ impl<'a, 'r> Run<'a, 'r> {
                 }
                 seen < max_sols
             };
-            if t.p2.joint.is_some() {
-                srch.dfs_joint(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep);
+            if !t.p2.bigs.is_empty() {
+                srch.dfs_big(c.centre, &c.tau, db, l2, last1, first, &mut keep);
+            } else if t.p2.joint.is_some() {
+                srch.dfs_joint(c.centre, &c.tau, c.dt, df, l2, last1, first, &mut keep);
             } else {
                 srch.dfs(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep);
             }
@@ -782,6 +834,16 @@ impl<'a, 'r> Run<'a, 'r> {
             made.fetch_add(local.len(), Ordering::Relaxed);
             out.lock().unwrap().push((j, local));
         });
+        for (k, &j) in jobs.iter().enumerate() {
+            let (df, db) = *late[k].lock().unwrap();
+            let c = &mut self.cands[j];
+            for (x, v) in std::iter::once((&mut c.df, df)).chain(c.db.iter_mut().zip(db)) {
+                if v != LAZY {
+                    *x = v;
+                    c.h2 = c.h2.max(v);
+                }
+            }
+        }
         if !self.stopped() {
             for (k, &j) in jobs.iter().enumerate() {
                 if !ran[k].load(Ordering::Relaxed) {
@@ -1002,6 +1064,22 @@ pub fn load_tables_with(
     threads: usize,
     verbose: bool,
 ) -> Tables {
+    load_tables_full(dir, h48_k, joint, p1_big, p1_extra, &[], threads, verbose)
+}
+
+/// [`load_tables_with`], and `p2_big`: the large joint phase-2 tables of these kinds
+/// (U/D x R/L ~6.3 GB, U/D x F/B ~18.4 GB; generated on first use, long).
+#[allow(clippy::too_many_arguments)]
+pub fn load_tables_full(
+    dir: &std::path::Path,
+    h48_k: u32,
+    joint: bool,
+    p1_big: bool,
+    p1_extra: (Option<bool>, Option<bool>),
+    p2_big: &[crate::p2big::Kind],
+    threads: usize,
+    verbose: bool,
+) -> Tables {
     let t0 = Instant::now();
     let mut p1 = load_p1(dir, p1_big, threads, verbose);
     if let Some(big) = p1_extra.0 {
@@ -1049,6 +1127,25 @@ pub fn load_tables_with(
         }
         p2.joint = Some(j);
     }
+    for &kind in p2_big {
+        let mut b = crate::p2big::Big::new(&p2, kind);
+        let name = kind.file_name();
+        let path = dir.join(format!("{name}.tab"));
+        b.table = crate::table::HugeBuf::zeroed(b.bytes() / 8);
+        let bytes = b.table.as_bytes_mut();
+        if crate::table::load(&path, name, bytes).is_err() {
+            if verbose {
+                eprintln!(
+                    "generating the {kind:?} joint phase-2 table ({:.1} GB)...",
+                    b.bytes() as f64 / 1e9
+                );
+            }
+            b.generate(&p2, threads, verbose);
+            let bytes = b.table.as_bytes();
+            crate::table::save(&path, name, bytes).expect("saving table");
+        }
+        p2.add_big(b);
+    }
     let p3 = P3Tables::load_or_build(dir, h48_k, threads, verbose);
     // Huge pages for the big tables, in parallel.
     std::thread::scope(|s| {
@@ -1062,6 +1159,9 @@ pub fn load_tables_with(
         s.spawn(|| p2.tau_table.data.collapse());
         if let Some(j) = &p2.joint {
             s.spawn(|| j.table.collapse());
+        }
+        for b in &p2.bigs {
+            s.spawn(|| b.table.collapse());
         }
         s.spawn(|| p3.h48.data.collapse());
     });

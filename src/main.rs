@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eggg_solver::cube::{Cube, Facelets};
 use eggg_solver::notation::{Style, format_moves, parse_moves};
-use eggg_solver::solver::{Options, Solution, Solver, Tables, load_tables_with, verify};
+use eggg_solver::solver::{Options, Solution, Solver, Tables, load_tables_full, verify};
 use rand::SeedableRng;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -174,6 +174,11 @@ struct TableArgs {
     /// (pattern-distance-decreasing moves, 17.5 GB).
     #[arg(long, value_enum)]
     p1_mask: Option<PatArg>,
+    /// Large joint phase-2 tables (tau x two centre patterns x PLL parity), whatever the
+    /// tier: udrl (U/D x R/L, ~6.3 GB) and/or udfb (U/D x F/B, ~18.4 GB). Generated on first
+    /// use (long).
+    #[arg(long, value_enum, value_delimiter = ',')]
+    p2_big: Vec<BigKind>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
@@ -181,6 +186,12 @@ enum PatArg {
     None,
     Small,
     Big,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum BigKind {
+    Udrl,
+    Udfb,
 }
 
 impl TableArgs {
@@ -198,8 +209,13 @@ impl TableArgs {
         let (k, joint, big) = self.config();
         if verbose {
             eprintln!(
-                "tables: h48 h{k}{}{} ({:?} tier)",
+                "tables: h48 h{k}{}{}{} ({:?} tier)",
                 if joint { ", joint phase 2" } else { "" },
+                if self.p2_big.is_empty() {
+                    String::new()
+                } else {
+                    format!(", large joint phase 2 {:?}", self.p2_big)
+                },
                 if big { ", large phase 1" } else { "" },
                 self.tier.resolve(&self.dir())
             );
@@ -239,12 +255,22 @@ impl TableArgs {
                 }
             );
         }
-        load_tables_with(
+
+        let kinds: Vec<eggg_solver::p2big::Kind> = self
+            .p2_big
+            .iter()
+            .map(|k| match k {
+                BigKind::Udrl => eggg_solver::p2big::Kind::UdRl,
+                BigKind::Udfb => eggg_solver::p2big::Kind::UdFb,
+            })
+            .collect();
+        load_tables_full(
             &self.dir(),
             k,
             joint,
             big || mask.is_some(),
             (pat, mask),
+            &kinds,
             threads,
             verbose,
         )
@@ -270,6 +296,27 @@ struct SearchArgs {
     /// Reductions collected in the first round (doubled each round).
     #[arg(long, default_value_t = Options::default().reductions)]
     reductions: usize,
+    /// Phase-2 cap schedule, SECONDS:MARGIN,...: from each time on, phase 2 produces
+    /// reductions up to (best length - MARGIN) moves.
+    #[arg(long, value_name = "SCHEDULE", value_parser = parse_margins, default_value = "0:15,3:14,6:13")]
+    margins: Margins,
+}
+
+#[derive(Clone, Debug)]
+struct Margins(Vec<(f64, usize)>);
+
+fn parse_margins(s: &str) -> Result<Margins, String> {
+    let mut v = vec![];
+    for part in s.split(',') {
+        let (t, m) = part
+            .split_once(':')
+            .ok_or_else(|| format!("expected SECONDS:MARGIN, got {part:?}"))?;
+        let t: f64 = t.trim().parse().map_err(|e| format!("{t:?}: {e}"))?;
+        let m: usize = m.trim().parse().map_err(|e| format!("{m:?}: {e}"))?;
+        v.push((t, m));
+    }
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(Margins(v))
 }
 
 #[derive(Args, Clone)]
@@ -411,6 +458,7 @@ fn options(limits: &LimitArgs, search: &SearchArgs, threads: usize) -> Options {
         threads,
         endpoints: search.endpoints,
         reductions: search.reductions,
+        margins: search.margins.0.clone(),
     }
 }
 

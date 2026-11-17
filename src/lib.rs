@@ -9,6 +9,7 @@ pub mod moves;
 pub mod notation;
 pub mod p1mask;
 pub mod p1pat;
+pub mod p2big;
 pub mod p2joint;
 pub mod par;
 pub mod phase1;

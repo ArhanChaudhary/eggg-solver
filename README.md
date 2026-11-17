@@ -44,8 +44,14 @@ the default, `auto`, takes the largest tier that fits in a third of the physical
 
 The tables: phase-1 centre staging (symmetry-reduced, 25 MB; `--p1-big`: 1.2 GB without the
 reduction, faster lookups), phase-2 pairing permutation (60 MB; `--p2-joint`: the joint
-pairing x U/D centres x PLL parity table, 1.05 GB, far fewer phase-2 nodes), phase-3 H48
+pairing x U/D centres x PLL parity table, 1.05 GB, far fewer phase-2 nodes; it is also read
+for the F/B centres through the rotation x), phase-3 H48
 (30 MB * 2^K for K edge-orientation bits, `--h48 K`). The three options override the tier.
+`--p2-big udrl,udfb` adds the large joint phase-2 tables (pairing x two centre patterns x PLL
+parity: U/D x R/L, 6.35 GB, read directly and through x; U/D x F/B, 18.4 GB). They are
+generated on first use (about 30 and 60-90 minutes on 48 threads; not generated yet) and cut
+the phase-2 nodes per solution at deep levels a further ~3.8x (U/D x R/L) or ~6.6x (both),
+as computed from their exact values by IDA* (`examples/p2deep`, `ORACLE=7`).
 The larger phase-3 tables matter most with few threads, where phase 3 is a large share of
 the time (one thread: first solution after 6.2 s with `huge`, 1.4 s with `xl`, 0.5 s with
 `xxl`, on average); with many threads phase 1 dominates.
@@ -78,7 +84,9 @@ orientation, so the output needs no rotations.
    never wait for one another.
 2. **Phase 2** (TPR phase 3): pair the dedges and solve the centres with
    U D F B R2 L2 Uw2 Rw2 Fw2, guided by an exact centre table and either the pairing
-   permutation table or the much tighter joint table.
+   permutation table or the much tighter joint table, read twice (for the U/D centres, and
+   through the rotation x for the F/B ones: ~7x fewer nodes per solution at deep levels than
+   the U/D reading alone).
 3. **Phase 3**: solve the reduced 3x3x3 in one IDA* search with H48 pruning tables (as in
    nissy's H48 solver and egg-solver), from both ends of the solution at once.
 
@@ -86,7 +94,8 @@ The driver collects many phase-1 endpoints and reductions and searches phase 3 l
 level on the total length over all of them, so each solution found is the shortest the pool
 allows; the pool grows while time remains. Once a solution exists, phase 2 only produces
 reductions that a short enough phase 3 could still turn into a shorter solution: phase 3 of
-at most 14 moves at first, 13 after 3 s and 12 after 6 s. Each deeper level has ~16x the
+at most 14 moves at first, 13 after 3 s and 12 after 6 s (`--margins 0:15,3:14,6:13`: from
+each time on, reductions up to best - margin moves). Each deeper level has ~16x the
 reductions and each is ~13x less likely to have a short enough phase 3, so every level adds
 about as many chances, and long runs keep improving. 48 threads, two sets of 20 random
 positions: 39.7 / 39.5 moves on average after 2 s, 39.0 / 39.1 after 30 s, 38.8 / 39.1
@@ -102,5 +111,9 @@ after 60 s.
   `scripts/paired.py A.json B.json` for a per-position paired comparison (runs of one build
   reproduce per-position lengths, so small differences are measurable).
 - `examples/` holds deterministic checks used during optimisation: `p1check` (phase-1
-  endpoint hash and node count), `p2jcheck` (joint-table admissibility), `p3check`,
-  `p3nodes` and `p3tasks` (phase-3 bounds, node counts and task splitting).
+  endpoint hash and node count), `p2jcheck` (joint-table admissibility), `p2deep` (phase-2
+  nodes per solution at deep levels; `ORACLE=bits` prunes with exact projected distances,
+  i.e. what the large joint tables would give), `p2cost` (CPU per deep reduction: phase 2,
+  bookkeeping, phase 3), `p2bigprobe` and `p2bigcheck` (large joint tables: generator cost;
+  exactness against IDA* once generated), `p3check`, `p3nodes` and `p3tasks` (phase-3
+  bounds, node counts and task splitting).

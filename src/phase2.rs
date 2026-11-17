@@ -42,6 +42,10 @@ pub struct P2Tables {
     pub tau_table: Mod3Table,
     /// Optional joint table over tau, the U/D pattern and the PLL bit (much tighter).
     pub joint: Option<crate::p2joint::Joint>,
+    /// Optional large joint tables (tau, two centre patterns, the PLL bit; tighter still).
+    pub bigs: Vec<crate::p2big::Big>,
+    /// The bounds read from them: (table, through its x view).
+    pub big_src: Vec<(usize, bool)>,
 }
 
 fn orbit_mask(c: &Cube, pos: &[usize; 8], colour: u8) -> u8 {
@@ -125,6 +129,8 @@ impl P2Tables {
             pl_inv,
             ph,
             joint: None,
+            bigs: vec![],
+            big_src: vec![],
             tau_table: Mod3Table {
                 data: crate::table::HugeBuf::zeroed(1),
             },
@@ -142,6 +148,48 @@ impl P2Tables {
         t
     }
 
+    /// Rank (0..12) of an allowed R/L pattern (bit i: position `RL_POS[i]` holds an R centre),
+    /// 255 if not allowed.
+    pub(crate) fn rank12(&self, mask: u8) -> u8 {
+        self.rl12[mask as usize]
+    }
+
+    pub(crate) fn unrank12(&self, r: u8) -> u8 {
+        self.rl12_inv[r as usize]
+    }
+
+    /// Add a large joint table and its bounds (directly, and through its view if it has one).
+    pub fn add_big(&mut self, b: crate::p2big::Big) {
+        let i = self.bigs.len();
+        self.big_src.push((i, false));
+        if b.view.is_some() {
+            self.big_src.push((i, true));
+        }
+        assert!(self.big_src.len() <= MAX_BIG_SRC);
+        self.bigs.push(b);
+    }
+
+    /// Table index of bound source `k` for a state.
+    #[inline(always)]
+    pub fn big_index(&self, k: usize, cc: u32, tau: &[u8; 16]) -> usize {
+        let (i, view) = self.big_src[k];
+        if view {
+            self.bigs[i].index_view(cc, tau)
+        } else {
+            self.bigs[i].index(cc, tau)
+        }
+    }
+
+    /// Exact distance of bound source `k` for a state.
+    pub fn big_distance(&self, k: usize, cc: u32, tau: &[u8; 16]) -> u8 {
+        let (i, view) = self.big_src[k];
+        if view {
+            self.bigs[i].distance_view(self, cc, tau)
+        } else {
+            self.bigs[i].distance(self, cc, tau)
+        }
+    }
+
     pub(crate) fn rank70(&self, mask: u8) -> u8 {
         self.rank70[mask as usize]
     }
@@ -153,6 +201,13 @@ impl P2Tables {
     #[cfg(test)]
     pub(crate) fn base_for_tests() -> P2Tables {
         P2Tables::base()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_centres_for_tests() -> P2Tables {
+        let mut t = P2Tables::base();
+        t.build_centres();
+        t
     }
 
     pub fn centre_coord_of(&self, c: &Cube) -> u32 {
@@ -477,13 +532,16 @@ impl<'a> Search2<'a> {
 }
 
 impl<'a> Search2<'a> {
-    /// [`Search2::dfs`] with the joint table: `dj` is the exact joint distance.
+    /// [`Search2::dfs`] with the joint table: `dj` and `df` are the exact joint distances of
+    /// the state and of its F/B view (the table read for the F/B centre pattern; the two
+    /// bounds together expand ~7x fewer nodes than the U/D one alone at deep levels).
     #[allow(clippy::too_many_arguments)]
     pub fn dfs_joint(
         &mut self,
         cc: u32,
         tau: &[u8; 16],
         dj: u8,
+        df: u8,
         left: u8,
         last: usize,
         after: u32,
@@ -498,8 +556,9 @@ impl<'a> Search2<'a> {
         let t = self.t;
         let j = t.joint.as_ref().unwrap();
         let allowed = after & PHASE2_MASK & if left == 1 { last_mask(last) } else { u32::MAX };
-        // Stage 1: children with the centre bound, joint entries prefetched.
-        let mut kids = [(0u32, [0u8; 16], 0usize, 0u8); 17];
+        // Stage 1: children with the centre bound; the class-table entries of both views
+        // prefetched (the class table is 3.3 MB: without this, its misses stall every index).
+        let mut kids = [(0u32, [0u8; 16], [0u8; 16], 0usize, 0usize, 0u8); 17];
         let mut nk = 0;
         for (i, &m) in P2_MOVES.iter().enumerate() {
             if allowed >> m & 1 == 0 {
@@ -510,8 +569,106 @@ impl<'a> Search2<'a> {
                 continue;
             }
             let t2 = t.tau_move(tau, i);
-            let idx = j.index(c2 / 1680, &t2, c2 & 1);
-            j.prefetch(idx);
+            let ru = j.raw(c2 / 1680, &t2);
+            j.prefetch_cls(ru);
+            let (uv, tv) = j.fb.map(c2, &t2);
+            let rf = j.raw(uv, &tv);
+            j.prefetch_cls(rf);
+            kids[nk] = (c2, t2, tv, ru, rf, m);
+            nk += 1;
+        }
+        self.nodes += nk as u64;
+        if self
+            .abort
+            .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return false;
+        }
+        // Stage 2: table indices, entries prefetched.
+        let mut idx = [(0usize, 0usize); 17];
+        for k in 0..nk {
+            let (c2, t2, tv, ru, rf, _) = kids[k];
+            let a = j.index_raw(ru, &t2, c2 & 1);
+            j.prefetch(a);
+            let b = j.index_raw(rf, &tv, c2 & 1);
+            j.prefetch(b);
+            idx[k] = (a, b);
+        }
+        // Stage 3: read, decode, descend.
+        for k in 0..nk {
+            let (c2, t2, _, _, _, m) = kids[k];
+            let (idx, idf) = idx[k];
+            let d2 = Mod3Table::decode(dj, j.get(idx));
+            if d2 >= left {
+                continue;
+            }
+            let f2 = Mod3Table::decode(df, j.get(idf));
+            if f2 >= left {
+                continue;
+            }
+            self.path.push(m);
+            let go = self.dfs_joint(
+                c2,
+                &t2,
+                d2,
+                f2,
+                left - 1,
+                m as usize,
+                after_child(after, m as usize),
+                found,
+            );
+            self.path.pop();
+            if !go {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// At most this many bounds from the large joint tables (U/D x R/L with its view, U/D x F/B).
+pub const MAX_BIG_SRC: usize = 3;
+
+impl<'a> Search2<'a> {
+    /// [`Search2::dfs`] with the large joint tables: `ds[k]` is the exact distance from bound
+    /// source `k` (see [`P2Tables::big_src`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dfs_big(
+        &mut self,
+        cc: u32,
+        tau: &[u8; 16],
+        ds: [u8; MAX_BIG_SRC],
+        left: u8,
+        last: usize,
+        after: u32,
+        found: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> bool {
+        let t = self.t;
+        let ns = t.big_src.len();
+        if left == 0 {
+            if cc_is_goal(t, cc) && ds[..ns].iter().all(|&d| d == 0) {
+                return found(&self.path);
+            }
+            return true;
+        }
+        let allowed = after & PHASE2_MASK & if left == 1 { last_mask(last) } else { u32::MAX };
+        // Stage 1: children with the centre bound, table entries prefetched.
+        let mut kids = [(0u32, [0u8; 16], [0usize; MAX_BIG_SRC], 0u8); 17];
+        let mut nk = 0;
+        for (i, &m) in P2_MOVES.iter().enumerate() {
+            if allowed >> m & 1 == 0 {
+                continue;
+            }
+            let c2 = t.centre_move[cc as usize][i];
+            if t.centre_dist[c2 as usize] >= left {
+                continue;
+            }
+            let t2 = t.tau_move(tau, i);
+            let mut idx = [0usize; MAX_BIG_SRC];
+            for k in 0..ns {
+                idx[k] = t.big_index(k, c2, &t2);
+                t.bigs[t.big_src[k].0].prefetch(idx[k]);
+            }
             kids[nk] = (c2, t2, idx, m);
             nk += 1;
         }
@@ -523,14 +680,17 @@ impl<'a> Search2<'a> {
             return false;
         }
         // Stage 2: read, decode, descend.
-        for k in 0..nk {
+        'kid: for k in 0..nk {
             let (c2, t2, idx, m) = kids[k];
-            let d2 = Mod3Table::decode(dj, j.get(idx));
-            if d2 >= left {
-                continue;
+            let mut d2 = [0u8; MAX_BIG_SRC];
+            for s in 0..ns {
+                d2[s] = Mod3Table::decode(ds[s], t.bigs[t.big_src[s].0].get(idx[s]));
+                if d2[s] >= left {
+                    continue 'kid;
+                }
             }
             self.path.push(m);
-            let go = self.dfs_joint(
+            let go = self.dfs_big(
                 c2,
                 &t2,
                 d2,

@@ -11,7 +11,7 @@
 //! entries of tau, conjugated into the class representative, are ranked (8!/2). Distances
 //! are stored mod 3 in 2 bits (1.05 GB).
 
-use crate::comb::{FACT, perm_rank};
+use crate::comb::FACT;
 use crate::cube::{EDGE_POS, GEO, ROTATIONS, centre_slot, mat_apply};
 use crate::moves::MOVE_PERMS;
 use crate::phase2::{P2_MOVES, P2Tables};
@@ -20,27 +20,43 @@ use crate::table::HugeBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// The M-slice edges UF, UB, DF, DB (Kociemba numbering) and the other eight.
-const M_EDGES: [usize; 4] = [1, 3, 5, 7];
-const REST: [usize; 8] = [0, 2, 4, 6, 8, 9, 10, 11];
-const N_PREFIX: usize = 12 * 11 * 10 * 9;
+pub(crate) const M_EDGES: [usize; 4] = [1, 3, 5, 7];
+pub(crate) const REST: [usize; 8] = [0, 2, 4, 6, 8, 9, 10, 11];
+pub(crate) const N_PREFIX: usize = 12 * 11 * 10 * 9;
 const N_RAW: usize = 70 * N_PREFIX;
-const N_REST: usize = 20160;
+pub(crate) const N_REST: usize = 20160;
 /// The wide half turns among the phase-2 moves (they flip the PLL bit).
-const WIDE: u32 = 0b111 << 14;
+pub(crate) const WIDE: u32 = 0b111 << 14;
 
-struct Sym {
+pub(crate) struct Sym {
     /// Edge permutation (edge e goes to edge `e[e]`).
-    e: [u8; 12],
+    pub(crate) e: [u8; 12],
     /// Image of a U/D pattern rank.
-    ud: [u8; 70],
+    pub(crate) ud: [u8; 70],
     /// [`conj`] as two byte shuffles (low lane): gather the edges by the inverse position
     /// permutation, then relabel them.
-    e_inv: V32,
-    e_map: V32,
+    pub(crate) e_inv: V32,
+    pub(crate) e_map: V32,
+}
+
+/// The table read for the F/B centre pattern instead of the U/D one: the rotation x swaps the
+/// U/D and F/B axes and keeps the phase-2 move set (Fw2 goes to Uw2 or Dw2 = Uw2 y2, and y2 is
+/// a symmetry of the table), so the joint distance of the rotated state is a second lower
+/// bound, read from the same table.
+pub struct FbView {
+    /// U/D pattern rank of the rotated state, by F/B pattern rank.
+    fb_ud: [u8; 70],
+    /// F/B pattern rank after each phase-2 move.
+    fb_move: [[u8; 17]; 70],
+    sym: Sym,
+    /// The rotation takes the low wing slots to the high ones: the rotated pairing is the
+    /// conjugate of the inverse of tau.
+    inverse: bool,
 }
 
 pub struct Joint {
     syms: Vec<Sym>,
+    pub fb: FbView,
     /// Raw (pattern, prefix) -> class << 2 | symmetry taking it to the class representative.
     cls: Vec<u32>,
     /// Class -> raw representative.
@@ -54,7 +70,7 @@ pub struct Joint {
 }
 
 #[inline(always)]
-fn prefix_rank(tau: &[u8; 16]) -> usize {
+pub(crate) fn prefix_rank(tau: &[u8; 16]) -> usize {
     let mut used = 0u32;
     let mut r = 0usize;
     for (i, &e) in M_EDGES.iter().enumerate() {
@@ -65,7 +81,7 @@ fn prefix_rank(tau: &[u8; 16]) -> usize {
     r
 }
 
-fn prefix_unrank(mut r: usize) -> [u8; 4] {
+pub(crate) fn prefix_unrank(mut r: usize) -> [u8; 4] {
     let mut digits = [0usize; 4];
     for i in (0..4).rev() {
         digits[i] = r % (12 - i);
@@ -82,20 +98,23 @@ fn prefix_unrank(mut r: usize) -> [u8; 4] {
 /// Rank of the eight non-M entries of tau (relative to the values the prefix leaves), /2 for
 /// the fixed parity.
 #[inline(always)]
-fn rest_rank(tau: &[u8; 16]) -> usize {
+pub(crate) fn rest_rank(tau: &[u8; 16]) -> usize {
     let mut pm = 0u32;
     for &e in &M_EDGES {
         pm |= 1 << tau[e];
     }
-    let mut p = [0u8; 8];
+    // Lehmer rank in Horner form (no factorial table).
+    let (mut r, mut used) = (0u32, 0u32);
     for (i, &e) in REST.iter().enumerate() {
         let v = tau[e] as u32;
-        p[i] = (v - (pm & ((1 << v) - 1)).count_ones()) as u8;
+        let x = v - (pm & ((1 << v) - 1)).count_ones();
+        r = r * (8 - i as u32) + (!used & ((1 << x) - 1)).count_ones();
+        used |= 1 << x;
     }
-    (perm_rank(&p) / 2) as usize
+    (r / 2) as usize
 }
 
-fn perm8_unrank(mut r: usize) -> [u8; 8] {
+pub(crate) fn perm8_unrank(mut r: usize) -> [u8; 8] {
     let mut avail = [0u8, 1, 2, 3, 4, 5, 6, 7];
     let mut n = 8;
     let mut out = [0u8; 8];
@@ -112,19 +131,133 @@ fn perm8_unrank(mut r: usize) -> [u8; 8] {
 
 /// The edge part of [`conj`] (entries 12.. undefined), with byte shuffles.
 #[inline(always)]
-fn conj_edges(tau: &[u8; 16], s: &Sym) -> [u8; 16] {
+pub(crate) fn conj_edges(tau: &[u8; 16], s: &Sym) -> [u8; 16] {
     let mut v = V32::ZERO;
     v.0[..16].copy_from_slice(tau);
     let t = crate::simd::shuf(&s.e_map, &crate::simd::shuf(&v, &s.e_inv));
     t.0[..16].try_into().unwrap()
 }
 
-fn conj(tau: &[u8; 16], s: &Sym) -> [u8; 16] {
+pub(crate) fn conj(tau: &[u8; 16], s: &Sym) -> [u8; 16] {
     let mut t = *tau;
     for e in 0..12 {
         t[s.e[e] as usize] = s.e[tau[e] as usize];
     }
     t
+}
+
+impl FbView {
+    fn new(p2: &P2Tables) -> FbView {
+        use crate::cube::{D, F, FACE_NORMAL, face_of_normal, wing_slot};
+        let g = &*GEO;
+        // The rotation about the R/L axis taking U to F or B.
+        let m = *ROTATIONS
+            .iter()
+            .find(|m| m[0][0] == 1 && m[1][1] == 0)
+            .unwrap();
+        let mut e = [0u8; 12];
+        let mut lows = 0;
+        for i in 0..12 {
+            let p = mat_apply(&m, EDGE_POS[i]);
+            e[i] = EDGE_POS.iter().position(|&q| q == p).unwrap() as u8;
+            let img = wing_slot(mat_apply(&m, g.wing_pos[p2.low[i] as usize]));
+            if img as u8 == p2.low[e[i] as usize] {
+                lows += 1;
+            }
+        }
+        assert!(lows == 0 || lows == 12, "x mixes low and high wing slots");
+        // F/B centre positions go to U/D ones; the colour F goes to U or D.
+        let ud_pos = [0usize, 1, 2, 3, 12, 13, 14, 15];
+        let fb_pos = [8usize, 9, 10, 11, 20, 21, 22, 23];
+        let comp = face_of_normal(mat_apply(&m, FACE_NORMAL[F])) == D;
+        let mut fb_ud = [0u8; 70];
+        for r in 0..70 {
+            let mask = p2.unrank70(r as u8);
+            let mut out = 0u8;
+            for (i, &p) in fb_pos.iter().enumerate() {
+                let q = centre_slot(mat_apply(&m, g.centre_pos[p]));
+                let j = ud_pos.iter().position(|&x| x == q).unwrap();
+                if (mask >> i & 1 == 1) != comp {
+                    out |= 1 << j;
+                }
+            }
+            fb_ud[r] = p2.rank70(out);
+        }
+        let (mut e_inv, mut e_map) = (V32([0x80; 32]), V32([0; 32]));
+        for i in 0..12 {
+            e_inv.0[e[i] as usize] = i as u8;
+            e_map.0[i] = e[i];
+        }
+        let mut fb_move = [[0u8; 17]; 70];
+        for (r, row) in fb_move.iter_mut().enumerate() {
+            let c = p2.centre_cube(r as u32 * 24);
+            for (i, &mv) in P2_MOVES.iter().enumerate() {
+                let cc = p2.centre_coord_of(&c.apply_perm(&MOVE_PERMS[mv as usize]));
+                row[i] = (cc / 24 % 70) as u8;
+            }
+        }
+        FbView {
+            fb_ud,
+            fb_move,
+            sym: Sym {
+                e,
+                ud: [0; 70],
+                e_inv,
+                e_map,
+            },
+            inverse: lows == 0,
+        }
+    }
+
+    /// The rotated state's (U/D pattern, tau) from the full centre coordinate and tau; the PLL
+    /// bit is unchanged.
+    #[inline(always)]
+    pub fn map(&self, cc: u32, tau: &[u8; 16]) -> (u32, [u8; 16]) {
+        self.map_fb(cc / 24 % 70, tau)
+    }
+
+    /// [`FbView::map`] from the F/B pattern rank.
+    #[inline(always)]
+    fn map_fb(&self, fb: u32, tau: &[u8; 16]) -> (u32, [u8; 16]) {
+        let ud = self.fb_ud[fb as usize] as u32;
+        let t = if self.inverse {
+            let mut inv = [0u8; 16];
+            for e in 0..12 {
+                inv[tau[e] as usize] = e as u8;
+            }
+            conj_edges(&inv, &self.sym)
+        } else {
+            conj_edges(tau, &self.sym)
+        };
+        (ud, t)
+    }
+}
+
+impl Joint {
+    /// Table index of the F/B view of a state (full centre coordinate `cc`).
+    #[inline(always)]
+    pub fn index_fb(&self, cc: u32, tau: &[u8; 16]) -> usize {
+        let (ud, t) = self.fb.map(cc, tau);
+        self.index(ud, &t, cc & 1)
+    }
+
+    /// Exact F/B-view distance, by walking down the mod-3 table over the phase-2 moves.
+    pub fn distance_fb(&self, p2: &P2Tables, cc: u32, tau: &[u8; 16]) -> u8 {
+        self.walk(
+            (cc / 24 % 70, *tau, cc & 1),
+            |&(fb, ref tau, pll)| {
+                let (ud, t) = self.fb.map_fb(fb, tau);
+                self.index(ud, &t, pll)
+            },
+            |&(fb, ref tau, pll), i| {
+                (
+                    self.fb.fb_move[fb as usize][i] as u32,
+                    p2.tau_move(tau, i),
+                    pll ^ (WIDE >> i & 1),
+                )
+            },
+        )
+    }
 }
 
 impl Joint {
@@ -231,8 +364,10 @@ impl Joint {
             }
         }
         let n = rep.len() * N_REST * 2;
+        let fb = FbView::new(p2);
         Joint {
             syms,
+            fb,
             cls,
             rep,
             stab,
@@ -253,7 +388,26 @@ impl Joint {
     /// Table index (one stabiliser variant; the table holds the same value in all of them).
     #[inline(always)]
     pub fn index(&self, ud: u32, tau: &[u8; 16], pll: u32) -> usize {
-        let c = self.cls[ud as usize * N_PREFIX + prefix_rank(tau)];
+        self.index_raw(self.raw(ud, tau), tau, pll)
+    }
+
+    /// The class-table position of (U/D pattern, tau): the first step of [`Joint::index`],
+    /// so that a search can prefetch the class entries (3.3 MB, mostly cache misses) of all
+    /// children before computing their table indices.
+    #[inline(always)]
+    pub fn raw(&self, ud: u32, tau: &[u8; 16]) -> usize {
+        ud as usize * N_PREFIX + prefix_rank(tau)
+    }
+
+    #[inline(always)]
+    pub fn prefetch_cls(&self, raw: usize) {
+        crate::table::prefetch(unsafe { self.cls.as_ptr().add(raw) });
+    }
+
+    /// [`Joint::index`] from the class-table position.
+    #[inline(always)]
+    pub fn index_raw(&self, raw: usize, tau: &[u8; 16], pll: u32) -> usize {
+        let c = self.cls[raw];
         let s = (c & 7) as usize;
         let r = if s == 0 {
             rest_rank(tau)
@@ -336,30 +490,44 @@ impl Joint {
 
     /// Exact distance of a state, by walking down the mod-3 table.
     pub fn distance(&self, p2: &P2Tables, ud: u32, tau: &[u8; 16], pll: u32) -> u8 {
-        let (mut ud, mut tau, mut pll) = (ud, *tau, pll);
-        let mut d = 0;
-        loop {
-            let v = self.get(self.index(ud, &tau, pll));
-            let mut next = None;
-            for i in 0..17 {
-                let t2 = p2.tau_move(&tau, i);
-                let u2 = self.ud_move[ud as usize][i] as u32;
-                let p = pll ^ (WIDE >> i & 1);
-                if self.get(self.index(u2, &t2, p)) == (v + 2) % 3 {
-                    next = Some((u2, t2, p));
-                    break;
+        self.walk(
+            (ud, *tau, pll),
+            |&(ud, ref tau, pll)| self.index(ud, tau, pll),
+            |&(ud, ref tau, pll), i| {
+                (
+                    self.ud_move[ud as usize][i] as u32,
+                    p2.tau_move(tau, i),
+                    pll ^ (WIDE >> i & 1),
+                )
+            },
+        )
+    }
+
+    /// Walk down the mod-3 table from `start` to a goal, each step to the first neighbour one
+    /// closer: the exact distance. (Prefetching all 17 neighbours per step was slower.)
+    #[inline(always)]
+    fn walk<S: Copy>(
+        &self,
+        start: S,
+        idx: impl Fn(&S) -> usize,
+        step: impl Fn(&S, usize) -> S,
+    ) -> u8 {
+        let mut s = start;
+        let mut v = self.get(idx(&s));
+        for d in 0..40 {
+            let want = (v + 2) % 3;
+            match (0..17)
+                .map(|i| step(&s, i))
+                .find(|k| self.get(idx(k)) == want)
+            {
+                Some(k) => {
+                    s = k;
+                    v = want;
                 }
-            }
-            match next {
-                Some((u2, t2, p)) if d < 40 => {
-                    ud = u2;
-                    tau = t2;
-                    pll = p;
-                    d += 1;
-                }
-                _ => return d,
+                None => return d,
             }
         }
+        40
     }
 
     /// Breadth-first generation, in place with 2 bits per entry (3 = not reached yet).
@@ -494,6 +662,43 @@ mod tests {
             for s in &j.syms {
                 assert_eq!(conj_edges(&tau, s)[..12], conj(&tau, s)[..12]);
             }
+        }
+    }
+
+    #[test]
+    fn fb_view_matches_rotated_cube() {
+        use crate::cube::{Cube, U};
+        use crate::moves::Conj;
+        let p2 = P2Tables::build_centres_for_tests();
+        let j = Joint::new(&p2);
+        let m = *ROTATIONS
+            .iter()
+            .find(|m| m[0][0] == 1 && m[1][1] == 0)
+            .unwrap();
+        let cj = Conj::new(m);
+        let mut rng = rand::thread_rng();
+        use rand::Rng;
+        let ud_pos = [0usize, 1, 2, 3, 12, 13, 14, 15];
+        let mut c = Cube::SOLVED;
+        for _ in 0..3000 {
+            let i = rng.gen_range(0..17);
+            c = c.apply_perm(&MOVE_PERMS[P2_MOVES[i] as usize]);
+            let cc = p2.centre_coord_of(&c);
+            let tau = p2.tau_of(&c);
+            let y = cj.apply(&c);
+            let mut mask = 0u8;
+            for (k, &p) in ud_pos.iter().enumerate() {
+                if y.ct[p] / 4 == U as u8 {
+                    mask |= 1 << k;
+                }
+            }
+            let (ud, t) = j.fb.map(cc, &tau);
+            assert_eq!(ud, p2.rank70(mask) as u32);
+            assert_eq!(t[..12], p2.tau_of(&y)[..12]);
+            assert_eq!(
+                crate::phase2::pll_parity(&y, &p2.low),
+                crate::phase2::pll_parity(&c, &p2.low)
+            );
         }
     }
 
