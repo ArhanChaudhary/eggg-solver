@@ -595,7 +595,8 @@ impl<'a, 'r> Run<'a, 'r> {
         // Reductions are only worth producing if a phase 3 of 14 moves or more could still
         // beat the best solution (14 moves: ~2e-4 of random 3x3 states, but that level has
         // ~10x the reductions of the one below, and phase 3 checks them cheaply).
-        let cap = self.best_len().saturating_sub(15).min(64);
+        let margin: usize = std::env::var("EGGG_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
+        let cap = self.best_len().saturating_sub(margin).min(64);
         let mut t12 = self
             .cands
             .iter()
@@ -663,7 +664,7 @@ impl<'a, 'r> Run<'a, 'r> {
             let mut sols: Vec<Vec<u8>> = vec![];
             let mut keep = |p: &[u8]| {
                 sols.push(p.to_vec());
-                sols.len() < 64
+                sols.len() < std::env::var("EGGG_P2MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(64)
             };
             if t.p2.joint.is_some() {
                 srch.dfs_joint(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep);
