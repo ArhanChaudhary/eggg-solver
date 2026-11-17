@@ -142,6 +142,8 @@ pub struct Search3<'a> {
     pub nodes: u64,
     pub node_limit: u64,
     pub abort: Option<&'a AtomicBool>,
+    /// A second abort flag (another search of the same level found a solution).
+    pub abort_level: Option<&'a AtomicBool>,
     pub aborted: bool,
 }
 
@@ -154,6 +156,7 @@ impl<'a> Search3<'a> {
             nodes: 0,
             node_limit: u64::MAX,
             abort: None,
+            abort_level: None,
             aborted: false,
         }
     }
@@ -204,7 +207,9 @@ impl<'a> Search3<'a> {
             return false;
         }
         if self.nodes > self.node_limit
-            || (self.nodes & 4095 == 0 && self.abort.is_some_and(|a| a.load(Ordering::Relaxed)))
+            || (self.nodes & 4095 == 0
+                && (self.abort.is_some_and(|a| a.load(Ordering::Relaxed))
+                    || self.abort_level.is_some_and(|a| a.load(Ordering::Relaxed))))
         {
             self.aborted = true;
             return false;
