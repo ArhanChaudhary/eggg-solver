@@ -682,9 +682,19 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
 
     /// Search below `s` (exact staging distance `d`) for paths of exactly `left` more moves.
     pub fn dfs(&mut self, s: &P1State, d: u8, left: u8, last: usize) {
+        if self.t.big {
+            self.dfs_t::<true>(s, d, left, last)
+        } else {
+            self.dfs_t::<false>(s, d, left, last)
+        }
+    }
+
+    /// [`Search1::dfs`], for the large (`BIG`) or the small table.
+    fn dfs_t<const BIG: bool>(&mut self, s: &P1State, d: u8, left: u8, last: usize) {
+        let t = self.t;
         if left == 0 {
             if d == 0 {
-                let frames = self.t.endpoint_frames(s, last);
+                let frames = t.endpoint_frames(s, last);
                 if frames != 0 && !(self.on_endpoint)(&self.path, frames) {
                     self.stop = true;
                 }
@@ -704,9 +714,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 let m = allowed.trailing_zeros() as usize;
                 allowed &= allowed - 1;
                 self.nodes += 1;
-                let pos = self.t.wing_dst[m].gather(&s.pos);
+                let pos = t.wing_dst[m].gather(&s.pos);
                 let mut frames = 0u8;
-                for (f, fr) in self.t.frames.iter().enumerate() {
+                for (f, fr) in t.frames.iter().enumerate() {
                     if fr.p2_mask >> m & 1 == 0 && fr.wings_ok(&pos) {
                         frames |= 1 << f;
                     }
@@ -714,11 +724,11 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 if frames == 0 {
                     continue;
                 }
-                let c = s.apply(m, self.t);
-                if Mod3Table::decode(d, self.t.value(&c)) != 0 {
+                let c = s.apply(m, t);
+                if Mod3Table::decode(d, t.value(&c)) != 0 {
                     continue;
                 }
-                for (f, fr) in self.t.frames.iter().enumerate() {
+                for (f, fr) in t.frames.iter().enumerate() {
                     if frames >> f & 1 == 1 && !fr.centres_ok(&c.centres) {
                         frames &= !(1 << f);
                     }
@@ -735,21 +745,21 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             }
             return;
         }
-        // Stage 1: the children's centre masks, and a prefetch of their class info (small
-        // table) or table entry (large table); stage 2 (small table): table indices,
+        // Stage 1: the children's centre masks, and a prefetch of their table entry (large
+        // table) or class info (small table); stage 2 (small table): table indices,
         // prefetched; stage 3: in move order, descend into the children that can still reach
         // the goal. Only the table indices are kept: the few children descended into are
         // rebuilt from `s`.
         let mut idx = [0u64; N_MOVES];
         let mut nk = 0;
         let mut a = allowed;
-        if self.t.big {
+        if BIG {
             while a != 0 {
                 let m = a.trailing_zeros() as usize;
                 a &= a - 1;
-                let (ud, rl) = s.child_masks(m, self.t);
-                let i = self.t.staging.big_index(ud, rl);
-                self.t.table.prefetch(i);
+                let (ud, rl) = s.child_masks(m, t);
+                let i = t.staging.big_index(ud, rl);
+                t.table.prefetch(i);
                 idx[nk] = i;
                 nk += 1;
             }
@@ -759,16 +769,16 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             while a != 0 {
                 let m = a.trailing_zeros() as usize;
                 a &= a - 1;
-                let (ud, rl) = s.child_masks(m, self.t);
-                let p = self.t.staging.info(ud);
+                let (ud, rl) = s.child_masks(m, t);
+                let p = t.staging.info(ud);
                 crate::table::prefetch(p);
                 infos[nk] = p;
                 rls[nk] = rl;
                 nk += 1;
             }
             for k in 0..nk {
-                let i = self.t.staging.fast_index(unsafe { *infos[k] }, rls[k]);
-                self.t.table.prefetch(i);
+                let i = t.staging.fast_index(unsafe { *infos[k] }, rls[k]);
+                t.table.prefetch(i);
                 idx[k] = i;
             }
         }
@@ -780,27 +790,29 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             self.stop = true;
             return;
         }
+        // The exact distance of a child from its stored value.
+        let dec = [0, 1, 2, 3].map(|v| Mod3Table::decode(d, v));
         // With the large table, each value is read just before it is needed, so that the first
         // subtrees overlap the later children's table reads; the small table is mostly
         // cached, and reading all the values first is faster.
         let mut dcs = [0u8; N_MOVES];
-        if !self.t.big {
+        if !BIG {
             for k in 0..nk {
-                dcs[k] = Mod3Table::decode(d, self.t.table.get(idx[k]));
+                dcs[k] = dec[t.table.get(idx[k]) as usize];
             }
         }
         for k in 0..nk {
             let m = allowed.trailing_zeros() as usize;
             allowed &= allowed - 1;
-            let dc = if self.t.big {
-                Mod3Table::decode(d, self.t.table.get(idx[k]))
+            let dc = if BIG {
+                dec[t.table.get(idx[k]) as usize]
             } else {
                 dcs[k]
             };
             if dc < left {
-                let c = s.apply(m, self.t);
+                let c = s.apply(m, t);
                 self.path.push(m as u8);
-                self.dfs(&c, dc, left - 1, m);
+                self.dfs_t::<BIG>(&c, dc, left - 1, m);
                 self.path.pop();
                 if self.stop {
                     return;
