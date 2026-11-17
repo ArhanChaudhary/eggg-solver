@@ -193,6 +193,47 @@ fn par_jobs(n: usize, threads: usize, stop: &AtomicBool, work: impl Fn(usize) + 
     });
 }
 
+/// Phase-1 search below `srch.path` (state `st`, staging distance `d`, exactly `left` more
+/// moves), expanding the first `split` levels here so that the job can be cut short: once
+/// `close` is raised, each subtree not yet started at those levels is pushed to `spill` (as
+/// its move prefix) instead of being searched. The subtrees visited, and the endpoints found,
+/// are exactly those of `srch.dfs`.
+#[allow(clippy::too_many_arguments)]
+fn p1_run<F: FnMut(&[u8], u8) -> bool>(
+    srch: &mut Search1<'_, F>,
+    st: &P1State,
+    d: u8,
+    left: u8,
+    last: usize,
+    split: u8,
+    close: &AtomicBool,
+    spill: &mut Vec<Vec<u8>>,
+) {
+    if split == 0 || left <= 3 {
+        srch.dfs(st, d, left, last);
+        return;
+    }
+    let t = srch.t;
+    let mut allowed = ALLOWED_AFTER[last];
+    while allowed != 0 && !srch.stop {
+        let m = allowed.trailing_zeros() as usize;
+        allowed &= allowed - 1;
+        let c = st.apply(m, t);
+        let dc = Mod3Table::decode(d, t.value(&c));
+        srch.nodes += 1;
+        if dc >= left {
+            continue;
+        }
+        srch.path.push(m as u8);
+        if close.load(Ordering::Relaxed) {
+            spill.push(srch.path.clone());
+        } else {
+            p1_run(srch, &c, dc, left - 1, m, split - 1, close, spill);
+        }
+        srch.path.pop();
+    }
+}
+
 /// A phase-2 candidate from a phase-1 endpoint (None if its centres cannot be solved).
 fn make_candidate(t: &Tables, cube: &Cube, moves1: &[u8], frame: usize) -> Option<Candidate> {
     let mut c = *cube;
@@ -456,19 +497,30 @@ impl<'a, 'r> Run<'a, 'r> {
             let (root, d0, len, stop) = (self.root, self.d0, self.level.len, self.stop);
             let jobs = &self.level.jobs;
             let first = self.level.next;
+            let threads = self.threads;
             let claimed = AtomicUsize::new(first);
             let found = AtomicUsize::new(0);
             let nodes = AtomicU64::new(0);
+            // Raised when enough endpoints are found, or when a quarter of the threads have
+            // run out of jobs: running jobs then hand back their unstarted subtrees, so that no
+            // thread waits long for the slowest job.
+            let close = AtomicBool::new(false);
+            let idle = AtomicUsize::new(0);
             let out = Mutex::new(vec![]);
             std::thread::scope(|s| {
-                for _ in 0..self.threads {
+                for _ in 0..threads {
                     s.spawn(|| {
                         let mut local = vec![];
                         let mut n = 0;
-                        while !stop.load(Ordering::Relaxed) && found.load(Ordering::Relaxed) < need
-                        {
+                        loop {
+                            if stop.load(Ordering::Relaxed) || close.load(Ordering::Relaxed) {
+                                break;
+                            }
                             let j = claimed.fetch_add(1, Ordering::Relaxed);
                             if j >= jobs.len() {
+                                if (idle.fetch_add(1, Ordering::Relaxed) + 1) * 4 >= threads {
+                                    close.store(true, Ordering::Relaxed);
+                                }
                                 break;
                             }
                             let prefix = &jobs[j];
@@ -479,6 +531,7 @@ impl<'a, 'r> Run<'a, 'r> {
                                 d = Mod3Table::decode(d, t.value(&st));
                             }
                             let mut eps = vec![];
+                            let mut spill = vec![];
                             let mut srch = Search1::new(t, |p: &[u8], f| {
                                 eps.push((p.to_vec(), f));
                                 true
@@ -486,13 +539,14 @@ impl<'a, 'r> Run<'a, 'r> {
                             srch.abort = Some(stop);
                             srch.path.extend_from_slice(prefix);
                             let last = prefix.last().map(|&m| m as usize).unwrap_or(N_MOVES);
-                            srch.dfs(&st, d, len - prefix.len() as u8, last);
+                            let left = len - prefix.len() as u8;
+                            p1_run(&mut srch, &st, d, left, last, 2, &close, &mut spill);
                             n += srch.nodes;
-                            found.fetch_add(
-                                eps.iter().map(|e| e.1.count_ones() as usize).sum(),
-                                Ordering::Relaxed,
-                            );
-                            local.push((j, eps));
+                            let k: usize = eps.iter().map(|e| e.1.count_ones() as usize).sum();
+                            if found.fetch_add(k, Ordering::Relaxed) + k >= need {
+                                close.store(true, Ordering::Relaxed);
+                            }
+                            local.push((j, eps, spill));
                         }
                         nodes.fetch_add(n, Ordering::Relaxed);
                         out.lock().unwrap().extend(local);
@@ -500,13 +554,25 @@ impl<'a, 'r> Run<'a, 'r> {
                 }
             });
             self.stats.nodes1 += nodes.load(Ordering::Relaxed);
-            self.level.next = claimed.load(Ordering::Relaxed).min(jobs.len());
+            let next = claimed.load(Ordering::Relaxed).min(jobs.len());
             let mut results = out.into_inner().unwrap();
             results.sort_by_key(|r| r.0);
+            // Subtrees handed back go first, then the jobs not yet claimed.
+            let mut rest: Vec<Vec<u8>> = vec![];
+            for r in &mut results {
+                rest.append(&mut r.2);
+            }
+            if rest.is_empty() {
+                self.level.next = next;
+            } else {
+                rest.extend(self.level.jobs.drain(next..));
+                self.level.jobs = rest;
+                self.level.next = 0;
+            }
             // New (endpoint, frame) pairs, in job order; their candidates are made in
             // parallel (standardising and the phase-2 bounds cost ~30 us each).
             let mut todo: Vec<(Vec<u8>, usize)> = vec![];
-            for (_, eps) in results {
+            for (_, eps, _) in results {
                 for (moves, frames) in eps {
                     for f in 0..3 {
                         if frames >> f & 1 == 1 && self.seen_ep.insert((moves.clone(), f)) {
@@ -766,6 +832,50 @@ impl<'a, 'r> Run<'a, 'r> {
     }
 }
 
+/// Load or build the phase-1 tables in `dir`.
+pub fn load_p1(dir: &std::path::Path, threads: usize, verbose: bool) -> P1Tables {
+    let big = p1_big();
+    let (p1_name, p1_len) = if big {
+        ("p1-staging-big", crate::phase1::Staging::big_len())
+    } else {
+        ("p1-staging2", P1Tables::table_len())
+    };
+    let p1_path = dir.join(format!("{p1_name}.tab"));
+    let staging = crate::phase1::Staging::new();
+    let n = p1_len;
+    let mut table = Mod3Table {
+        data: crate::table::HugeBuf::zeroed(n.div_ceil(32)),
+        n: n as u64,
+    };
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            table.data.as_mut_slice().as_mut_ptr() as *mut u8,
+            table.data.byte_len(),
+        )
+    };
+    if crate::table::load(&p1_path, p1_name, bytes).is_err() {
+        if verbose {
+            eprintln!("generating phase-1 staging table ({p1_name})...");
+        }
+        let depths = if big {
+            staging.generate_big(threads)
+        } else {
+            staging.generate(threads)
+        };
+        table = Mod3Table::from_depths(&depths);
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                table.data.as_slice().as_ptr() as *const u8,
+                table.data.byte_len(),
+            )
+        };
+        crate::table::save(&p1_path, p1_name, bytes).expect("saving table");
+    }
+    let mut p1 = P1Tables::with_table(staging, table);
+    p1.big = big;
+    p1
+}
+
 /// Load or build all tables in `dir`.
 pub fn load_tables(dir: &std::path::Path, h48_k: u32, threads: usize, verbose: bool) -> Tables {
     load_tables_with(dir, h48_k, false, threads, verbose)
@@ -786,48 +896,7 @@ pub fn load_tables_with(
     verbose: bool,
 ) -> Tables {
     let t0 = Instant::now();
-    let big = p1_big();
-    let (p1_name, p1_len) = if big {
-        ("p1-staging-big", crate::phase1::Staging::big_len())
-    } else {
-        ("p1-staging2", P1Tables::table_len())
-    };
-    let p1_path = dir.join(format!("{p1_name}.tab"));
-    let p1 = {
-        let staging = crate::phase1::Staging::new();
-        let n = p1_len;
-        let mut table = Mod3Table {
-            data: crate::table::HugeBuf::zeroed(n.div_ceil(32)),
-            n: n as u64,
-        };
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                table.data.as_mut_slice().as_mut_ptr() as *mut u8,
-                table.data.byte_len(),
-            )
-        };
-        if crate::table::load(&p1_path, p1_name, bytes).is_err() {
-            if verbose {
-                eprintln!("generating phase-1 staging table ({p1_name})...");
-            }
-            let depths = if big {
-                staging.generate_big(threads)
-            } else {
-                staging.generate(threads)
-            };
-            table = Mod3Table::from_depths(&depths);
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    table.data.as_slice().as_ptr() as *const u8,
-                    table.data.byte_len(),
-                )
-            };
-            crate::table::save(&p1_path, p1_name, bytes).expect("saving table");
-        }
-        let mut p1 = P1Tables::with_table(staging, table);
-        p1.big = big;
-        p1
-    };
+    let p1 = load_p1(dir, threads, verbose);
     let p2_path = dir.join("p2-tau.tab");
     let p2 = {
         let n = crate::phase2::N_TAU;
@@ -898,4 +967,79 @@ pub fn load_tables_with(
         eprintln!("tables ready in {:.1} s", t0.elapsed().as_secs_f64());
     }
     Tables { p1, p2, p3 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    /// Jobs cut short at random points, with their handed-back subtrees searched later, find
+    /// exactly the endpoints of one uninterrupted search.
+    #[test]
+    fn split_jobs_find_the_same_endpoints() {
+        let t = load_p1(std::path::Path::new("tables"), 8, false);
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(7);
+        for scramble in 0..6 {
+            let mut cube = Cube::SOLVED;
+            for _ in 0..9 {
+                let m = rand::Rng::gen_range(&mut rng, 0..N_MOVES);
+                cube = cube.apply_perm(&MOVE_PERMS[m]);
+            }
+            let root = P1State::from_cube(&cube);
+            let d0 = t.distance(&root);
+            for len in d0.max(4)..d0.max(4) + 2 {
+                let mut want = vec![];
+                let mut srch = Search1::new(&t, |p: &[u8], f| {
+                    want.push((p.to_vec(), f));
+                    true
+                });
+                srch.dfs(&root, d0, len, N_MOVES);
+                drop(srch);
+                want.sort();
+
+                let mut got = vec![];
+                let mut queue: Vec<Vec<u8>> = vec![vec![]];
+                let mut count = 0usize;
+                while let Some(prefix) = queue.pop() {
+                    let close = AtomicBool::new(false);
+                    let mut st = root;
+                    let mut d = d0;
+                    for &m in &prefix {
+                        st = st.apply(m as usize, &t);
+                        d = Mod3Table::decode(d, t.value(&st));
+                    }
+                    let mut spill = vec![];
+                    let mut srch = Search1::new(&t, |p: &[u8], f| {
+                        got.push((p.to_vec(), f));
+                        count += 1;
+                        if count % 3 == scramble % 3 {
+                            close.store(true, Ordering::Relaxed);
+                        }
+                        true
+                    });
+                    srch.path.extend_from_slice(&prefix);
+                    let last = prefix.last().map(|&m| m as usize).unwrap_or(N_MOVES);
+                    p1_run(
+                        &mut srch,
+                        &st,
+                        d,
+                        len - prefix.len() as u8,
+                        last,
+                        2,
+                        &close,
+                        &mut spill,
+                    );
+                    drop(srch);
+                    queue.extend(spill);
+                }
+                got.sort();
+                assert!(
+                    !want.is_empty() || len == d0,
+                    "no endpoints at length {len}"
+                );
+                assert_eq!(got, want, "scramble {scramble}, length {len}");
+            }
+        }
+    }
 }
