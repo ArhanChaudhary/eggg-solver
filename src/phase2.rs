@@ -41,6 +41,8 @@ pub struct P2Tables {
     pub pl_inv: [[u8; 16]; 17],
     pub ph: [[u8; 16]; 17],
     pub tau_table: Mod3Table,
+    /// Optional joint table over tau, the U/D pattern and the PLL bit (much tighter).
+    pub joint: Option<crate::p2joint::Joint>,
 }
 
 fn orbit_mask(c: &Cube, pos: &[usize; 8], colour: u8) -> u8 {
@@ -124,6 +126,7 @@ impl P2Tables {
             centre_dist: vec![],
             pl_inv,
             ph,
+            joint: None,
             tau_table: Mod3Table {
                 data: crate::table::HugeBuf::zeroed(1),
                 n: 0,
@@ -142,6 +145,19 @@ impl P2Tables {
         t
     }
 
+    pub(crate) fn rank70(&self, mask: u8) -> u8 {
+        self.rank70[mask as usize]
+    }
+
+    pub(crate) fn unrank70(&self, r: u8) -> u8 {
+        self.unrank70[r as usize]
+    }
+
+    #[cfg(test)]
+    pub(crate) fn base_for_tests() -> P2Tables {
+        P2Tables::base()
+    }
+
     pub fn centre_coord_of(&self, c: &Cube) -> u32 {
         let ud = self.rank70[orbit_mask(c, &UD_POS, U as u8) as usize] as u32;
         let fb = self.rank70[orbit_mask(c, &FB_POS, F as u8) as usize] as u32;
@@ -154,7 +170,7 @@ impl P2Tables {
         ((ud * 70 + fb) * 12 + rl) * 2 + pll
     }
 
-    fn centre_cube(&self, coord: u32) -> Cube {
+    pub(crate) fn centre_cube(&self, coord: u32) -> Cube {
         let pll = coord % 2;
         let rl = (coord / 2 % 12) as usize;
         let fb = (coord / 24 % 70) as usize;
@@ -420,6 +436,69 @@ impl<'a> Search2<'a> {
             }
             self.path.push(m);
             let go = self.dfs(c2, &t2, d2, left - 1, m as usize, found);
+            self.path.pop();
+            if !go {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl<'a> Search2<'a> {
+    /// [`Search2::dfs`] with the joint table: `dj` is the exact joint distance.
+    pub fn dfs_joint(
+        &mut self,
+        cc: u32,
+        tau: &[u8; 16],
+        dj: u8,
+        left: u8,
+        last: usize,
+        found: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> bool {
+        if left == 0 {
+            if cc_is_goal(self.t, cc) && dj == 0 {
+                return found(&self.path);
+            }
+            return true;
+        }
+        let t = self.t;
+        let j = t.joint.as_ref().unwrap();
+        let allowed =
+            ALLOWED_AFTER[last] & PHASE2_MASK & if left == 1 { last_mask(last) } else { u32::MAX };
+        // Stage 1: children with the centre bound, joint entries prefetched.
+        let mut kids = [(0u32, [0u8; 16], 0usize, 0u8); 17];
+        let mut nk = 0;
+        for (i, &m) in P2_MOVES.iter().enumerate() {
+            if allowed >> m & 1 == 0 {
+                continue;
+            }
+            let c2 = t.centre_move[cc as usize][i];
+            if t.centre_dist[c2 as usize] >= left {
+                continue;
+            }
+            let t2 = t.tau_move(tau, i);
+            let idx = j.index(c2 / 1680, &t2, c2 & 1);
+            j.prefetch(idx);
+            kids[nk] = (c2, t2, idx, m);
+            nk += 1;
+        }
+        self.nodes += nk as u64;
+        if self
+            .abort
+            .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return false;
+        }
+        // Stage 2: read, decode, descend.
+        for k in 0..nk {
+            let (c2, t2, idx, m) = kids[k];
+            let d2 = Mod3Table::decode(dj, j.get(idx));
+            if d2 >= left {
+                continue;
+            }
+            self.path.push(m);
+            let go = self.dfs_joint(c2, &t2, d2, left - 1, m as usize, found);
             self.path.pop();
             if !go {
                 return false;

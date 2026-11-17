@@ -565,7 +565,10 @@ impl<'a, 'r> Run<'a, 'r> {
             return None;
         }
         let tau = t.p2.tau_of(&x);
-        let dt = t.p2.tau_distance(&tau);
+        let dt = match &t.p2.joint {
+            Some(j) => j.distance(&t.p2, centre / 1680, &tau, centre & 1),
+            None => t.p2.tau_distance(&tau),
+        };
         Some(Candidate {
             moves1: moves1.to_vec(),
             frame,
@@ -631,10 +634,15 @@ impl<'a, 'r> Run<'a, 'r> {
             let mut srch = Search2::new(&t.p2);
             srch.abort = Some(stop);
             let mut sols: Vec<Vec<u8>> = vec![];
-            srch.dfs(c.centre, &c.tau, c.dt, l2, last1, &mut |p: &[u8]| {
+            let mut keep = |p: &[u8]| {
                 sols.push(p.to_vec());
                 sols.len() < 4096
-            });
+            };
+            if t.p2.joint.is_some() {
+                srch.dfs_joint(c.centre, &c.tau, c.dt, l2, last1, &mut keep);
+            } else {
+                srch.dfs(c.centre, &c.tau, c.dt, l2, last1, &mut keep);
+            }
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
             let mut local = vec![];
             for p in sols {
@@ -752,6 +760,17 @@ impl<'a, 'r> Run<'a, 'r> {
 
 /// Load or build all tables in `dir`.
 pub fn load_tables(dir: &std::path::Path, h48_k: u32, threads: usize, verbose: bool) -> Tables {
+    load_tables_with(dir, h48_k, false, threads, verbose)
+}
+
+/// Load or build all tables in `dir`; `joint`: also the joint phase-2 table (2.1 GB).
+pub fn load_tables_with(
+    dir: &std::path::Path,
+    h48_k: u32,
+    joint: bool,
+    threads: usize,
+    verbose: bool,
+) -> Tables {
     let t0 = Instant::now();
     let p1_path = dir.join("p1-staging2.tab");
     let p1 = {
@@ -813,6 +832,32 @@ pub fn load_tables(dir: &std::path::Path, h48_k: u32, threads: usize, verbose: b
             t
         }
     };
+    let mut p2 = p2;
+    if joint {
+        let mut j = crate::p2joint::Joint::new(&p2);
+        let path = dir.join("p2-joint.tab");
+        j.table = crate::table::HugeBuf::zeroed(j.bytes() / 8);
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                j.table.as_mut_slice().as_mut_ptr() as *mut u8,
+                j.bytes(),
+            )
+        };
+        if crate::table::load(&path, "p2-joint", bytes).is_err() {
+            if verbose {
+                eprintln!(
+                    "generating the joint phase-2 table ({:.1} GB)...",
+                    j.bytes() as f64 / 1e9
+                );
+            }
+            j.generate(&p2, threads, verbose);
+            let bytes = unsafe {
+                std::slice::from_raw_parts(j.table.as_slice().as_ptr() as *const u8, j.bytes())
+            };
+            crate::table::save(&path, "p2-joint", bytes).expect("saving table");
+        }
+        p2.joint = Some(j);
+    }
     let p3 = P3Tables::load_or_build(dir, h48_k, threads, verbose);
     if verbose {
         eprintln!("tables ready in {:.1} s", t0.elapsed().as_secs_f64());
