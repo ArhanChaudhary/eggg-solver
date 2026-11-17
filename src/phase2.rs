@@ -556,8 +556,9 @@ impl<'a> Search2<'a> {
         let t = self.t;
         let j = t.joint.as_ref().unwrap();
         let allowed = after & PHASE2_MASK & if left == 1 { last_mask(last) } else { u32::MAX };
-        // Stage 1: children with the centre bound, joint entries (both views) prefetched.
-        let mut kids = [(0u32, [0u8; 16], 0usize, 0usize, 0u8); 17];
+        // Stage 1: children with the centre bound; the class-table entries of both views
+        // prefetched (the class table is 3.3 MB: without this, its misses stall every index).
+        let mut kids = [(0u32, [0u8; 16], [0u8; 16], 0usize, 0usize, 0u8); 17];
         let mut nk = 0;
         for (i, &m) in P2_MOVES.iter().enumerate() {
             if allowed >> m & 1 == 0 {
@@ -568,11 +569,12 @@ impl<'a> Search2<'a> {
                 continue;
             }
             let t2 = t.tau_move(tau, i);
-            let idx = j.index(c2 / 1680, &t2, c2 & 1);
-            j.prefetch(idx);
-            let idf = j.index_fb(c2, &t2);
-            j.prefetch(idf);
-            kids[nk] = (c2, t2, idx, idf, m);
+            let ru = j.raw(c2 / 1680, &t2);
+            j.prefetch_cls(ru);
+            let (uv, tv) = j.fb.map(c2, &t2);
+            let rf = j.raw(uv, &tv);
+            j.prefetch_cls(rf);
+            kids[nk] = (c2, t2, tv, ru, rf, m);
             nk += 1;
         }
         self.nodes += nk as u64;
@@ -582,9 +584,20 @@ impl<'a> Search2<'a> {
         {
             return false;
         }
-        // Stage 2: read, decode, descend.
+        // Stage 2: table indices, entries prefetched.
+        let mut idx = [(0usize, 0usize); 17];
         for k in 0..nk {
-            let (c2, t2, idx, idf, m) = kids[k];
+            let (c2, t2, tv, ru, rf, _) = kids[k];
+            let a = j.index_raw(ru, &t2, c2 & 1);
+            j.prefetch(a);
+            let b = j.index_raw(rf, &tv, c2 & 1);
+            j.prefetch(b);
+            idx[k] = (a, b);
+        }
+        // Stage 3: read, decode, descend.
+        for k in 0..nk {
+            let (c2, t2, _, _, _, m) = kids[k];
+            let (idx, idf) = idx[k];
             let d2 = Mod3Table::decode(dj, j.get(idx));
             if d2 >= left {
                 continue;

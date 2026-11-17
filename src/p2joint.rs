@@ -388,7 +388,26 @@ impl Joint {
     /// Table index (one stabiliser variant; the table holds the same value in all of them).
     #[inline(always)]
     pub fn index(&self, ud: u32, tau: &[u8; 16], pll: u32) -> usize {
-        let c = self.cls[ud as usize * N_PREFIX + prefix_rank(tau)];
+        self.index_raw(self.raw(ud, tau), tau, pll)
+    }
+
+    /// The class-table position of (U/D pattern, tau): the first step of [`Joint::index`],
+    /// so that a search can prefetch the class entries (3.3 MB, mostly cache misses) of all
+    /// children before computing their table indices.
+    #[inline(always)]
+    pub fn raw(&self, ud: u32, tau: &[u8; 16]) -> usize {
+        ud as usize * N_PREFIX + prefix_rank(tau)
+    }
+
+    #[inline(always)]
+    pub fn prefetch_cls(&self, raw: usize) {
+        crate::table::prefetch(unsafe { self.cls.as_ptr().add(raw) });
+    }
+
+    /// [`Joint::index`] from the class-table position.
+    #[inline(always)]
+    pub fn index_raw(&self, raw: usize, tau: &[u8; 16], pll: u32) -> usize {
+        let c = self.cls[raw];
         let s = (c & 7) as usize;
         let r = if s == 0 {
             rest_rank(tau)
