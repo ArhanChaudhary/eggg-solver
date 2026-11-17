@@ -427,15 +427,16 @@ impl<'a, 'r> Run<'a, 'r> {
             // whole pool are cheap; deep ones wait for a bigger pool).
             let t1 = Instant::now();
             let budget =
-                (produce.mul_f64(1.5).saturating_sub(check)).max(Duration::from_millis(10));
+                (produce.mul_f64(std::env::var("EGGG_P3F").ok().and_then(|v| v.parse().ok()).unwrap_or(1.5)).saturating_sub(check)).max(Duration::from_millis(10));
             self.phase3_levels(t1 + budget);
             self.stats.time[2] += t1.elapsed();
             check += t1.elapsed();
             if self.stopped() || self.level.len > 40 {
                 return;
             }
-            want1 *= 2;
-            want2 *= 2;
+            let g: usize = std::env::var("EGGG_GROW").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+            want1 *= g;
+            want2 *= g;
         }
     }
 
