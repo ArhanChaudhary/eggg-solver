@@ -37,10 +37,10 @@ the default, `auto`, takes the largest tier that fits in a third of the physical
 | `tiny` | h48 h0 | 0.16 GB |
 | `small` | h48 h3 | 0.35 GB |
 | `medium` | h48 h5, joint phase 2 | 2.3 GB |
-| `large` | h48 h6, joint phase 2, large phase 1 | 4.2 GB |
-| `huge` | h48 h7, joint phase 2, large phase 1 | 6.1 GB |
-| `xl` | h48 h9, joint phase 2, large phase 1 | 17.5 GB |
-| `xxl` | h48 h11 (the largest), joint phase 2, large phase 1 | 63 GB |
+| `large` | h48 h6, joint phase 2, large phase 1 + move masks | 5.0 GB |
+| `huge` | h48 h7, joint phase 2, large phase 1 + move masks | 6.9 GB |
+| `xl` | h48 h9, joint phase 2, large phase 1 + move masks | 18.3 GB |
+| `xxl` | h48 h11 (the largest), joint phase 2, large phase 1 + move masks | 64 GB |
 
 The tables: phase-1 centre staging (symmetry-reduced, 25 MB; `--p1-big`: 1.2 GB without the
 reduction, faster lookups), phase-2 pairing permutation (60 MB; `--p2-joint`: the joint
@@ -49,6 +49,18 @@ pairing x U/D centres x PLL parity table, 1.05 GB, far fewer phase-2 nodes), pha
 The larger phase-3 tables matter most with few threads, where phase 3 is a large share of
 the time (one thread: first solution after 6.2 s with `huge`, 1.4 s with `xl`, 0.5 s with
 `xxl`, on average); with many threads phase 1 dominates.
+
+Phase-1 move masks (same phase-1 endpoints, fewer table reads; see `src/p1mask.rs`): the
+reduced move-mask table (0.8 GB, generated in seconds; on by default in the tiers with the
+large phase-1 table, `--p1-mask none` to turn it off) stores, per staging state, the moves
+that decrease the staging distance: deep in the tree almost every node is at distance =
+moves left, and then one read of its mask replaces ~20 reads of its children; such nodes are
+expanded in batches with the masks prefetched a round ahead (10x fewer reads in all; phase 1
+5x faster on the M2). `--p1-mask big` is the same without the symmetry reduction (18.9 GB).
+Experimental (see `src/p1pat.rs`): `--p1-pat small|big` (0.9 / 41 GB) runs one phase-1 search
+per colour pair, pruned by the distance to staged centres with that pair in a pattern phase
+2 can solve (0.53x reads, 1.4x faster on the M2); with `--p1-mask` too, the pair searches use
+masks of that distance (17.5 GB).
 
 ## How it works
 

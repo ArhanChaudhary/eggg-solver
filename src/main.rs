@@ -87,14 +87,14 @@ enum Tier {
     Small,
     /// ~2.3 GB: h48 h5 and the joint phase-2 table.
     Medium,
-    /// ~4.2 GB: h48 h6, the joint phase-2 table and the large phase-1 table.
+    /// ~5.0 GB: h48 h6, the joint phase-2 table and the large phase-1 table.
     Large,
-    /// ~6.1 GB: h48 h7, the joint phase-2 table and the large phase-1 table.
+    /// ~6.9 GB: h48 h7, the joint phase-2 table and the large phase-1 table.
     Huge,
-    /// ~17.5 GB: h48 h9, the joint phase-2 table and the large phase-1 table (phase 3 3.6x
+    /// ~18.3 GB: h48 h9, the joint phase-2 table and the large phase-1 table (phase 3 3.6x
     /// faster than huge; single-threaded first solutions ~4x sooner).
     Xl,
-    /// ~63 GB: h48 h11 (the largest), the joint phase-2 table and the large phase-1 table
+    /// ~64 GB: h48 h11 (the largest), the joint phase-2 table and the large phase-1 table
     /// (phase 3 11x faster than huge; single-threaded first solutions ~12x sooner).
     Xxl,
 }
@@ -106,10 +106,10 @@ impl Tier {
             Tier::Tiny => (0, false, false, 0.16e9),
             Tier::Small => (3, false, false, 0.35e9),
             Tier::Medium => (5, true, false, 2.3e9),
-            Tier::Large => (6, true, true, 4.2e9),
-            Tier::Huge | Tier::Auto => (7, true, true, 6.1e9),
-            Tier::Xl => (9, true, true, 17.5e9),
-            Tier::Xxl => (11, true, true, 63.1e9),
+            Tier::Large => (6, true, true, 5.0e9),
+            Tier::Huge | Tier::Auto => (7, true, true, 6.9e9),
+            Tier::Xl => (9, true, true, 18.3e9),
+            Tier::Xxl => (11, true, true, 63.9e9),
         }
     }
 
@@ -162,6 +162,25 @@ struct TableArgs {
     /// whatever the tier.
     #[arg(long)]
     p1_big: bool,
+    /// Phase-1 pattern table (searches per colour pair, pruned by the distance to staged
+    /// centres with the pair in a pattern phase 2 can solve): none, the symmetry-reduced one
+    /// (0.9 GB) or the large one (41 GB).
+    #[arg(long, value_enum)]
+    p1_pat: Option<PatArg>,
+    /// Phase-1 move-mask table (the distance-decreasing moves of each staging state; nodes
+    /// at distance = moves left read one mask instead of ~20 child entries): none, the
+    /// symmetry-reduced one (0.8 GB; the default in the tiers with the large phase-1 table)
+    /// or the large one (18.9 GB). Implies --p1-big. With --p1-pat: the pair table instead
+    /// (pattern-distance-decreasing moves, 17.5 GB).
+    #[arg(long, value_enum)]
+    p1_mask: Option<PatArg>,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+enum PatArg {
+    None,
+    Small,
+    Big,
 }
 
 impl TableArgs {
@@ -185,7 +204,50 @@ impl TableArgs {
                 self.tier.resolve(&self.dir())
             );
         }
-        load_tables_with(&self.dir(), k, joint, big, threads, verbose)
+        let pat = match self.p1_pat {
+            None | Some(PatArg::None) => None,
+            Some(PatArg::Small) => Some(false),
+            Some(PatArg::Big) => Some(true),
+        };
+        if verbose && let Some(b) = pat {
+            eprintln!(
+                "phase-1 pattern table: {}",
+                if b {
+                    "large (41 GB)"
+                } else {
+                    "reduced (0.9 GB)"
+                }
+            );
+        }
+        let mask = match self.p1_mask {
+            Some(PatArg::None) => None,
+            Some(PatArg::Small) => Some(false),
+            Some(PatArg::Big) => Some(true),
+            // The tiers with the large phase-1 table also use the reduced move-mask table
+            // (0.8 GB; phase 1 ~5x faster with the same endpoints), unless a pattern table
+            // is asked for (that combination selects the 17.5 GB pair-mask table).
+            None if pat.is_none() && self.config().2 => Some(false),
+            None => None,
+        };
+        if verbose && let Some(b) = mask {
+            eprintln!(
+                "phase-1 move-mask table: {}",
+                if b {
+                    "large (18.9 GB)"
+                } else {
+                    "reduced (0.8 GB)"
+                }
+            );
+        }
+        load_tables_with(
+            &self.dir(),
+            k,
+            joint,
+            big || mask.is_some(),
+            (pat, mask),
+            threads,
+            verbose,
+        )
     }
 
     fn dir(&self) -> PathBuf {
