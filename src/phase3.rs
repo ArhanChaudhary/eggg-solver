@@ -186,7 +186,7 @@ impl P3Tables {
     /// Stages 0 and 1 of the search at an internal node (`left >= 2`; see [`Search3::dfs`]):
     /// the children within the corner bounds, with their table entries prefetched.
     #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
+    #[inline(never)]
     fn expand(
         &self,
         n: &Node,
