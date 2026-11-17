@@ -599,13 +599,13 @@ impl<'a, 'r> Run<'a, 'r> {
         // margin goes from 15 to 13 as the run gets longer (phases 2 and 3 are then cheap
         // next to phase 1). Measured on 20 positions x 30 s: 39.3 -> 39.0 moves.
         let elapsed = self.start.elapsed().as_secs_f64();
-        let margin = if elapsed < 3.0 {
-            15
-        } else if elapsed < 6.0 {
-            14
-        } else {
-            13
-        };
+        // EGGG_MARGINS="t1,t2,t3": margin 15 before t1, 14 before t2, 13 before t3, then 12.
+        let ts: Vec<f64> = std::env::var("EGGG_MARGINS")
+            .unwrap_or_else(|_| "3,6,1e9".into())
+            .split(',')
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        let margin = 15 - ts.iter().filter(|&&t| elapsed >= t).count();
         let cap = self.best_len().saturating_sub(margin).min(64);
         let mut t12 = self
             .cands
@@ -695,14 +695,14 @@ impl<'a, 'r> Run<'a, 'r> {
                 let Some(c3) = Cube3::from_reduced(&x) else {
                     continue;
                 };
-                let mut moves12 = c.moves1.clone();
-                moves12.extend(p.iter().map(|&m| rotate_move(m as usize, &rot_inv) as u8));
-                let h3 = Search3::new(&t.p3).lower_bound(&c3);
+                let h3 = t.p3.lower_bound(&c3);
                 // A reduction whose phase 3 cannot beat the best solution never will (the
                 // best only gets shorter): most of the deep levels' reductions.
-                if moves12.len() + h3 as usize >= best {
+                if c.moves1.len() + p.len() + h3 as usize >= best {
                     continue;
                 }
+                let mut moves12 = c.moves1.clone();
+                moves12.extend(p.iter().map(|&m| rotate_move(m as usize, &rot_inv) as u8));
                 local.push(Reduction {
                     moves12,
                     len1: c.moves1.len(),
