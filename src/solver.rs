@@ -47,7 +47,13 @@ pub struct Options {
     pub endpoints: usize,
     /// Reductions collected in the first round (doubled each round).
     pub reductions: usize,
+    /// Phase-2 cap schedule: (from this many seconds, margin); phase 2 produces reductions
+    /// up to L12 = best - margin. Sorted by time.
+    pub margins: Vec<(f64, usize)>,
 }
+
+/// The default phase-2 cap schedule (see `Run::phase2`).
+pub const DEFAULT_MARGINS: [(f64, usize); 3] = [(0.0, 15), (3.0, 14), (6.0, 13)];
 
 impl Default for Options {
     fn default() -> Self {
@@ -58,6 +64,7 @@ impl Default for Options {
             threads: crate::par::threads(),
             endpoints: 128,
             reductions: 32,
+            margins: DEFAULT_MARGINS.to_vec(),
         }
     }
 }
@@ -320,6 +327,7 @@ struct Run<'a, 'r> {
     cands: Vec<Candidate>,
     reds: Vec<Reduction>,
     red_index: HashMap<(usize, Cube3), usize>,
+    margins: Vec<(f64, usize)>,
 }
 
 impl<'a> Solver<'a> {
@@ -352,6 +360,7 @@ impl<'a> Solver<'a> {
         let root = P1State::from_cube(cube);
         let d0 = self.t.p1.distance(&root);
         let mut run = Run {
+            margins: self.opts.margins.clone(),
             t: self.t,
             cube: *cube,
             threads,
@@ -631,13 +640,12 @@ impl<'a, 'r> Run<'a, 'r> {
         // margin goes from 15 to 13 as the run gets longer (phases 2 and 3 are then cheap
         // next to phase 1). Measured on 20 positions x 30 s: 39.3 -> 39.0 moves.
         let elapsed = self.start.elapsed().as_secs_f64();
-        let margin = if elapsed < 3.0 {
-            15
-        } else if elapsed < 6.0 {
-            14
-        } else {
-            13
-        };
+        let margin = self
+            .margins
+            .iter()
+            .take_while(|m| m.0 <= elapsed)
+            .last()
+            .map_or(DEFAULT_MARGINS[0].1, |m| m.1);
         let cap = self.best_len().saturating_sub(margin).min(64);
         let mut t12 = self
             .cands

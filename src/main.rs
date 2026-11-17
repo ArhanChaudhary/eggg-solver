@@ -232,6 +232,27 @@ struct SearchArgs {
     /// Reductions collected in the first round (doubled each round).
     #[arg(long, default_value_t = Options::default().reductions)]
     reductions: usize,
+    /// Phase-2 cap schedule, SECONDS:MARGIN,...: from each time on, phase 2 produces
+    /// reductions up to (best length - MARGIN) moves.
+    #[arg(long, value_name = "SCHEDULE", value_parser = parse_margins, default_value = "0:15,3:14,6:13")]
+    margins: Margins,
+}
+
+#[derive(Clone, Debug)]
+struct Margins(Vec<(f64, usize)>);
+
+fn parse_margins(s: &str) -> Result<Margins, String> {
+    let mut v = vec![];
+    for part in s.split(',') {
+        let (t, m) = part
+            .split_once(':')
+            .ok_or_else(|| format!("expected SECONDS:MARGIN, got {part:?}"))?;
+        let t: f64 = t.trim().parse().map_err(|e| format!("{t:?}: {e}"))?;
+        let m: usize = m.trim().parse().map_err(|e| format!("{m:?}: {e}"))?;
+        v.push((t, m));
+    }
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    Ok(Margins(v))
 }
 
 #[derive(Args, Clone)]
@@ -373,6 +394,7 @@ fn options(limits: &LimitArgs, search: &SearchArgs, threads: usize) -> Options {
         threads,
         endpoints: search.endpoints,
         reductions: search.reductions,
+        margins: search.margins.0.clone(),
     }
 }
 
