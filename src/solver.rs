@@ -597,9 +597,10 @@ impl<'a, 'r> Run<'a, 'r> {
 
     /// Phase 2, level by level on the reduction length, until `want` reductions in total.
     fn phase2(&mut self, want: usize) {
-        // Reductions are only worth producing if a phase 3 of 15 moves or more could still
-        // beat the best solution.
-        let cap = self.best_len().saturating_sub(16).min(64);
+        // Reductions are only worth producing if a phase 3 of 14 moves or more could still
+        // beat the best solution (14 moves: ~2e-4 of random 3x3 states, but that level has
+        // ~10x the reductions of the one below, and phase 3 checks them cheaply).
+        let cap = self.best_len().saturating_sub(15).min(64);
         let mut t12 = self
             .cands
             .iter()
