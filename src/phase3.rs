@@ -92,6 +92,35 @@ struct Kid {
     hy: u8,
 }
 
+/// The children of an internal node (`left >= 2`) after stages 0 and 1 of the search: those
+/// within the corner bounds, their table entries prefetched.
+struct Expansion {
+    kids: [std::mem::MaybeUninit<Kid>; 18],
+    nk: usize,
+    /// Children generated (all the allowed moves: the node counter's increment).
+    generated: u64,
+    /// The children extend the back side.
+    back: bool,
+}
+
+impl Expansion {
+    #[inline(always)]
+    fn new() -> Expansion {
+        Expansion {
+            kids: [const { std::mem::MaybeUninit::uninit() }; 18],
+            nk: 0,
+            generated: 0,
+            back: false,
+        }
+    }
+
+    #[inline(always)]
+    fn kid(&self, i: usize) -> &Kid {
+        debug_assert!(i < self.nk);
+        unsafe { self.kids.get_unchecked(i).assume_init_ref() }
+    }
+}
+
 impl P3Tables {
     /// (corner-class distance, h48 index) of a cube.
     #[inline(always)]
@@ -126,6 +155,163 @@ impl P3Tables {
     fn bound(&self, v: &C3) -> u8 {
         let (a, i) = self.probe(v);
         a.max(self.h48.value(i))
+    }
+
+    /// The first child from `i` on within bound `r` (its index and bounds), reading its table
+    /// entries.
+    #[inline(always)]
+    fn survivor(&self, e: &Expansion, mut i: usize, r: u8) -> Option<(usize, u8, u8)> {
+        while i < e.nk {
+            let k = e.kid(i);
+            let cv = if k.iv == KNOWN {
+                k.hv
+            } else {
+                self.h48.value(k.iv).max(k.hv)
+            };
+            if cv <= r {
+                let cy = if k.iy == KNOWN {
+                    k.hy
+                } else {
+                    self.h48.value(k.iy).max(k.hy)
+                };
+                if cy <= r {
+                    return Some((i, cv, cy));
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Stages 0 and 1 of the search at an internal node (`left >= 2`; see [`Search3::dfs`]):
+    /// the children within the corner bounds, with their table entries prefetched.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn expand(
+        &self,
+        n: &Node,
+        left: u8,
+        last_f: usize,
+        last_b: usize,
+        hv: u8,
+        hy: u8,
+        e: &mut Expansion,
+    ) {
+        let t = self;
+        let outer = (1u32 << N_MOVES3) - 1;
+        let tight = hv == left || hy == left;
+        let back = hv == left && hy != left;
+        e.back = back;
+        e.generated = 0;
+        let mut nk = 0;
+        // Stage 0: children, and a prefetch of the cocsep entries of the side that moved on the
+        // right and (once per face, see below) of the other side.
+        let mut pre: [std::mem::MaybeUninit<(Node, u8, u32, u32)>; 18] =
+            [const { std::mem::MaybeUninit::uninit() }; 18];
+        let mut np = 0;
+        let mut allowed = if back {
+            ALLOWED_BEFORE[last_b]
+        } else {
+            ALLOWED_AFTER[last_f]
+        } & outer
+            & if tight { QUARTER } else { u32::MAX };
+        while allowed != 0 {
+            let face = allowed.trailing_zeros() / 3;
+            let fm = allowed >> (face * 3) & 7;
+            allowed &= !(7 << (face * 3));
+            // The side not moved by a turn of this face gets the same coset for X and X'
+            // (X2 is in the target group), and its parent's for X2.
+            let mut twin_ci = u32::MAX;
+            for pw in 0..3 {
+                if fm >> pw & 1 == 0 {
+                    continue;
+                }
+                let m = (face * 3 + pw) as usize;
+                e.generated += 1;
+                let node = if back {
+                    let b = &t.fast.moves[crate::moves::inverse_move(m)];
+                    Node {
+                        v: n.v.apply_inv_c(b),
+                        y: n.y.apply_c(b),
+                    }
+                } else {
+                    let c = &t.fast.moves[m];
+                    Node {
+                        v: n.v.apply_c(c),
+                        y: n.y.apply_inv_c(c),
+                    }
+                };
+                // `own`: the side that moved on the right (its coset changes); `other` moved
+                // on the left.
+                let (own, other) = if back {
+                    (&node.y, &node.v)
+                } else {
+                    (&node.v, &node.y)
+                };
+                let ci = t.fast.cocsep(own) as u32;
+                crate::table::prefetch(t.cocsep_ptr(ci as usize));
+                if pw != 1 && twin_ci == u32::MAX {
+                    twin_ci = t.fast.cocsep(other) as u32;
+                    crate::table::prefetch(t.cocsep_ptr(twin_ci as usize));
+                }
+                debug_assert!(np < 18);
+                unsafe { pre.get_unchecked_mut(np) }.write((
+                    node,
+                    m as u8,
+                    ci,
+                    if pw == 1 { u32::MAX } else { twin_ci },
+                ));
+                np += 1;
+            }
+        }
+        // Stage 1: corner-class bounds, table indices, prefetch of the table entries.
+        let mut twin: (u32, u8, usize) = (u32::MAX, 0, 0);
+        for p in pre.iter().take(np) {
+            let (node, m, ci, xci) = unsafe { p.assume_init_ref() };
+            let (node, m) = (*node, *m as usize);
+            let (own, other) = if back {
+                (&node.y, &node.v)
+            } else {
+                (&node.v, &node.y)
+            };
+            let (oc, oi) = t.probe_at(own, *ci as usize);
+            if oc >= left {
+                continue;
+            }
+            let (xc, xi, xh) = if *xci == u32::MAX {
+                (0, KNOWN, if back { hv } else { hy })
+            } else {
+                // The two quarter turns of a face share the other side's probe.
+                if twin.0 != (m / 3) as u32 {
+                    let (c, i) = t.probe_at(other, *xci as usize);
+                    twin = ((m / 3) as u32, c, i);
+                }
+                (twin.1, twin.2, 0)
+            };
+            if xc >= left || xh >= left {
+                continue;
+            }
+            t.h48.prefetch(oi);
+            if xi != KNOWN {
+                t.h48.prefetch(xi);
+            }
+            let (iv, iy, hv0, hy0) = if back {
+                (xi, oi, xc.max(xh), oc)
+            } else {
+                (oi, xi, oc, xc.max(xh))
+            };
+            debug_assert!(nk < 18);
+            unsafe { e.kids.get_unchecked_mut(nk) }.write(Kid {
+                node,
+                m: m as u8,
+                iv,
+                iy,
+                hv: hv0,
+                hy: hy0,
+            });
+            nk += 1;
+        }
+        e.nk = nk;
     }
 }
 
@@ -262,6 +448,21 @@ impl<'a> Search3<'a> {
     /// group contains the half turns), a tight bound on the inverse that its first move is: so
     /// the search extends the side whose next move is restricted.
     fn dfs(&mut self, n: &Node, left: u8, last_f: usize, last_b: usize, hv: u8, hy: u8) -> bool {
+        self.dfs_pre(n, left, last_f, last_b, hv, hy, None)
+    }
+
+    /// [`Search3::dfs`], given the node's expansion if it was computed ahead.
+    #[allow(clippy::too_many_arguments)]
+    fn dfs_pre(
+        &mut self,
+        n: &Node,
+        left: u8,
+        last_f: usize,
+        last_b: usize,
+        hv: u8,
+        hy: u8,
+        pre: Option<&Expansion>,
+    ) -> bool {
         if self.aborted {
             return false;
         }
@@ -273,10 +474,9 @@ impl<'a> Search3<'a> {
             return false;
         }
         let t = self.t;
-        let outer = (1u32 << N_MOVES3) - 1;
-        let tight = hv == left || hy == left;
-        let back = hv == left && hy != left;
         if left == 1 {
+            let outer = (1u32 << N_MOVES3) - 1;
+            let tight = hv == left || hy == left;
             let mut allowed = ALLOWED_AFTER[last_f]
                 & ALLOWED_BEFORE[last_b]
                 & outer
@@ -292,136 +492,30 @@ impl<'a> Search3<'a> {
             }
             return false;
         }
-        let mut kids: [std::mem::MaybeUninit<Kid>; 18] =
-            [const { std::mem::MaybeUninit::uninit() }; 18];
-        let mut nk = 0;
-        // Stage 0: children, and a prefetch of the cocsep entries of the side that moved on the
-        // right and (once per face, see below) of the other side.
-        let mut pre: [std::mem::MaybeUninit<(Node, u8, u32, u32)>; 18] =
-            [const { std::mem::MaybeUninit::uninit() }; 18];
-        let mut np = 0;
-        let mut allowed = if back {
-            ALLOWED_BEFORE[last_b]
-        } else {
-            ALLOWED_AFTER[last_f]
-        } & outer
-            & if tight { QUARTER } else { u32::MAX };
-        while allowed != 0 {
-            let face = allowed.trailing_zeros() / 3;
-            let fm = allowed >> (face * 3) & 7;
-            allowed &= !(7 << (face * 3));
-            // The side not moved by a turn of this face gets the same coset for X and X'
-            // (X2 is in the target group), and its parent's for X2.
-            let mut twin_ci = u32::MAX;
-            for pw in 0..3 {
-                if fm >> pw & 1 == 0 {
-                    continue;
-                }
-                let m = (face * 3 + pw) as usize;
-                self.nodes += 1;
-                let node = if back {
-                    let b = &t.fast.moves[crate::moves::inverse_move(m)];
-                    Node {
-                        v: n.v.apply_inv_c(b),
-                        y: n.y.apply_c(b),
-                    }
-                } else {
-                    let c = &t.fast.moves[m];
-                    Node {
-                        v: n.v.apply_c(c),
-                        y: n.y.apply_inv_c(c),
-                    }
-                };
-                // `own`: the side that moved on the right (its coset changes); `other` moved
-                // on the left.
-                let (own, other) = if back {
-                    (&node.y, &node.v)
-                } else {
-                    (&node.v, &node.y)
-                };
-                let ci = t.fast.cocsep(own) as u32;
-                crate::table::prefetch(t.cocsep_ptr(ci as usize));
-                if pw != 1 && twin_ci == u32::MAX {
-                    twin_ci = t.fast.cocsep(other) as u32;
-                    crate::table::prefetch(t.cocsep_ptr(twin_ci as usize));
-                }
-                debug_assert!(np < 18);
-                unsafe { pre.get_unchecked_mut(np) }.write((
-                    node,
-                    m as u8,
-                    ci,
-                    if pw == 1 { u32::MAX } else { twin_ci },
-                ));
-                np += 1;
+        let mut local = Expansion::new();
+        let e = match pre {
+            Some(e) => e,
+            None => {
+                t.expand(n, left, last_f, last_b, hv, hy, &mut local);
+                &local
             }
-        }
-        // Stage 1: corner-class bounds, table indices, prefetch of the table entries.
-        let mut twin: (u32, u8, usize) = (u32::MAX, 0, 0);
-        for p in pre.iter().take(np) {
-            let (node, m, ci, xci) = unsafe { p.assume_init_ref() };
-            let (node, m) = (*node, *m as usize);
-            let (own, other) = if back {
-                (&node.y, &node.v)
-            } else {
-                (&node.v, &node.y)
-            };
-            let (oc, oi) = t.probe_at(own, *ci as usize);
-            if oc >= left {
-                continue;
-            }
-            let (xc, xi, xh) = if *xci == u32::MAX {
-                (0, KNOWN, if back { hv } else { hy })
-            } else {
-                // The two quarter turns of a face share the other side's probe.
-                if twin.0 != (m / 3) as u32 {
-                    let (c, i) = t.probe_at(other, *xci as usize);
-                    twin = ((m / 3) as u32, c, i);
-                }
-                (twin.1, twin.2, 0)
-            };
-            if xc >= left || xh >= left {
-                continue;
-            }
-            t.h48.prefetch(oi);
-            if xi != KNOWN {
-                t.h48.prefetch(xi);
-            }
-            let (iv, iy, hv0, hy0) = if back {
-                (xi, oi, xc.max(xh), oc)
-            } else {
-                (oi, xi, oc, xc.max(xh))
-            };
-            kids[nk].write(Kid {
-                node,
-                m: m as u8,
-                iv,
-                iy,
-                hv: hv0,
-                hy: hy0,
-            });
-            nk += 1;
-        }
-        // Stage 2: read the bounds and descend.
+        };
+        // (Counted here, not when expanded ahead: the counts, and so the abort checks, are
+        // those of a plain depth-first search.)
+        self.nodes += e.generated;
+        let back = e.back;
+        // Stage 2: read the bounds and descend. Before descending into a child, the next child
+        // to descend into is expanded, so that its table reads overlap this child's subtree.
         let r = left - 1;
         let back_side = back;
-        for k in kids.iter().take(nk) {
-            let k = unsafe { k.assume_init_ref() };
-            let cv = if k.iv == KNOWN {
-                k.hv
-            } else {
-                t.h48.value(k.iv).max(k.hv)
-            };
-            if cv > r {
-                continue;
-            }
-            let cy = if k.iy == KNOWN {
-                k.hy
-            } else {
-                t.h48.value(k.iy).max(k.hy)
-            };
-            if cy > r {
-                continue;
-            }
+        let ahead = r >= 2 && !matches!(&self.collect, Some((root, _)) if *root == left);
+        let mut slots = [Expansion::new(), Expansion::new()];
+        // The slot holding the expansion of the next child to descend into, if computed.
+        let mut ready: Option<usize> = None;
+        let mut next = t.survivor(e, 0, r);
+        while let Some((i, cv, cy)) = next {
+            let k = e.kid(i);
+            next = t.survivor(e, i + 1, r);
             if let Some((root, tasks)) = &mut self.collect
                 && *root == left
             {
@@ -448,13 +542,36 @@ impl<'a> Search3<'a> {
                 });
                 continue;
             }
-            let found = if back {
+            let (lf, lb) = if back {
+                (last_f, k.m as usize)
+            } else {
+                (k.m as usize, last_b)
+            };
+            let mine = if ahead {
+                let sl = ready.unwrap_or_else(|| {
+                    t.expand(&k.node, r, lf, lb, cv, cy, &mut slots[0]);
+                    0
+                });
+                ready = next.map(|(j, cvj, cyj)| {
+                    let kj = e.kid(j);
+                    let (lfj, lbj) = if back {
+                        (last_f, kj.m as usize)
+                    } else {
+                        (kj.m as usize, last_b)
+                    };
+                    t.expand(&kj.node, r, lfj, lbj, cvj, cyj, &mut slots[1 - sl]);
+                    1 - sl
+                });
+                Some(&slots[sl])
+            } else {
+                None
+            };
+            if back {
                 self.back.push(k.m);
-                self.dfs(&k.node, r, last_f, k.m as usize, cv, cy)
             } else {
                 self.front.push(k.m);
-                self.dfs(&k.node, r, k.m as usize, last_b, cv, cy)
-            };
+            }
+            let found = self.dfs_pre(&k.node, r, lf, lb, cv, cy, mine);
             if found {
                 return true;
             }
