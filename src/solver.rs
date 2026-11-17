@@ -373,6 +373,22 @@ impl<'a> Solver<'a> {
                 eprintln!("candidates by (L1, L1+h2): {h1:?}");
                 eprintln!("reductions by L12: {h12:?}");
             }
+            // Experiments (examples/xwend.rs): append every reduction as "FACELETS MOVES12".
+            if let Some(path) = std::env::var_os("EGGG_DUMP_REDS") {
+                use std::io::Write;
+                let f = run.cube.to_facelets().to_string_letters();
+                let mut out = String::new();
+                for r in &run.reds {
+                    let ms: Vec<String> = r.moves12.iter().map(|m| m.to_string()).collect();
+                    out += &format!("{f} {}\n", ms.join(" "));
+                }
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .and_then(|mut file| file.write_all(out.as_bytes()))
+                    .expect("writing the reduction dump");
+            }
             done.store(true, Ordering::Relaxed);
         });
         self.stats = run.stats;

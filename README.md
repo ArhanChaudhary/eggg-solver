@@ -91,4 +91,10 @@ after 60 s.
   reproduce per-position lengths, so small differences are measurable).
 - `examples/` holds deterministic checks used during optimisation: `p1check` (phase-1
   endpoint hash and node count), `p2jcheck` (joint-table admissibility), `p3check`,
-  `p3nodes` and `p3tasks` (phase-3 bounds, node counts and task splitting).
+  `p3nodes` and `p3tasks` (phase-3 bounds, node counts and task splitting). `hshort`,
+  `hmitm` and `xwend` are the experiments behind leaving phase 3 as it is: wide half turns
+  (Uw2 Rw2 Fw2) in the last phase can beat the optimal 3x3x3 on reduced cubes, but rarely:
+  the reduced cubes within 9 such moves are only 7e-6 more than those within 9 outer moves
+  (1 in 4 million cubes at distance 9 has a shorter solution, mostly tails a longer phase 2
+  already produces), a pool 0.001% larger. Endings "X W" after a phase-2 solution without
+  its last wide move W are possible for ~1e-4 of the reductions and never shorter.

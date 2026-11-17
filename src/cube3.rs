@@ -131,6 +131,12 @@ impl Cube3 {
     /// Extract the 3x3x3 from a reduced 4x4x4 (centres solved in some orientation, dedges
     /// paired). The result is relative to the centres, so solving it solves the 4x4x4.
     pub fn from_reduced(c: &Cube) -> Option<Cube3> {
+        Cube3::from_reduced_any(c).filter(|x| x.is_valid())
+    }
+
+    /// [`Cube3::from_reduced`] without the check that the result is a legal 3x3x3 (a reduced
+    /// cube with PLL parity gives a 3x3x3 whose edge and corner permutations differ in parity).
+    pub fn from_reduced_any(c: &Cube) -> Option<Cube3> {
         // Recolour so that the centres are in their home orientation.
         let cols = c.centre_colours();
         let face_colour: Vec<u8> = (0..6).map(|f| cols[f * 4]).collect();
@@ -166,7 +172,7 @@ impl Cube3 {
                 return None;
             }
         }
-        out.is_valid().then_some(out)
+        Some(out)
     }
 }
 

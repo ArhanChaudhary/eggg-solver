@@ -1,0 +1,5 @@
+# hmitm 6 300 10 12 6 5 (stored ball: 22993597 states within 6 H-moves; random reduced cubes of exact 3x3x3 distance d)
+d | tested | shortcuts (gain: count) | of which not of frame x's shape | of no frame's shape
+10 | 300 | {} | 0 | 0
+11 | 300 | {} | 0 | 0
+12 | 300 | {} | 0 | 0

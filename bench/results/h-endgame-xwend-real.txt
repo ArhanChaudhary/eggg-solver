@@ -1,0 +1,4 @@
+# xwend dump /tmp/hend-reds.txt (reductions of 10 solver runs: bench -N 4 -t 4 --seed 77 and -N 6 -t 8 --seed 78, -j 6, --tier medium, EGGG_DUMP_REDS)
+31816 reductions; d3 histogram (0: not computed, no ending) {0: 31811, 17: 1, 18: 4}
+ending Q X W (same W): wings and corners allow it for 0; gain d3(r) - |X| (Q X W vs Q W + phase 3): {}
+phase 3 replaced by W' X W' (any W'): allowed for 5; gain d3(r) - |X| - 2: {(-3, "bound"): 1, (-2, "bound"): 2, (-1, "bound"): 2}

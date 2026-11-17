@@ -1,0 +1,51 @@
+enumerated 94967128552 sequences up to length 9 in 923.9 s
+sequences (with a wide move) ending reduced, per length: [0, 0, 0, 0, 0, 72, 2724, 63936, 1245492, 22066968]
+kH | distinct states | d3 histogram | d3 > kH (gain: count) | min(d3, kx) > kH | min(d3, kx, ky, kz) > kH
+6 | 3 | {8: 3} | {2: 3} | {} | {}
+7 | 240 | {8: 120, 9: 24, 10: 96} | {1: 120, 2: 24, 3: 96} | {1: 20, 3: 32} | {}
+8 | 7107 | {9: 4467, 10: 1680, 11: 960} | {1: 4467, 2: 1680, 3: 960} | {1: 1504, 2: 512, 3: 448} | {}
+9 | 136128 | {10: 99672, 11: 25992, 12: 10464} | {1: 99672, 2: 25992, 3: 10464} | {1: 42544, 2: 11664, 3: 6016} | {1: 2688, 2: 576, 3: 1536}
+examples of shortcuts no frame covers (solving sequence = inverse):
+  H 9 [D' B Rw2 D2 U2 R' B2 F2 Rw2] vs 3x3 10 [D' B R L F2 B2 L' F2 B2 L2]; kx ky kz [99, 99, 99]
+  H 9 [U F Rw2 L B2 F2 D2 U2 Rw2] vs 3x3 10 [U F R' U2 D2 R L' U2 D2 R2]; kx ky kz [99, 99, 99]
+  H 9 [U R' Fw2 D2 U2 F L2 R2 Fw2] vs 3x3 10 [U R' F B R2 L2 B R2 L2 F2]; kx ky kz [99, 99, 99]
+  H 9 [D L Fw2 U2 B D2 L2 R2 Fw2] vs 3x3 12 [D L F B L2 B R2 F B' R2 L2 B2]; kx ky kz [99, 99, 99]
+  H 9 [L' D Fw2 R2 B L2 D2 U2 Fw2] vs 3x3 12 [L' D F B U2 B D2 F B' U2 D2 B2]; kx ky kz [99, 99, 99]
+  H 9 [B' U' Rw2 D2 L U2 B2 F2 Rw2] vs 3x3 10 [F2 B U D R2 D2 R' U2 R2 D']; kx ky kz [99, 99, 99]
+  H 9 [B' L Uw2 L2 U' R2 B2 F2 Uw2] vs 3x3 10 [F2 B R' L' U2 L2 D R2 U2 R]; kx ky kz [99, 99, 99]
+  H 9 [U' F' Rw2 U2 R D2 B2 F2 Rw2] vs 3x3 12 [U' F R' L' B2 R2 U2 L' U2 F2 B2 R2]; kx ky kz [99, 99, 99]
+  H 9 [U B' Rw2 D2 U2 B2 R F2 Rw2] vs 3x3 11 [U D2 B2 U2 F' B R B2 R2 F' B2]; kx ky kz [99, 99, 99]
+  H 9 [F D Rw2 B2 F2 R D2 U2 Rw2] vs 3x3 10 [F D R L U2 D2 L U2 D2 R2]; kx ky kz [99, 99, 99]
+  H 9 [D R Fw2 D2 U2 R2 F' L2 Fw2] vs 3x3 11 [U2 D R2 D2 R' L F' R2 F2 R2 L]; kx ky kz [99, 99, 99]
+  H 9 [D F' Rw2 F2 L B2 D2 U2 Rw2] vs 3x3 11 [D B2 L2 B2 L F B' D2 B2 U2 B']; kx ky kz [99, 99, 99]
+  H 9 [L U B' Uw2 B2 F2 L2 R2 Uw2] vs 3x3 10 [L U F2 B R2 F2 R2 L2 F2 R2]; kx ky kz [99, 99, 99]
+  H 9 [B U Rw2 D2 U2 F2 L B2 Rw2] vs 3x3 12 [F' R2 F2 R2 D2 F B U L B2 L2 B2]; kx ky kz [99, 99, 99]
+  H 9 [R' B Uw2 B2 F2 R2 U' L2 Uw2] vs 3x3 12 [R' B U D R2 L2 U D' R2 U' L2 D2]; kx ky kz [99, 99, 99]
+  H 9 [F D R' Uw2 B2 F2 L2 R2 Uw2] vs 3x3 10 [F D R F2 R2 F2 B2 R2 F2 L2]; kx ky kz [99, 99, 99]
+  H 9 [R F Uw2 L2 R2 D' B2 F2 Uw2] vs 3x3 10 [R F U D F2 B2 U' F2 B2 U2]; kx ky kz [99, 99, 99]
+  H 9 [L' F Uw2 U' B2 F2 L2 R2 Uw2] vs 3x3 10 [L' F D R2 L2 U D' R2 L2 D2]; kx ky kz [99, 99, 99]
+  H 9 [F' L' Uw2 L2 R2 D B2 F2 Uw2] vs 3x3 10 [F' L F2 B2 L2 U F2 R2 L2 F2]; kx ky kz [99, 99, 99]
+  H 9 [D' R' Fw2 U2 F D2 L2 R2 Fw2] vs 3x3 12 [D' R' U R2 U2 L2 U' D B U2 B2 D]; kx ky kz [99, 99, 99]
+  H 9 [B' D' Rw2 L' B2 F2 D2 U2 Rw2] vs 3x3 10 [B' D' R U2 D2 R L' U2 D2 L2]; kx ky kz [99, 99, 99]
+  H 9 [U B' Rw2 R B2 F2 D2 U2 Rw2] vs 3x3 10 [U B' L' U2 D2 R L' U2 D2 R2]; kx ky kz [99, 99, 99]
+  H 9 [U F R Uw2 B2 F2 L2 R2 Uw2] vs 3x3 10 [U F R' F2 R2 F2 B2 R2 F2 L2]; kx ky kz [99, 99, 99]
+  H 9 [L B' Uw2 L2 R2 F2 D B2 Uw2] vs 3x3 10 [L' B2 R2 F' B D B2 D2 F' B2]; kx ky kz [99, 99, 99]
+  H 9 [U' F Rw2 L' B2 F2 D2 U2 Rw2] vs 3x3 10 [U' F R U2 D2 R L' U2 D2 L2]; kx ky kz [99, 99, 99]
+  H 9 [R' F' Uw2 U B2 F2 L2 R2 Uw2] vs 3x3 10 [R' F' D' R2 L2 U D' R2 L2 U2]; kx ky kz [99, 99, 99]
+  H 9 [F R' Uw2 D' B2 F2 L2 R2 Uw2] vs 3x3 10 [F R' U R2 L2 U D' R2 L2 D2]; kx ky kz [99, 99, 99]
+  H 9 [D L Fw2 L2 R2 D2 B U2 Fw2] vs 3x3 12 [U' F2 D2 F2 R2 U D L B U2 B2 U2]; kx ky kz [99, 99, 99]
+  H 9 [D' L' Fw2 U2 B D2 L2 R2 Fw2] vs 3x3 12 [D' L F' B' R2 F2 U2 F' U2 R2 L2 F2]; kx ky kz [99, 99, 99]
+  H 9 [R B U Rw2 B2 F2 D2 U2 Rw2] vs 3x3 10 [R B U' F2 U2 F2 B2 U2 F2 D2]; kx ky kz [99, 99, 99]
+  H 9 [L F' Uw2 R2 D' L2 B2 F2 Uw2] vs 3x3 12 [L F U D B2 U2 R2 U R2 F2 B2 U2]; kx ky kz [99, 99, 99]
+  H 9 [B L Uw2 D B2 F2 L2 R2 Uw2] vs 3x3 10 [B L U' R2 L2 U D' R2 L2 U2]; kx ky kz [99, 99, 99]
+  H 9 [L B' Uw2 B2 F2 R2 D' L2 Uw2] vs 3x3 12 [R' U2 D2 R L F B2 U2 R2 D' L2 D2]; kx ky kz [99, 99, 99]
+  H 9 [D' F' Rw2 D2 L' U2 B2 F2 Rw2] vs 3x3 12 [D' F R L B2 R2 D2 R D2 F2 B2 R2]; kx ky kz [99, 99, 99]
+  H 9 [U B' Rw2 B2 F2 U2 R D2 Rw2] vs 3x3 12 [U B' R L U2 D2 R L' U2 R D2 L2]; kx ky kz [99, 99, 99]
+  H 9 [R' F Uw2 D' B2 F2 L2 R2 Uw2] vs 3x3 10 [R' F U R2 L2 U D' R2 L2 D2]; kx ky kz [99, 99, 99]
+  H 9 [F' D' Rw2 D2 U2 F2 L B2 Rw2] vs 3x3 12 [F' D R' L' F2 B2 U2 R2 B2 R' F2 R2]; kx ky kz [99, 99, 99]
+  H 9 [D B Rw2 R' B2 F2 D2 U2 Rw2] vs 3x3 10 [D B L U2 D2 R L' U2 D2 L2]; kx ky kz [99, 99, 99]
+  H 9 [B' D' R Fw2 L2 R2 D2 U2 Fw2] vs 3x3 10 [B' D' R' U2 R2 U2 D2 R2 U2 L2]; kx ky kz [99, 99, 99]
+  H 9 [R F' Uw2 F2 D' B2 L2 R2 Uw2] vs 3x3 11 [R B2 D2 B2 D' F B' R2 B2 L2 B']; kx ky kz [99, 99, 99]
+PLL-parity reduced states (distinct, by min H-length): {7: 30, 8: 1728, 9: 52260}; sequences per length [0, 0, 0, 0, 0, 0, 0, 72, 4032, 120792]
+shortest PLL parity in H: Uw2 R2 F2 Uw2 F2 R2 Uw2 (shape lengths [7, 7, 7, 7])
+1081.51 s 1013748 KB

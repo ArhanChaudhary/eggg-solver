@@ -1,0 +1,12 @@
+enumerated 5953511404 sequences up to length 8 in 122.5 s
+sequences (with a wide move) ending reduced, per length: [0, 0, 0, 0, 0, 72, 2724, 63936, 1245492]
+kH | distinct states | d3 histogram | d3 > kH (gain: count) | min(d3, kx) > kH | min(d3, kx, ky, kz) > kH
+5 | 72 | {5: 72} | {} | {} | {}
+6 | 2428 | {0: 1, 4: 270, 5: 576, 6: 1578, 8: 3} | {2: 3} | {} | {}
+7 | 52722 | {1: 18, 3: 312, 4: 1104, 5: 8100, 6: 15024, 7: 27924, 8: 120, 9: 24, 10: 96} | {1: 120, 2: 24, 3: 96} | {1: 20, 3: 32} | {}
+8 | 970278 | {2: 243, 3: 528, 4: 7209, 5: 29472, 6: 161547, 7: 294552, 8: 469620, 9: 4467, 10: 1680, 11: 960} | {1: 4467, 2: 1680, 3: 960} | {1: 1504, 2: 512, 3: 448} | {}
+examples of shortcuts no frame covers (solving sequence = inverse):
+PLL-parity reduced states (distinct, by min H-length): {7: 30, 8: 1728}; sequences per length [0, 0, 0, 0, 0, 0, 0, 72, 4032]
+shortest PLL parity in H: Fw2 R2 U2 Fw2 D2 L2 Fw2 (shape lengths [7, 7, 7, 7])
+419.32 s 1266172 KB
+[exited with code 0]
