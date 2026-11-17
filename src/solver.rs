@@ -725,6 +725,26 @@ impl<'a, 'r> Run<'a, 'r> {
     /// Phase 3, level by level on the total length, below the best solution, until the
     /// deadline (a level in progress then stops claiming reductions; finished ones are kept).
     fn phase3_levels(&mut self, deadline: Instant) {
+        // Without a solution yet, first solve the most promising reduction outright (within
+        // this round's budget; finished levels raise its bound, so a reduction that turns out
+        // deep is not picked again): a first solution costs a fraction of searching the whole
+        // pool level by level up to it, and the levels below it are then searched over the
+        // pool as usual.
+        if self.best.is_none()
+            && let Some(r) = (0..self.reds.len()).min_by_key(|&i| {
+                let red = &self.reds[i];
+                (red.moves12.len() + red.h3.max(red.done3) as usize, i)
+            })
+        {
+            while !self.stopped() && Instant::now() < deadline {
+                let red = &self.reds[r];
+                let total = red.moves12.len() + red.h3.max(red.done3) as usize;
+                if let Some((r, sol)) = self.phase3_level(total, Some(deadline), Some(r)) {
+                    self.record(r, &sol);
+                    break;
+                }
+            }
+        }
         loop {
             let best = self.best_len();
             let lo = self
@@ -740,7 +760,7 @@ impl<'a, 'r> Run<'a, 'r> {
                 self.start,
                 &format!("phase 3: total {lo}, nodes {}", self.stats.nodes3),
             );
-            match self.phase3_level(lo, deadline) {
+            match self.phase3_level(lo, Some(deadline), None) {
                 Some((r, sol)) => self.record(r, &sol),
                 None => {
                     if Instant::now() >= deadline {
@@ -751,15 +771,23 @@ impl<'a, 'r> Run<'a, 'r> {
         }
     }
 
-    /// Phase-3 searches of total length `total` over the reductions; the first solution found.
-    fn phase3_level(&mut self, total: usize, deadline: Instant) -> Option<(usize, Vec<u8>)> {
+    /// Phase-3 searches of total length `total` over the reductions (or just reduction
+    /// `only`); the first solution found. Without a deadline the level is finished.
+    fn phase3_level(
+        &mut self,
+        total: usize,
+        deadline: Option<Instant>,
+        only: Option<usize>,
+    ) -> Option<(usize, Vec<u8>)> {
         let t = self.t;
         let reds = &self.reds;
         let mut order: Vec<usize> = (0..reds.len())
             .filter(|&i| {
                 let r = &reds[i];
                 let l12 = r.moves12.len();
-                total >= l12 + r.h3 as usize && total - l12 >= r.done3 as usize
+                only.is_none_or(|o| o == i)
+                    && total >= l12 + r.h3 as usize
+                    && total - l12 >= r.done3 as usize
             })
             .collect();
         // Shallow searches first: any solution of this level is as good as any other.
@@ -792,7 +820,7 @@ impl<'a, 'r> Run<'a, 'r> {
         let finished: Vec<AtomicUsize> = (0..reds.len()).map(|_| AtomicUsize::new(0)).collect();
         let stop = self.stop;
         par_jobs(jobs.len(), self.threads, stop, |j| {
-            if found.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            if found.load(Ordering::Relaxed) || deadline.is_some_and(|d| Instant::now() >= d) {
                 return;
             }
             let (i, task) = &jobs[j];
