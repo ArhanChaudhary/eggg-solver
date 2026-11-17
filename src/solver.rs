@@ -603,7 +603,7 @@ impl<'a, 'r> Run<'a, 'r> {
             .min()
             .unwrap_or(99);
         while self.reds.len() < want && !self.stopped() && t12 <= cap {
-            for r in self.phase2_level(t12) {
+            for r in self.phase2_level(t12, want - self.reds.len()) {
                 let key = (r.frame, r.c3);
                 match self.red_index.get(&key) {
                     Some(&i) if self.reds[i].moves12.len() <= r.moves12.len() => {}
@@ -620,7 +620,10 @@ impl<'a, 'r> Run<'a, 'r> {
     }
 
     /// Phase-2 searches of total length `t12` for every candidate that can reach it.
-    fn phase2_level(&mut self, t12: usize) -> Vec<Reduction> {
+    /// Stops starting searches once `need` reductions are found: each level has ~8x the
+    /// reductions of the one below, and finishing it would overshoot the round's target (the
+    /// candidates not searched keep the level for the next round).
+    fn phase2_level(&mut self, t12: usize, need: usize) -> Vec<Reduction> {
         let t = self.t;
         let cands = &self.cands;
         let jobs: Vec<usize> = (0..cands.len())
@@ -633,7 +636,13 @@ impl<'a, 'r> Run<'a, 'r> {
         let out = Mutex::new(vec![]);
         let nodes = AtomicU64::new(0);
         let stop = self.stop;
+        let made = AtomicUsize::new(0);
+        let ran: Vec<AtomicBool> = (0..jobs.len()).map(|_| AtomicBool::new(false)).collect();
         par_jobs(jobs.len(), self.threads, stop, |j| {
+            if made.load(Ordering::Relaxed) >= need {
+                return;
+            }
+            ran[j].store(true, Ordering::Relaxed);
             let c = &cands[jobs[j]];
             let l2 = (t12 - c.moves1.len()) as u8;
             let rot = frame_rotation(c.frame);
@@ -677,10 +686,14 @@ impl<'a, 'r> Run<'a, 'r> {
                     done3: 0,
                 });
             }
+            made.fetch_add(local.len(), Ordering::Relaxed);
             out.lock().unwrap().push((j, local));
         });
         if !self.stopped() {
-            for &j in &jobs {
+            for (k, &j) in jobs.iter().enumerate() {
+                if !ran[k].load(Ordering::Relaxed) {
+                    continue;
+                }
                 let c = &mut self.cands[j];
                 c.done2 = c.done2.max((t12 - c.moves1.len()) as u8 + 1);
             }
