@@ -382,6 +382,8 @@ pub struct Frame {
     pub rl_ok: [u64; 4],
     /// For each move, the slots whose wings end up in the low slots.
     pub low_src: [[u8; 12]; N_MOVES],
+    /// 0x80 at the low slots (looked up by each wing's slot).
+    pub low_tab: V32,
 }
 
 impl Frame {
@@ -478,8 +480,13 @@ impl Frame {
         let low_slots: [u8; 12] = low_slots.try_into().unwrap();
         let low_src =
             std::array::from_fn(|m| low_slots.map(|s| MOVE_PERMS[m].wing_src[s as usize]));
+        let mut low_tab = V32::ZERO;
+        for &sl in &low_slots {
+            low_tab.0[sl as usize] = 0x80;
+        }
         Frame {
             p2_mask,
+            low_tab,
             low_src,
             low_slots,
             high_pieces,
@@ -489,26 +496,12 @@ impl Frame {
     }
 
     /// Are the wings pairable in this frame (one wing of each dedge in the low slots, an even
-    /// number of high wings among them)?
+    /// number of high wings among them)? `pos` holds the slot of each wing.
     #[inline(always)]
-    pub fn wings_ok(&self, wings: &V32) -> bool {
-        let mut m = 0u32;
-        for &s in &self.low_slots {
-            m |= 1 << wings.0[s as usize];
-        }
+    pub fn wings_ok(&self, pos: &V32) -> bool {
+        let m = crate::simd::movemask(&self.low_tab.gather(pos)) & MASK24;
         ((m ^ (m >> 1)) & 0x55_5555) == 0x55_5555
             && (m & self.high_pieces).count_ones().is_multiple_of(2)
-    }
-
-    /// [`Frame::wings_ok`] of the cube after move `m`, from the wings before it.
-    #[inline(always)]
-    pub fn wings_ok_after(&self, wings: &V32, m: usize) -> bool {
-        let mut x = 0u32;
-        for &s in &self.low_src[m] {
-            x |= 1 << wings.0[s as usize];
-        }
-        ((x ^ (x >> 1)) & 0x55_5555) == 0x55_5555
-            && (x & self.high_pieces).count_ones().is_multiple_of(2)
     }
 
     /// Is the special axis's centre pattern one phase 2 can solve (assuming staged centres)?
@@ -526,7 +519,8 @@ impl Frame {
 #[derive(Clone, Copy)]
 pub struct P1State {
     pub centres: V32,
-    pub wings: V32,
+    /// The slot of each wing piece.
+    pub pos: V32,
     pub parity: bool,
 }
 
@@ -536,10 +530,13 @@ impl P1State {
         for s in 0..24 {
             centres.0[s] = CODE_OF_FACE[(c.ct[s] / 4) as usize];
         }
-        let wings = V32::from_slice(&c.wp);
+        let mut pos = V32::ZERO;
+        for sl in 0..24 {
+            pos.0[c.wp[sl] as usize] = sl as u8;
+        }
         P1State {
             centres,
-            wings,
+            pos,
             parity: Cube::parity(&c.wp) == 1,
         }
     }
@@ -548,7 +545,7 @@ impl P1State {
     pub fn apply(&self, m: usize, t: &P1Tables) -> P1State {
         P1State {
             centres: self.centres.gather(&t.centre_idx[m]),
-            wings: self.wings.gather(&t.wing_idx[m]),
+            pos: t.wing_dst[m].gather(&self.pos),
             parity: self.parity ^ (WIDE_QUARTER >> m & 1 == 1),
         }
     }
@@ -569,6 +566,8 @@ pub struct P1Tables {
     pub frames: [Frame; 3],
     pub centre_idx: [V32; N_MOVES],
     pub wing_idx: [V32; N_MOVES],
+    /// Destination slot of each slot under each move (applied to wing positions).
+    pub wing_dst: [V32; N_MOVES],
 }
 
 impl P1Tables {
@@ -591,6 +590,13 @@ impl P1Tables {
         let frames = [Frame::new(0), Frame::new(1), Frame::new(2)];
         let centre_idx = std::array::from_fn(|m| V32::from_slice(&MOVE_PERMS[m].centre_src));
         let wing_idx = std::array::from_fn(|m| V32::from_slice(&MOVE_PERMS[m].wing_src));
+        let wing_dst = std::array::from_fn(|m| {
+            let mut d = V32::ZERO;
+            for t in 0..24 {
+                d.0[MOVE_PERMS[m].wing_src[t] as usize] = t as u8;
+            }
+            d
+        });
         P1Tables {
             staging,
             table,
@@ -598,6 +604,7 @@ impl P1Tables {
             frames,
             centre_idx,
             wing_idx,
+            wing_dst,
         }
     }
 
@@ -647,7 +654,7 @@ impl P1Tables {
             if last < N_MOVES && fr.p2_mask >> last & 1 == 1 {
                 continue;
             }
-            if fr.wings_ok(&s.wings) && fr.centres_ok(&s.centres) {
+            if fr.wings_ok(&s.pos) && fr.centres_ok(&s.centres) {
                 out |= 1 << f;
             }
         }
@@ -701,9 +708,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 let m = allowed.trailing_zeros() as usize;
                 allowed &= allowed - 1;
                 self.nodes += 1;
+                let pos = self.t.wing_dst[m].gather(&s.pos);
                 let mut frames = 0u8;
                 for (f, fr) in self.t.frames.iter().enumerate() {
-                    if fr.p2_mask >> m & 1 == 0 && fr.wings_ok_after(&s.wings, m) {
+                    if fr.p2_mask >> m & 1 == 0 && fr.wings_ok(&pos) {
                         frames |= 1 << f;
                     }
                 }
@@ -820,7 +828,7 @@ mod tests {
             let fr = Frame::new(f);
             assert_eq!(fr.p2_mask.count_ones(), 17);
             let s = P1State::from_cube(&Cube::SOLVED);
-            assert!(fr.wings_ok(&s.wings));
+            assert!(fr.wings_ok(&s.pos));
             assert!(fr.centres_ok(&s.centres));
         }
     }
