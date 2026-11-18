@@ -1082,6 +1082,9 @@ impl BNode {
     }
 }
 
+/// The wide moves (Uw, Rw, Fw and their powers).
+const WIDE_MOVES: u32 = 0x1ff << 18;
+
 /// Per move (and none, [`N_MOVES`]), the moves on its axis (move m turns a face of axis
 /// (m / 3) % 3): the moves that continue a trailing run of same-axis moves.
 const SAME_AXIS: [u32; N_MOVES + 1] = {
@@ -1262,6 +1265,24 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         return;
                     }
                 } else if nd.left == 2 && !mt.batch_leaves {
+                    // Over all pairs, a child (at distance 1) whose wings have even parity has
+                    // no endpoint below it: its last move must not be a wide quarter turn, and
+                    // then cannot stage the centres or is a phase-2 move in every frame (see
+                    // `leaf`). Its last moves are counted, not tested.
+                    if self.pair == ALL_PAIRS {
+                        let even = if s.parity {
+                            WIDE_QUARTER
+                        } else {
+                            !WIDE_QUARTER
+                        };
+                        let mut b = a & even;
+                        a &= !even;
+                        while b != 0 {
+                            let m = b.trailing_zeros() as usize;
+                            b &= b - 1;
+                            self.nodes += (ALLOWED_AFTER[m] & !WIDE_QUARTER).count_ones() as u64;
+                        }
+                    }
                     while a != 0 {
                         let m = a.trailing_zeros() as usize;
                         a &= a - 1;
@@ -1397,8 +1418,13 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         // endpoint: it is counted, not tested (the half turns, for one).
         let mut test = allowed & !(t.all_p2[0] | same & t.all_p2[run_frames as usize]);
         // Without the staging moves from a mask, the search over all pairs tests that the move
-        // stages the centres first (the cheaper and less selective test; no table read).
+        // stages the centres first (the cheaper and less selective test; no table read). From
+        // unstaged centres (d >= 1) only a wide move can stage them: an outer move keeps every
+        // face's centres on that face.
         let check_staged = staging.is_none() && self.pair == ALL_PAIRS;
+        if check_staged && d >= 1 {
+            test &= WIDE_MOVES;
+        }
         let centres = s.centres;
         while test != 0 {
             let m = test.trailing_zeros() as usize;
@@ -1790,6 +1816,21 @@ mod tests {
             }
         }
         assert!(seen[0] > 0 && seen[1] > 0);
+        // The leaf's shortcuts: the wide half turns are phase-2 moves in every frame, and an
+        // outer move never changes whether the centres are staged.
+        assert_eq!(WIDE_MOVES & !WIDE_QUARTER & !t.all_p2[0], 0);
+        let s = P1State::from_cube(&Cube::random(&mut rng));
+        for m in (0..N_MOVES).filter(|&m| WIDE_MOVES >> m & 1 == 0) {
+            let c = s.apply(m, &t);
+            for a in 0..6 {
+                let face = |x: &P1State| {
+                    let mut v: Vec<u8> = x.centres.0[4 * a..4 * a + 4].to_vec();
+                    v.sort();
+                    v
+                };
+                assert_eq!(face(&s), face(&c));
+            }
+        }
     }
 
     #[test]
