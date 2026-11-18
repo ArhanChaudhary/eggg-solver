@@ -664,6 +664,13 @@ pub struct P1Tables {
     pub centre_idx: [V32; N_MOVES],
     /// Destination slot of each slot under each move (applied to wing positions).
     pub wing_dst: [V32; N_MOVES],
+    /// Per move m, per slot j: bit 5 + f set if the slot that m takes j to is low in frame f
+    /// (see [`P1Tables::wing_frames`]; zero at j >= 24).
+    low_after: [V32; N_MOVES],
+    /// Per piece (byte), bit 5 + f set if its home slot is high in frame f.
+    high_bytes: [u64; 3],
+    /// Per move, the frames (bit f) in which it is a phase-2 move.
+    p2_frames: [u8; N_MOVES],
     /// The pattern table (searches per colour pair, see [`crate::p1pat`]).
     pub pat: Option<crate::p1pat::PatTable>,
     /// The move-mask table (with the large staging table, see [`crate::p1mask`]).
@@ -689,6 +696,30 @@ impl P1Tables {
             }
             d
         });
+        let mut low = [0u8; 24];
+        let mut high_bytes = [0u64; 3];
+        for (f, fr) in frames.iter().enumerate() {
+            for &sl in &fr.low_slots {
+                low[sl as usize] |= 1 << (5 + f);
+            }
+            for i in 0..24 {
+                if fr.high_pieces >> i & 1 == 1 {
+                    high_bytes[i / 8] |= 1 << (5 + f + 8 * (i % 8));
+                }
+            }
+        }
+        let low_after = std::array::from_fn(|m| {
+            let mut v = V32::ZERO;
+            for j in 0..24 {
+                v.0[j] = low[wing_dst[m].0[j] as usize];
+            }
+            v
+        });
+        let p2_frames = std::array::from_fn(|m| {
+            (0..3)
+                .filter(|&f| frames[f].p2_mask >> m & 1 == 1)
+                .fold(0, |a, f| a | 1 << f)
+        });
         P1Tables {
             staging,
             table,
@@ -696,6 +727,9 @@ impl P1Tables {
             frames,
             centre_idx,
             wing_dst,
+            low_after,
+            high_bytes,
+            p2_frames,
             pat: None,
             mask: None,
         }
@@ -766,6 +800,27 @@ impl P1Tables {
             }
         }
         out
+    }
+
+    /// The frames (bit f) in which the wings are pairable ([`Frame::wings_ok`]) after move `m`
+    /// from wing positions `pos`: all three tests on one gather.
+    #[inline(always)]
+    pub fn wing_frames(&self, pos: &V32, m: usize) -> u32 {
+        debug_assert!(m < N_MOVES);
+        let x = unsafe { self.low_after.get_unchecked(m) }.gather(pos);
+        let w = |k: usize| u64::from_le_bytes(x.0[8 * k..8 * k + 8].try_into().unwrap());
+        let (w0, w1, w2) = (w(0), w(1), w(2));
+        // Pieces 2k and 2k + 1 (a dedge): exactly one low (even bytes of w ^ w >> 8).
+        let t = (w0 ^ w0 >> 8) & (w1 ^ w1 >> 8) & (w2 ^ w2 >> 8);
+        let t = t & t >> 16;
+        let t = t & t >> 32;
+        // An even number of low wings among the high pieces.
+        let mut p =
+            (w0 & self.high_bytes[0]) ^ (w1 & self.high_bytes[1]) ^ (w2 & self.high_bytes[2]);
+        p ^= p >> 32;
+        p ^= p >> 16;
+        p ^= p >> 8;
+        ((t & !p) >> 5) as u32 & 7
     }
 
     /// Which frames accept this staged state as an endpoint (bit f), given the trailing run
@@ -1137,18 +1192,23 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         } else {
             !WIDE_QUARTER
         };
+        // The frames in which the run before the last move has a phase-2 move (the last move
+        // continues the run if on the same axis).
+        let mut run_frames = 0;
+        let mut r = run;
+        while r != 0 {
+            run_frames |= self.t.p2_frames[r.trailing_zeros() as usize];
+            r &= r - 1;
+        }
         while allowed != 0 {
             let m = allowed.trailing_zeros() as usize;
             allowed &= allowed - 1;
             self.nodes += 1;
-            let pos = self.t.wing_dst[m].gather(&s.pos);
-            let run_m = run_after(run, last, m);
-            let mut frames = 0u8;
-            for (f, fr) in self.t.frames.iter().enumerate() {
-                if fr.p2_mask & run_m == 0 && fr.wings_ok(&pos) {
-                    frames |= 1 << f;
-                }
+            let mut excl = unsafe { *self.t.p2_frames.get_unchecked(m) };
+            if last < N_MOVES && (m / 3) % 3 == (last / 3) % 3 {
+                excl |= run_frames;
             }
+            let mut frames = (self.t.wing_frames(&s.pos, m) & !excl as u32) as u8;
             if frames == 0 {
                 continue;
             }
@@ -1452,6 +1512,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// [`P1Tables::wing_frames`] agrees with the per-frame tests.
+    #[test]
+    fn wing_frames_match_wings_ok() {
+        let t = P1Tables::with_table(Staging::new(), Mod3Table::from_depths(&[0]));
+        let mut rng = rand::thread_rng();
+        let mut seen = [0u32; 8];
+        for k in 0..20000 {
+            let mut s = P1State::from_cube(&Cube::random(&mut rng));
+            if k % 2 == 0 {
+                // Near-pairable states too: a few moves from solved.
+                s = P1State::from_cube(&Cube::SOLVED);
+                for j in 0..k % 7 {
+                    s = s.apply((k * 13 + j * 5) % N_MOVES, &t);
+                }
+            }
+            for m in 0..N_MOVES {
+                let pos = t.wing_dst[m].gather(&s.pos);
+                let want = (0..3)
+                    .filter(|&f| t.frames[f].wings_ok(&pos))
+                    .fold(0, |a, f| a | 1 << f);
+                assert_eq!(t.wing_frames(&s.pos, m), want);
+                seen[want as usize] += 1;
+            }
+        }
+        assert!(seen[0] > 0 && seen[7] > 0 && seen[1..7].iter().any(|&n| n > 0));
     }
 
     #[test]
