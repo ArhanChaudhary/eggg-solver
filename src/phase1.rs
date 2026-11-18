@@ -50,6 +50,32 @@ pub fn pext(x: u32, m: u32) -> u32 {
     }
 }
 
+/// The bit counts of the four bytes of `x` (one byte each).
+#[inline(always)]
+pub(crate) fn byte_counts(x: u32) -> u32 {
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    unsafe {
+        use std::arch::aarch64::*;
+        vget_lane_u32::<0>(vreinterpret_u32_u8(vcnt_u8(vcreate_u8(x as u64))))
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    {
+        (0..4).fold(0, |a, k| a | (x >> (8 * k) & 255).count_ones() << (8 * k))
+    }
+}
+
+/// Without BMI2: per mask byte, per value byte, the value's bits under the mask, packed.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+fn pext8_table() -> Box<[[u8; 256]; 256]> {
+    let mut t: Box<[[u8; 256]; 256]> = vec![[0u8; 256]; 256].try_into().unwrap();
+    for (m, row) in t.iter_mut().enumerate() {
+        for (x, e) in row.iter_mut().enumerate() {
+            *e = pext(x as u32, m as u32) as u8;
+        }
+    }
+    t
+}
+
 #[inline(always)]
 pub fn pdep(x: u32, m: u32) -> u32 {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
@@ -92,6 +118,9 @@ pub struct Staging {
     /// Byte-sliced colex rank of 8-of-24 masks, by byte and number of bits below it (sized
     /// so that no count of the two lower bytes needs a bounds check; only 0..=8 are used).
     rank_t: [[[u32; 256]; 17]; 3],
+    /// Without BMI2: [`pext`] of a byte by lookup (see [`Staging::pext24`]).
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    pext8: Box<[[u8; 256]; 256]>,
 }
 
 fn perm_tables(perm: &[u8; 24]) -> [[u32; 256]; 3] {
@@ -229,6 +258,27 @@ impl Staging {
             unl,
             unl_inv,
             rank_t,
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+            pext8: pext8_table(),
+        }
+    }
+
+    /// [`pext`] of 24-bit masks: BMI2 on x86-64, else three byte lookups.
+    #[inline(always)]
+    pub(crate) fn pext24(&self, x: u32, m: u32) -> u32 {
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        {
+            pext(x, m)
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        {
+            let t = &self.pext8;
+            let p0 = t[(m & 255) as usize][(x & 255) as usize] as u32;
+            let p1 = t[(m >> 8 & 255) as usize][(x >> 8 & 255) as usize] as u32;
+            let p2 = t[(m >> 16 & 255) as usize][(x >> 16 & 255) as usize] as u32;
+            let c = byte_counts(m);
+            let c0 = c & 255;
+            p0 | p1 << c0 | p2 << (c0 + (c >> 8 & 255))
         }
     }
 
@@ -237,11 +287,16 @@ impl Staging {
         let b0 = m & 255;
         let b1 = m >> 8 & 255;
         let b2 = m >> 16;
-        let c0 = b0.count_ones() as usize;
-        let c1 = c0 + b1.count_ones() as usize;
-        self.rank_t[0][0][b0 as usize]
-            + self.rank_t[1][c0][b1 as usize]
-            + self.rank_t[2][c1][b2 as usize]
+        let c = byte_counts(m);
+        let c0 = (c & 255) as usize;
+        let c1 = c0 + (c >> 8 & 255) as usize;
+        debug_assert!(c0 <= 8 && c1 <= 16);
+        // SAFETY: a byte has at most 8 bits set (c0 <= 8, c1 <= 16).
+        unsafe {
+            self.rank_t[0][0][b0 as usize]
+                + self.rank_t.get_unchecked(1).get_unchecked(c0)[b1 as usize]
+                + self.rank_t.get_unchecked(2).get_unchecked(c1)[b2 as usize]
+        }
     }
 
     /// Canonical table index of the centre classes given the U/D-colour and R/L-colour
@@ -281,7 +336,7 @@ impl Staging {
         let s = (info & 255) as usize;
         let b = apply_mask(&self.sym_perm[s], rl);
         let rem = !self.class_rep[class] & MASK24;
-        (class * N_SPLIT + self.unl[pext(b, rem) as u16 as usize] as usize) as u64
+        (class * N_SPLIT + self.unl[self.pext24(b, rem) as u16 as usize] as usize) as u64
     }
 
     /// [`Staging::fast_index`] from the flags of the centres (see [`P1State::centre_flags`]).
@@ -291,7 +346,7 @@ impl Staging {
         let h = flags.gather(&self.sym_gather[(info & 255) as usize]);
         let b = crate::simd::movemask(&h);
         let rem = crate::simd::movemask(&crate::simd::add(&h, &h));
-        (class * N_SPLIT + self.unl[pext(b, rem) as u16 as usize] as usize) as u64
+        (class * N_SPLIT + self.unl[self.pext24(b, rem) as u16 as usize] as usize) as u64
     }
 
     pub fn rep_of(&self, idx: u64) -> (u32, u32) {
@@ -312,7 +367,8 @@ impl Staging {
     /// [`Staging::big_index`], given also the complement `nud` of the U/D mask.
     #[inline(always)]
     pub(crate) fn big_index_n(&self, ud: u32, nud: u32, rl: u32) -> u64 {
-        self.rank24(ud) as u64 * N_SPLIT as u64 + self.unl[pext(rl, nud) as u16 as usize] as u64
+        self.rank24(ud) as u64 * N_SPLIT as u64
+            + self.unl[self.pext24(rl, nud) as u16 as usize] as u64
     }
 
     pub fn big_len() -> usize {
@@ -1423,6 +1479,21 @@ mod tests {
                 assert_eq!(st.index(apply_mask(&t, ud), apply_mask(&t, rl)), i);
                 assert_eq!(st.index(apply_mask(&t, ud), apply_mask(&t, fb)), i);
             }
+        }
+    }
+
+    #[test]
+    fn pext24_matches_pext() {
+        use rand::Rng;
+        let st = Staging::new();
+        let mut rng = rand::thread_rng();
+        for _ in 0..100000 {
+            let (x, m) = (rng.r#gen::<u32>() & MASK24, rng.r#gen::<u32>() & MASK24);
+            assert_eq!(st.pext24(x, m), pext(x, m));
+            assert_eq!(
+                byte_counts(x),
+                (0..4).fold(0, |a, k| a | (x >> (8 * k) & 255).count_ones() << (8 * k))
+            );
         }
     }
 
