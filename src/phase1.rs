@@ -403,6 +403,49 @@ impl Staging {
             + self.unl[self.pext24(rl, nud) as u16 as usize] as u64
     }
 
+    /// [`Staging::big_index`] from the state's centre flags (see [`P1State::centre_flags`]).
+    #[inline(always)]
+    pub(crate) fn big_index_flags(&self, g: &V32) -> u64 {
+        // NEON: both position masks by one pairwise-add chain, and the bit counts of their
+        // bytes by one count.
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        unsafe {
+            use std::arch::aarch64::*;
+            const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+            let w = vld1q_u8(W.as_ptr());
+            let (a0, a1) = (vld1q_u8(g.0.as_ptr()), vld1q_u8(g.0.as_ptr().add(16)));
+            let r0 = vandq_u8(vcltzq_s8(vreinterpretq_s8_u8(a0)), w);
+            let r1 = vandq_u8(vcltzq_s8(vreinterpretq_s8_u8(a1)), w);
+            let f = vdupq_n_u8(0x40);
+            let n0 = vandq_u8(vtstq_u8(a0, f), w);
+            let n1 = vandq_u8(vtstq_u8(a1, f), w);
+            let z = vpaddq_u8(vpaddq_u8(r0, r1), vpaddq_u8(n0, n1));
+            // Bytes 0..3: the R/L mask; bytes 4..7: the mask of the other colours.
+            let z = vget_low_u8(vpaddq_u8(z, z));
+            let x = vget_lane_u64::<0>(vreinterpret_u64_u8(z));
+            let c = vget_lane_u64::<0>(vreinterpret_u64_u8(vcnt_u8(z)));
+            let (rl, nud) = (x as u32, (x >> 32) as u32);
+            let ud = !nud & MASK24;
+            // Bit counts of the bytes of `nud` (each at most 8; U/D's are 8 minus them).
+            let (n0, n1) = ((c >> 32 & 255) as u32, (c >> 40 & 255) as u32);
+            debug_assert!(n0 <= 8 && n1 <= 8);
+            let (c0, c1) = ((8 - n0) as usize, (16 - n0 - n1) as usize);
+            let rank = self.rank_t[0][0][(ud & 255) as usize]
+                + self.rank_t.get_unchecked(1).get_unchecked(c0)[(ud >> 8 & 255) as usize]
+                + self.rank_t.get_unchecked(2).get_unchecked(c1)[(ud >> 16 & 255) as usize];
+            let t = &self.pext8;
+            let split = t[(nud & 255) as usize][(rl & 255) as usize] as u32
+                | (t[(nud >> 8 & 255) as usize][(rl >> 8 & 255) as usize] as u32) << n0
+                | (t[(nud >> 16 & 255) as usize][(rl >> 16 & 255) as usize] as u32) << (n0 + n1);
+            rank as u64 * N_SPLIT as u64 + self.unl[split as u16 as usize] as u64
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+        {
+            let (ud, nud, rl) = flag_masks(g);
+            self.big_index_n(ud, nud, rl)
+        }
+    }
+
     pub fn big_len() -> usize {
         735_471 * N_SPLIT
     }
@@ -1221,8 +1264,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                             let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
                             mt.resolve_flags(t, t.staging.rank24(!nud & MASK24) as u64, &g)
                         } else {
-                            let (ud, nud, rl) = flag_masks(&g);
-                            let i = t.staging.big_index_n(ud, nud, rl);
+                            let i = t.staging.big_index_flags(&g);
                             mt.prefetch(t, i);
                             (i, 0)
                         };
@@ -1413,8 +1455,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             while a != 0 {
                 let m = a.trailing_zeros() as usize;
                 a &= a - 1;
-                let (ud, nud, rl) = flag_masks(&unsafe { child_flags(&flags, m, t) });
-                let i = t.staging.big_index_n(ud, nud, rl);
+                let i = t
+                    .staging
+                    .big_index_flags(&unsafe { child_flags(&flags, m, t) });
                 t.table.prefetch(i);
                 unsafe { *idx.get_unchecked_mut(nk) = i };
                 nk += 1;
@@ -1578,6 +1621,7 @@ mod tests {
                     let (ud, rl) = c.masks();
                     let g = unsafe { child_flags(&flags, m, &t) };
                     assert_eq!(flag_masks(&g), (ud, !ud & MASK24, rl));
+                    assert_eq!(t.staging.big_index_flags(&g), t.staging.big_index(ud, rl));
                     assert_eq!(
                         t.staging.big_index_n(ud, !ud & MASK24, rl),
                         t.staging.big_index(ud, rl)
