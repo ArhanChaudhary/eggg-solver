@@ -66,7 +66,7 @@ pub(crate) fn byte_counts(x: u32) -> u32 {
 
 /// Without BMI2: per mask byte, per value byte, the value's bits under the mask, packed.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
-fn pext8_table() -> Box<[[u8; 256]; 256]> {
+pub(crate) fn pext8_table() -> Box<[[u8; 256]; 256]> {
     let mut t: Box<[[u8; 256]; 256]> = vec![[0u8; 256]; 256].try_into().unwrap();
     for (m, row) in t.iter_mut().enumerate() {
         for (x, e) in row.iter_mut().enumerate() {

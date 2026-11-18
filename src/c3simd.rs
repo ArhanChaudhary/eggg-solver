@@ -203,6 +203,9 @@ pub struct H48Fast {
     syms: Box<[SymC; 256]>,
     rank495: Box<[u16; 4096]>,
     rank70: [u8; 256],
+    /// Without BMI2: pext of a byte by lookup (see [`H48Fast::pext12`]).
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    pext8: Box<[[u8; 256]; 256]>,
 }
 
 impl H48Fast {
@@ -269,6 +272,25 @@ impl H48Fast {
             syms,
             rank495,
             rank70,
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+            pext8: crate::phase1::pext8_table(),
+        }
+    }
+
+    /// pext of 12-bit masks: BMI2 on x86-64, else two byte lookups (the portable loop
+    /// was ~8 iterations per phase-3 node on aarch64).
+    #[inline(always)]
+    fn pext12(&self, x: u32, m: u32) -> u32 {
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        {
+            crate::phase1::pext(x, m)
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        {
+            let t = &self.pext8;
+            let p0 = t[(m & 255) as usize][(x & 255) as usize] as u32;
+            let p1 = t[(m >> 8 & 15) as usize][(x >> 8 & 15) as usize] as u32;
+            p0 | p1 << (m & 255).count_ones()
         }
     }
 
@@ -293,7 +315,7 @@ impl H48Fast {
         let m = movemask(&crate::simd::shl::<1>(&z)) >> 16 & 0xfff;
         let o = movemask(&crate::simd::shl::<3>(&z)) >> 16 & 0x7ff;
         let eslot = self.rank495[e as usize] as u32;
-        let msplit = self.rank70[crate::phase1::pext(m, !e & 0xfff) as u8 as usize] as u32;
+        let msplit = self.rank70[self.pext12(m, !e & 0xfff) as u8 as usize] as u32;
         (eslot, msplit, o)
     }
 }
@@ -332,6 +354,22 @@ mod tests {
             for k in 0..48 {
                 assert_eq!(f.edges(&v, k), co.edge_part_conj(&x, k));
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pext_tests {
+    use super::*;
+
+    #[test]
+    fn pext12_matches_pext() {
+        let f = H48Fast::new(&Coords::new());
+        let mut rng = rand::thread_rng();
+        for _ in 0..100_000 {
+            let x = rand::Rng::gen_range(&mut rng, 0..4096u32);
+            let m = rand::Rng::gen_range(&mut rng, 0..4096u32);
+            assert_eq!(f.pext12(x, m), crate::phase1::pext(x, m));
         }
     }
 }
