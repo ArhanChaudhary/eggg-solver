@@ -806,6 +806,9 @@ pub struct P1Tables {
     pub pat: Option<crate::p1pat::PatTable>,
     /// The move-mask table (with the large staging table, see [`crate::p1mask`]).
     pub mask: Option<crate::p1mask::MaskTable>,
+    /// With the move masks: the small (symmetry-reduced) staging table, for the depth-first
+    /// part of the search (mostly cached, unlike the large one).
+    pub small: Option<Mod3Table>,
 }
 
 /// [`Search1::pair`] for the search over all pairs, pruned by the staging table only.
@@ -856,6 +859,7 @@ impl P1Tables {
             stage_rep,
             pat: None,
             mask: None,
+            small: None,
         }
     }
 
@@ -1077,6 +1081,9 @@ const K_PAT: u8 = 2;
 const K_PAT_BIG: u8 = 3;
 /// The large staging table, and the move-mask table for nodes at distance = moves left.
 const K_MASK: u8 = 4;
+/// [`K_MASK`] with the depth-first nodes' children read from the small staging table
+/// ([`P1Tables::small`]).
+const K_MASK_SMALL: u8 = 5;
 
 impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     pub fn new(t: &'a P1Tables, on_endpoint: F) -> Self {
@@ -1320,7 +1327,11 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 .as_ref()
                 .is_some_and(|m| m.kind != crate::p1mask::MaskKind::Pair)
         {
-            self.dfs_t::<K_MASK>(s, d, left, last);
+            if self.t.small.is_some() {
+                self.dfs_t::<K_MASK_SMALL>(s, d, left, last);
+            } else {
+                self.dfs_t::<K_MASK>(s, d, left, last);
+            }
             if !self.stop {
                 self.run_batch();
             }
@@ -1450,7 +1461,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         }
         // Batches: with the move masks, or (counts only) per-pair searches with the virtual
         // move-mask table, which then gives the pattern-distance-decreasing moves.
-        let batched = K == K_MASK || (K >= K_PAT && K <= K_PAT_BIG && self.t.mask.is_some());
+        let batched = K == K_MASK
+            || K == K_MASK_SMALL
+            || (K >= K_PAT && K <= K_PAT_BIG && self.t.mask.is_some());
         if batched && d == left {
             let i = self
                 .t
@@ -1530,7 +1543,11 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     pt.table.prefetch(*i);
                 } else {
                     *i = t.staging.fast_index_flags(unsafe { *p }, g);
-                    t.table.prefetch(*i);
+                    if K == K_MASK_SMALL {
+                        t.small.as_ref().unwrap().prefetch(*i);
+                    } else {
+                        t.table.prefetch(*i);
+                    }
                 }
             }
         }
@@ -1546,6 +1563,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         }
         let table = if K == K_PAT || K == K_PAT_BIG {
             &t.pat.as_ref().unwrap().table
+        } else if K == K_MASK_SMALL {
+            t.small.as_ref().unwrap()
         } else {
             &t.table
         };
@@ -1555,7 +1574,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         // that the first subtrees overlap the later children's table reads; the small staging
         // table is mostly cached, and reading all the values first is faster.
         let mut dcs = [0u8; N_MOVES];
-        if K == K_SMALL {
+        let small = K == K_SMALL || K == K_MASK_SMALL;
+        if small {
             for (dc, &i) in dcs.iter_mut().zip(idx) {
                 *dc = dec[table.get(i) as usize];
             }
@@ -1564,7 +1584,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         for k in 0..nk {
             let m = allowed.trailing_zeros() as usize;
             allowed &= allowed - 1;
-            let dc = if K != K_SMALL {
+            let dc = if !small {
                 dec[table.get(idx[k]) as usize]
             } else {
                 dcs[k]
