@@ -1060,13 +1060,20 @@ impl BNode {
     }
 }
 
-/// The moves on each axis (move m turns a face of axis (m / 3) % 3).
-const AXIS_MOVES: [u32; 3] = {
-    let mut t = [0u32; 3];
-    let mut m = 0;
-    while m < N_MOVES {
-        t[(m / 3) % 3] |= 1 << m;
-        m += 1;
+/// Per move (and none, [`N_MOVES`]), the moves on its axis (move m turns a face of axis
+/// (m / 3) % 3): the moves that continue a trailing run of same-axis moves.
+const SAME_AXIS: [u32; N_MOVES + 1] = {
+    let mut t = [0u32; N_MOVES + 1];
+    let mut a = 0;
+    while a < N_MOVES {
+        let mut m = 0;
+        while m < N_MOVES {
+            if (m / 3) % 3 == (a / 3) % 3 {
+                t[a] |= 1 << m;
+            }
+            m += 1;
+        }
+        a += 1;
     }
     t
 };
@@ -1075,7 +1082,7 @@ const AXIS_MOVES: [u32; 3] = {
 /// move `last` before it.
 #[inline(always)]
 fn run_after(run: u32, last: usize, m: usize) -> u32 {
-    if last < N_MOVES && (m / 3) % 3 == (last / 3) % 3 {
+    if SAME_AXIS[last] >> m & 1 == 1 {
         run | 1 << m
     } else {
         1 << m
@@ -1361,11 +1368,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         // Every allowed move is a node (the ones not tested after a stop are taken back).
         self.nodes += allowed.count_ones() as u64;
         // The moves that continue the run (on the last move's axis).
-        let same = if last < N_MOVES {
-            AXIS_MOVES[(last / 3) % 3]
-        } else {
-            0
-        };
+        let same = SAME_AXIS[last];
         let t = self.t;
         let (pos, high_bytes) = (s.pos, t.high_bytes);
         // A move that is a phase-2 move in every frame (with the run it continues) ends no
