@@ -132,9 +132,11 @@ mod imp {
             let (a0, a1) = ld(a);
             let m0 = vandq_u8(vcltzq_s8(vreinterpretq_s8_u8(a0)), w);
             let m1 = vandq_u8(vcltzq_s8(vreinterpretq_s8_u8(a1)), w);
-            let b0 = vaddv_u8(vget_low_u8(m0)) as u32 | (vaddv_u8(vget_high_u8(m0)) as u32) << 8;
-            let b1 = vaddv_u8(vget_low_u8(m1)) as u32 | (vaddv_u8(vget_high_u8(m1)) as u32) << 8;
-            b0 | b1 << 16
+            // Pairwise sums: bytes, then quads, then the four mask bytes in lane 0.
+            let s = vpaddq_u8(m0, m1);
+            let s = vpaddq_u8(s, s);
+            let s = vpaddq_u8(s, s);
+            vgetq_lane_u32::<0>(vreinterpretq_u32_u8(s))
         }
     }
 
@@ -305,6 +307,13 @@ mod tests {
         let m = movemask(&a);
         for i in 0..32 {
             assert_eq!(m >> i & 1, (v[i] >> 7) as u32);
+        }
+        for k in 0..1000u32 {
+            let x = V32(std::array::from_fn(|i| {
+                (k.wrapping_mul(2654435761) >> (i % 24)) as u8 ^ (i as u8 * 37)
+            }));
+            let want = (0..32).fold(0, |a, i| a | ((x.0[i] >> 7) as u32) << i);
+            assert_eq!(movemask(&x), want);
         }
         for bit in 0..8 {
             let bm = a.bit_mask(bit);
