@@ -234,8 +234,16 @@ impl MaskTable {
             crate::table::prefetch(unsafe { self.pair.as_ptr().add(5 * j as usize) });
             return (j, info as u8);
         }
+        self.resolve_flags(t, i, &s.centre_flags())
+    }
+
+    /// [`MaskTable::resolve`] for the reduced table, given the rank `i` of the U/D positions
+    /// and the state's centre flags (`P1State::centre_flags`).
+    #[inline(always)]
+    pub(crate) fn resolve_flags(&self, t: &P1Tables, i: u64, flags: &V32) -> (u64, u8) {
+        let st = &t.staging;
         let info = unsafe { *st.info_of_rank(i) };
-        let j = st.fast_index_flags(info, &s.centre_flags());
+        let j = st.fast_index_flags(info, flags);
         crate::table::prefetch(unsafe { self.red.as_ptr().add(j as usize) });
         (j, info as u8)
     }

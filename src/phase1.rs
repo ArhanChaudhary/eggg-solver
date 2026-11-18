@@ -1073,7 +1073,14 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         let run = trailing_run(&self.batch_roots[off + 1..]);
         let id = self.batch_tree.len() as u32;
         self.batch_tree.push((ROOT | off as u32, 0));
-        self.t.mask.as_ref().unwrap().prefetch(self.t, idx);
+        let mt = self.t.mask.as_ref().unwrap();
+        // The reduced table's nodes are queued with their index (and its entry prefetched).
+        let (idx, sym) = if mt.kind == crate::p1mask::MaskKind::Reduced {
+            mt.resolve(self.t, idx, &s, self.pair)
+        } else {
+            mt.prefetch(self.t, idx);
+            (idx, 0)
+        };
         self.batch.push(BNode {
             centres: s.centres,
             pos: s.pos,
@@ -1081,18 +1088,18 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             id,
             run,
             parity: s.parity,
-            sym: 0,
+            sym,
             left,
             last: last as u8,
         });
     }
 
-    /// Queue the child `c` (after move `m`, first index `idx`) of batch node `nd`.
+    /// Queue the child `c` (after move `m`) of batch node `nd`: its first index `idx` (its
+    /// entry or class info prefetched), or for the reduced table its index and symmetry.
     #[inline(always)]
-    fn push_child(&mut self, nd: &BNode, c: &P1State, idx: u64, m: usize) {
+    fn push_child(&mut self, nd: &BNode, c: &P1State, (idx, sym): (u64, u8), m: usize) {
         let id = self.batch_tree.len() as u32;
         self.batch_tree.push((nd.id, m as u8));
-        self.t.mask.as_ref().unwrap().prefetch(self.t, idx);
         self.batch.push(BNode {
             centres: c.centres,
             pos: c.pos,
@@ -1100,7 +1107,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             id,
             run: run_after(nd.run, nd.last as usize, m),
             parity: c.parity,
-            sym: 0,
+            sym,
             left: nd.left - 1,
             last: m as u8,
         });
@@ -1153,11 +1160,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 self.batch.clear();
                 return;
             }
-            if matches!(
-                mt.kind,
-                crate::p1mask::MaskKind::Reduced | crate::p1mask::MaskKind::Pair
-            ) {
-                // The reduced table's index needs the class info (prefetched at the push).
+            if mt.kind == crate::p1mask::MaskKind::Pair {
+                // The pair table's index needs the class info (prefetched at the push).
                 for nd in cur.iter_mut() {
                     (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.state(), self.pair);
                 }
@@ -1201,8 +1205,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         a &= a - 1;
                         let g = unsafe { child_flags(&flags, m, t) };
                         let i = t.staging.rank24(crate::simd::movemask(&g)) as u64;
+                        mt.prefetch(t, i);
                         let c = s.apply(m, t);
-                        self.push_child(nd, &c, i, m);
+                        self.push_child(nd, &c, (i, 0), m);
                     }
                 } else {
                     let flags = s.centre_flags();
@@ -1210,13 +1215,16 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         let m = a.trailing_zeros() as usize;
                         a &= a - 1;
                         let g = unsafe { child_flags(&flags, m, t) };
-                        // The reduced table needs only the rank of the U/D positions.
+                        // The reduced table: the index from the class info of the U/D
+                        // positions, now (the info table is small enough to be cached).
                         let i = if reduced {
                             let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
-                            t.staging.rank24(!nud & MASK24) as u64
+                            mt.resolve_flags(t, t.staging.rank24(!nud & MASK24) as u64, &g)
                         } else {
                             let (ud, nud, rl) = flag_masks(&g);
-                            t.staging.big_index_n(ud, nud, rl)
+                            let i = t.staging.big_index_n(ud, nud, rl);
+                            mt.prefetch(t, i);
+                            (i, 0)
                         };
                         let c = s.apply(m, t);
                         self.push_child(nd, &c, i, m);
