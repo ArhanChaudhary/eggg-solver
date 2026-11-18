@@ -765,6 +765,24 @@ pub struct P1Tables {
     pub mask: Option<crate::p1mask::MaskTable>,
 }
 
+/// [`P1Tables::wing_frames`] from the gathered low-slot flags `x` (see
+/// [`P1Tables::low_after`]) and the high pieces' flags.
+#[inline(always)]
+fn wing_test(x: &V32, high_bytes: &[u64; 3]) -> u32 {
+    let w = |k: usize| u64::from_le_bytes(x.0[8 * k..8 * k + 8].try_into().unwrap());
+    let (w0, w1, w2) = (w(0), w(1), w(2));
+    // Pieces 2k and 2k + 1 (a dedge): exactly one low (even bytes of w ^ w >> 8).
+    let t = (w0 ^ w0 >> 8) & (w1 ^ w1 >> 8) & (w2 ^ w2 >> 8);
+    let t = t & t >> 16;
+    let t = t & t >> 32;
+    // An even number of low wings among the high pieces.
+    let mut p = (w0 & high_bytes[0]) ^ (w1 & high_bytes[1]) ^ (w2 & high_bytes[2]);
+    p ^= p >> 32;
+    p ^= p >> 16;
+    p ^= p >> 8;
+    ((t & !p) >> 5) as u32 & 7
+}
+
 /// [`Search1::pair`] for the search over all pairs, pruned by the staging table only.
 pub const ALL_PAIRS: usize = 3;
 
@@ -895,20 +913,10 @@ impl P1Tables {
     #[inline(always)]
     pub fn wing_frames(&self, pos: &V32, m: usize) -> u32 {
         debug_assert!(m < N_MOVES);
-        let x = unsafe { self.low_after.get_unchecked(m) }.gather(pos);
-        let w = |k: usize| u64::from_le_bytes(x.0[8 * k..8 * k + 8].try_into().unwrap());
-        let (w0, w1, w2) = (w(0), w(1), w(2));
-        // Pieces 2k and 2k + 1 (a dedge): exactly one low (even bytes of w ^ w >> 8).
-        let t = (w0 ^ w0 >> 8) & (w1 ^ w1 >> 8) & (w2 ^ w2 >> 8);
-        let t = t & t >> 16;
-        let t = t & t >> 32;
-        // An even number of low wings among the high pieces.
-        let mut p =
-            (w0 & self.high_bytes[0]) ^ (w1 & self.high_bytes[1]) ^ (w2 & self.high_bytes[2]);
-        p ^= p >> 32;
-        p ^= p >> 16;
-        p ^= p >> 8;
-        ((t & !p) >> 5) as u32 & 7
+        wing_test(
+            &unsafe { self.low_after.get_unchecked(m) }.gather(pos),
+            &self.high_bytes,
+        )
     }
 
     /// Which frames accept this staged state as an endpoint (bit f), given the trailing run
@@ -1000,6 +1008,17 @@ impl BNode {
         }
     }
 }
+
+/// The moves on each axis (move m turns a face of axis (m / 3) % 3).
+const AXIS_MOVES: [u32; 3] = {
+    let mut t = [0u32; 3];
+    let mut m = 0;
+    while m < N_MOVES {
+        t[(m / 3) % 3] |= 1 << m;
+        m += 1;
+    }
+    t
+};
 
 /// The trailing run of same-axis moves after move `m`, given the run `run` before it and the
 /// move `last` before it.
@@ -1290,14 +1309,21 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         }
         // Every allowed move is a node (the ones not tested after a stop are taken back).
         self.nodes += allowed.count_ones() as u64;
+        // The moves that continue the run (on the last move's axis).
+        let same = if last < N_MOVES {
+            AXIS_MOVES[(last / 3) % 3]
+        } else {
+            0
+        };
+        let t = self.t;
+        let (pos, high_bytes) = (s.pos, t.high_bytes);
         while allowed != 0 {
             let m = allowed.trailing_zeros() as usize;
             allowed &= allowed - 1;
-            let mut excl = unsafe { *self.t.p2_frames.get_unchecked(m) };
-            if last < N_MOVES && (m / 3) % 3 == (last / 3) % 3 {
-                excl |= run_frames;
-            }
-            let mut frames = (self.t.wing_frames(&s.pos, m) & !excl as u32) as u8;
+            let excl = unsafe { *t.p2_frames.get_unchecked(m) } as u32
+                | run_frames as u32 & 0u32.wrapping_sub(same >> m & 1);
+            let x = unsafe { t.low_after.get_unchecked(m) }.gather(&pos);
+            let mut frames = (wing_test(&x, &high_bytes) & !excl) as u8;
             if frames == 0 {
                 continue;
             }
