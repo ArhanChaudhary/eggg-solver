@@ -804,6 +804,9 @@ pub struct P1Tables {
     p2_frames: [u8; N_MOVES],
     /// Per set r of frames, the moves that are phase-2 moves in all frames but r's.
     all_p2: [u32; 8],
+    /// Per move m, per position i: the source (as in `centre_idx[m]`) of the first position
+    /// on i's axis (see [`P1Tables::staged_after`]).
+    stage_rep: [V32; N_MOVES],
     /// The pattern table (searches per colour pair, see [`crate::p1pat`]).
     pub pat: Option<crate::p1pat::PatTable>,
     /// The move-mask table (with the large staging table, see [`crate::p1mask`]).
@@ -876,6 +879,13 @@ impl P1Tables {
                 .filter(|&m| (p2_frames[m] as usize | r) == 7)
                 .fold(0, |a, m| a | 1 << m)
         });
+        let stage_rep = std::array::from_fn(|m| {
+            let mut v: V32 = centre_idx[m];
+            for i in 0..24 {
+                v.0[i] = centre_idx[m].0[4 * ((i / 4) % 3)];
+            }
+            v
+        });
         P1Tables {
             staging,
             table,
@@ -887,6 +897,7 @@ impl P1Tables {
             high_bytes,
             p2_frames,
             all_p2,
+            stage_rep,
             pat: None,
             mask: None,
         }
@@ -968,6 +979,17 @@ impl P1Tables {
             &unsafe { self.low_after.get_unchecked(m) }.gather(pos),
             &self.high_bytes,
         )
+    }
+
+    /// Are the centres staged after move `m` from `centres` (staging distance 0: on each
+    /// axis, the 8 centres of one colour pair)?
+    #[inline(always)]
+    pub fn staged_after(&self, centres: &V32, m: usize) -> bool {
+        debug_assert!(m < N_MOVES);
+        const PAIR: V32 = V32([0xfe; 32]);
+        let a = centres.gather(unsafe { self.centre_idx.get_unchecked(m) });
+        let b = centres.gather(unsafe { self.stage_rep.get_unchecked(m) });
+        crate::simd::is_zero(&crate::simd::and(&crate::simd::xor(&a, &b), &PAIR))
     }
 
     /// Which frames accept this staged state as an endpoint (bit f), given the trailing run
@@ -1374,9 +1396,16 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         // A move that is a phase-2 move in every frame (with the run it continues) ends no
         // endpoint: it is counted, not tested (the half turns, for one).
         let mut test = allowed & !(t.all_p2[0] | same & t.all_p2[run_frames as usize]);
+        // Without the staging moves from a mask, the search over all pairs tests that the move
+        // stages the centres first (the cheaper and less selective test; no table read).
+        let check_staged = staging.is_none() && self.pair == ALL_PAIRS;
+        let centres = s.centres;
         while test != 0 {
             let m = test.trailing_zeros() as usize;
             test &= test - 1;
+            if check_staged && !t.staged_after(&centres, m) {
+                continue;
+            }
             let excl = unsafe { *t.p2_frames.get_unchecked(m) } as u32
                 | run_frames as u32 & 0u32.wrapping_sub(same >> m & 1);
             let x = unsafe { t.low_after.get_unchecked(m) }.gather(&pos);
@@ -1385,7 +1414,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 continue;
             }
             let c = s.apply(m, self.t);
-            if staging.is_none() {
+            if staging.is_none() && !check_staged {
                 self.reads += 1;
                 if Mod3Table::decode(d, self.value(&c)) != 0 {
                     continue;
@@ -1730,6 +1759,37 @@ mod tests {
             }
         }
         assert!(seen[0] > 0 && seen[7] > 0 && seen[1..7].iter().any(|&n| n > 0));
+    }
+
+    /// [`P1Tables::staged_after`] agrees with the definition (and with the staging table's
+    /// goal, distance 0, where the large table is in ./tables).
+    #[test]
+    fn staged_after_matches_definition() {
+        let t = P1Tables::with_table(Staging::new(), Mod3Table::from_depths(&[0]));
+        let mut rng = rand::thread_rng();
+        let mut seen = [0u32; 2];
+        for k in 0..20000 {
+            let mut s = P1State::from_cube(&Cube::SOLVED);
+            for j in 0..k % 4 {
+                s = s.apply((k * 11 + j * 7) % N_MOVES, &t);
+            }
+            if k % 3 == 0 {
+                s = P1State::from_cube(&Cube::random(&mut rng));
+            }
+            for m in 0..N_MOVES {
+                let c = s.apply(m, &t);
+                let want = (0..3).all(|a| {
+                    let p: Vec<u8> = (0..24)
+                        .filter(|&i| (i / 4) % 3 == a)
+                        .map(|i| c.centres.0[i] >> 1)
+                        .collect();
+                    p.iter().all(|&x| x == p[0])
+                });
+                assert_eq!(t.staged_after(&s.centres, m), want);
+                seen[want as usize] += 1;
+            }
+        }
+        assert!(seen[0] > 0 && seen[1] > 0);
     }
 
     #[test]

@@ -46,6 +46,14 @@ mod imp {
     }
 
     #[inline(always)]
+    pub fn is_zero(a: &V32) -> bool {
+        unsafe {
+            let v = ld(a);
+            _mm256_testz_si256(v, v) != 0
+        }
+    }
+
+    #[inline(always)]
     pub fn add(a: &V32, b: &V32) -> V32 {
         unsafe { st(_mm256_add_epi8(ld(a), ld(b))) }
     }
@@ -141,6 +149,14 @@ mod imp {
     }
 
     #[inline(always)]
+    pub fn is_zero(a: &V32) -> bool {
+        unsafe {
+            let (a0, a1) = ld(a);
+            vmaxvq_u8(vorrq_u8(a0, a1)) == 0
+        }
+    }
+
+    #[inline(always)]
     pub fn add(a: &V32, b: &V32) -> V32 {
         unsafe { map2(a, b, |x, y| vaddq_u8(x, y)) }
     }
@@ -209,6 +225,11 @@ mod imp {
     }
 
     #[inline(always)]
+    pub fn is_zero(a: &V32) -> bool {
+        a.0.iter().all(|&x| x == 0)
+    }
+
+    #[inline(always)]
     pub fn add(a: &V32, b: &V32) -> V32 {
         zip(a, b, u8::wrapping_add)
     }
@@ -239,7 +260,7 @@ mod imp {
     }
 }
 
-pub use imp::{add, and, gather, min, movemask, shl, shuf, sub, xor};
+pub use imp::{add, and, gather, is_zero, min, movemask, shl, shuf, sub, xor};
 
 impl V32 {
     pub const ZERO: V32 = V32([0; 32]);
@@ -320,6 +341,12 @@ mod tests {
             for i in 0..32 {
                 assert_eq!(bm >> i & 1, (v[i] >> bit & 1) as u32);
             }
+        }
+        assert!(is_zero(&V32::ZERO));
+        for i in 0..32 {
+            let mut z = V32::ZERO;
+            z.0[i] = 1 << (i % 8);
+            assert!(!is_zero(&z));
         }
         let mn = min(&a, &b);
         let ad = add(&a, &b);
