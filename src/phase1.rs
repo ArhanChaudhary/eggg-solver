@@ -1082,6 +1082,17 @@ impl BNode {
     }
 }
 
+/// Per move, the last moves a leaf with even wing parity after it counts.
+const EVEN_LEAF_MOVES: [u8; N_MOVES] = {
+    let mut t = [0u8; N_MOVES];
+    let mut m = 0;
+    while m < N_MOVES {
+        t[m] = (ALLOWED_AFTER[m] & !WIDE_QUARTER).count_ones() as u8;
+        m += 1;
+    }
+    t
+};
+
 /// The wide moves (Uw, Rw, Fw and their powers).
 const WIDE_MOVES: u32 = 0x1ff << 18;
 
@@ -1280,7 +1291,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         while b != 0 {
                             let m = b.trailing_zeros() as usize;
                             b &= b - 1;
-                            self.nodes += (ALLOWED_AFTER[m] & !WIDE_QUARTER).count_ones() as u64;
+                            self.nodes += EVEN_LEAF_MOVES[m] as u64;
                         }
                     }
                     while a != 0 {
