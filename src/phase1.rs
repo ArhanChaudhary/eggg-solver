@@ -1256,10 +1256,11 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             run_frames |= self.t.p2_frames[r.trailing_zeros() as usize];
             r &= r - 1;
         }
+        // Every allowed move is a node (the ones not tested after a stop are taken back).
+        self.nodes += allowed.count_ones() as u64;
         while allowed != 0 {
             let m = allowed.trailing_zeros() as usize;
             allowed &= allowed - 1;
-            self.nodes += 1;
             let mut excl = unsafe { *self.t.p2_frames.get_unchecked(m) };
             if last < N_MOVES && (m / 3) % 3 == (last / 3) % 3 {
                 excl |= run_frames;
@@ -1291,6 +1292,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 self.path.pop();
                 if !go {
                     self.stop = true;
+                    self.nodes -= allowed.count_ones() as u64;
                     return;
                 }
             }
