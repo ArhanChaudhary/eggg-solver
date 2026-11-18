@@ -183,34 +183,46 @@ impl MaskTable {
     }
 
     /// The first index of a batch node (state `s`, search over `pair`): the large staging
-    /// index, or for the pair table the rank of the pair's positions.
+    /// index (large table), or the rank of the U/D positions (reduced table) or of the pair's
+    /// positions (pair table), whose class info [`MaskTable::resolve`] reads.
     #[inline(always)]
     pub fn pre_index(&self, t: &P1Tables, s: &P1State, pair: usize) -> u64 {
-        if self.kind == MaskKind::Pair {
-            let g = t.pat.as_ref().unwrap().flags(&s.centres, pair);
-            t.staging.rank24(crate::simd::movemask(&g)) as u64
-        } else {
-            let (ud, rl) = s.masks();
-            t.staging.big_index(ud, rl)
+        match self.kind {
+            MaskKind::Pair => {
+                let g = t.pat.as_ref().unwrap().flags(&s.centres, pair);
+                t.staging.rank24(crate::simd::movemask(&g)) as u64
+            }
+            MaskKind::Reduced => t.staging.rank24(s.masks().0) as u64,
+            MaskKind::Big | MaskKind::Virtual => {
+                let (ud, rl) = s.masks();
+                t.staging.big_index(ud, rl)
+            }
         }
     }
 
-    /// Prefetch what the mask of the node with large staging index `i` needs first.
+    /// [`MaskTable::pre_index`] of a state with large staging index `i` (not the pair table).
+    #[inline(always)]
+    pub fn pre_index_of_big(&self, i: u64) -> u64 {
+        if self.kind == MaskKind::Reduced {
+            i / N_SPLIT as u64
+        } else {
+            i
+        }
+    }
+
+    /// Prefetch what the mask of the node with first index `i` needs first.
     #[inline(always)]
     pub fn prefetch(&self, t: &P1Tables, i: u64) {
         match self.kind {
             MaskKind::Big => {
                 crate::table::prefetch(unsafe { self.big.as_ptr().add(i as usize) });
             }
-            MaskKind::Reduced => {
-                crate::table::prefetch(t.staging.info_of_rank(i / N_SPLIT as u64));
-            }
-            MaskKind::Pair => crate::table::prefetch(t.staging.info_of_rank(i)),
+            MaskKind::Reduced | MaskKind::Pair => crate::table::prefetch(t.staging.info_of_rank(i)),
             MaskKind::Virtual => {}
         }
     }
 
-    /// The reduced table's index and symmetry for the node with large staging index `i`
+    /// The reduced (or pair) table's index and symmetry for the node with first index `i`
     /// (its class info prefetched), the entry prefetched.
     #[inline(always)]
     pub fn resolve(&self, t: &P1Tables, i: u64, s: &P1State, pair: usize) -> (u64, u8) {
@@ -222,7 +234,7 @@ impl MaskTable {
             crate::table::prefetch(unsafe { self.pair.as_ptr().add(5 * j as usize) });
             return (j, info as u8);
         }
-        let info = unsafe { *st.info_of_rank(i / N_SPLIT as u64) };
+        let info = unsafe { *st.info_of_rank(i) };
         let j = st.fast_index_flags(info, &s.centre_flags());
         crate::table::prefetch(unsafe { self.red.as_ptr().add(j as usize) });
         (j, info as u8)

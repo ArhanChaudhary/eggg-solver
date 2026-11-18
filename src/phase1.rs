@@ -818,21 +818,55 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     /// batches (see [`Search1::run_batch`]).
     batch: Vec<BNode>,
     batch_next: Vec<BNode>,
+    /// The paths of the batch nodes, as a tree: per node (by [`BNode::id`]), its parent's id
+    /// and its last move, or for a node queued by the depth-first search, [`ROOT`] | the
+    /// offset in `batch_roots` of its path (its length, then the moves).
+    batch_tree: Vec<(u32, u8)>,
+    batch_roots: Vec<u8>,
     batch_path: Vec<u8>,
 }
 
-/// A node of a batch: its state, mask-table index and path (moves left = staging distance).
+/// See [`Search1::batch_tree`].
+const ROOT: u32 = 1 << 31;
+
+/// A node of a batch (moves left = staging distance): its state, mask-table index, and its
+/// path's entry in [`Search1::batch_tree`].
 #[derive(Clone, Copy)]
 struct BNode {
-    s: P1State,
-    /// The large staging table's index (for the reduced mask table: its index, once
-    /// resolved at the start of the node's round, with `sym`).
+    centres: V32,
+    pos: V32,
+    /// The mask table's first index (see `MaskTable::pre_index`; for the reduced and pair
+    /// tables, their index, once resolved at the start of the node's round, with `sym`).
     idx: u64,
+    id: u32,
+    /// The moves of its path's trailing run of same-axis moves (see [`trailing_run`]).
+    run: u32,
+    parity: bool,
     sym: u8,
     left: u8,
     last: u8,
-    plen: u8,
-    path: [u8; 44],
+}
+
+impl BNode {
+    #[inline(always)]
+    fn state(&self) -> P1State {
+        P1State {
+            centres: self.centres,
+            pos: self.pos,
+            parity: self.parity,
+        }
+    }
+}
+
+/// The trailing run of same-axis moves after move `m`, given the run `run` before it and the
+/// move `last` before it.
+#[inline(always)]
+fn run_after(run: u32, last: usize, m: usize) -> u32 {
+    if last < N_MOVES && (m / 3) % 3 == (last / 3) % 3 {
+        run | 1 << m
+    } else {
+        1 << m
+    }
 }
 
 /// The table guiding a search ([`Search1::dfs_t`]'s `K`).
@@ -856,31 +890,75 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             pair: ALL_PAIRS,
             batch: vec![],
             batch_next: vec![],
+            batch_tree: vec![],
+            batch_roots: vec![],
             batch_path: Vec::with_capacity(48),
         }
     }
 
-    /// Queue a node at staging distance `left` = moves left (>= 2) for a batch.
+    /// Queue a node at staging distance `left` = moves left (>= 2) for a batch: the state `s`
+    /// after the search's path and `m` (if any), its mask table's first index `idx`.
     #[inline(always)]
     fn push_batch(&mut self, s: P1State, idx: u64, left: u8, last: usize, m: Option<u8>) {
-        let mut path = [0u8; 44];
-        let n = self.path.len();
-        path[..n].copy_from_slice(&self.path);
-        let mut plen = n as u8;
+        let off = self.batch_roots.len();
+        self.batch_roots.push(0);
+        self.batch_roots.extend_from_slice(&self.path);
         if let Some(m) = m {
-            path[n] = m;
-            plen += 1;
+            self.batch_roots.push(m);
         }
+        let n = self.batch_roots.len() - off - 1;
+        self.batch_roots[off] = n as u8;
+        let run = trailing_run(&self.batch_roots[off + 1..]);
+        let id = self.batch_tree.len() as u32;
+        self.batch_tree.push((ROOT | off as u32, 0));
         self.t.mask.as_ref().unwrap().prefetch(self.t, idx);
         self.batch.push(BNode {
-            s,
+            centres: s.centres,
+            pos: s.pos,
             idx,
+            id,
+            run,
+            parity: s.parity,
             sym: 0,
             left,
             last: last as u8,
-            plen,
-            path,
         });
+    }
+
+    /// Queue the child `c` (after move `m`, first index `idx`) of batch node `nd`.
+    #[inline(always)]
+    fn push_child(&mut self, nd: &BNode, c: &P1State, idx: u64, m: usize) {
+        let id = self.batch_tree.len() as u32;
+        self.batch_tree.push((nd.id, m as u8));
+        self.t.mask.as_ref().unwrap().prefetch(self.t, idx);
+        self.batch.push(BNode {
+            centres: c.centres,
+            pos: c.pos,
+            idx,
+            id,
+            run: run_after(nd.run, nd.last as usize, m),
+            parity: c.parity,
+            sym: 0,
+            left: nd.left - 1,
+            last: m as u8,
+        });
+    }
+
+    /// Set `self.path` to the path of batch node `id` (see [`Search1::batch_tree`]).
+    #[cold]
+    fn set_batch_path(&mut self, id: u32) {
+        let mut tail = vec![];
+        let mut e = self.batch_tree[id as usize];
+        while e.0 & ROOT == 0 {
+            tail.push(e.1);
+            e = self.batch_tree[e.0 as usize];
+        }
+        let off = (e.0 & !ROOT) as usize;
+        let n = self.batch_roots[off] as usize;
+        self.path.clear();
+        self.path
+            .extend_from_slice(&self.batch_roots[off + 1..off + 1 + n]);
+        self.path.extend(tail.iter().rev());
     }
 
     /// Search the subtrees of the queued nodes: in rounds, each node's children are the
@@ -891,11 +969,14 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         std::mem::swap(&mut self.path, &mut self.batch_path);
         self.run_batch_rounds();
         std::mem::swap(&mut self.path, &mut self.batch_path);
+        self.batch_tree.clear();
+        self.batch_roots.clear();
     }
 
     fn run_batch_rounds(&mut self) {
         let t = self.t;
         let mt = t.mask.as_ref().unwrap();
+        let reduced = mt.kind == crate::p1mask::MaskKind::Reduced;
         while !self.batch.is_empty() {
             let mut cur = std::mem::take(&mut self.batch);
             std::mem::swap(&mut self.batch, &mut self.batch_next);
@@ -916,18 +997,24 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             ) {
                 // The reduced table's index needs the class info (prefetched at the push).
                 for nd in cur.iter_mut() {
-                    (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.s, self.pair);
+                    (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.state(), self.pair);
                 }
             }
             for nd in &cur {
+                let s = nd.state();
                 let mut a =
-                    mt.get(t, nd.idx, nd.sym, &nd.s, self.pair) & ALLOWED_AFTER[nd.last as usize];
+                    mt.get(t, nd.idx, nd.sym, &s, self.pair) & ALLOWED_AFTER[nd.last as usize];
                 self.nodes += a.count_ones() as u64;
                 self.reads += 1;
-                self.path.clear();
-                self.path.extend_from_slice(&nd.path[..nd.plen as usize]);
                 if nd.left == 1 {
-                    self.leaf(&nd.s, 1, nd.last as usize, Some(a));
+                    self.leaf(
+                        &s,
+                        1,
+                        nd.last as usize,
+                        Some(a),
+                        nd.run,
+                        Some((nd.id, None)),
+                    );
                     if self.stop {
                         self.batch.clear();
                         return;
@@ -936,10 +1023,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     while a != 0 {
                         let m = a.trailing_zeros() as usize;
                         a &= a - 1;
-                        let c = nd.s.apply(m, t);
-                        self.path.push(m as u8);
-                        self.leaf(&c, 1, m, None);
-                        self.path.pop();
+                        let c = s.apply(m, t);
+                        let run = run_after(nd.run, nd.last as usize, m);
+                        self.leaf(&c, 1, m, None, run, Some((nd.id, Some(m as u8))));
                         if self.stop {
                             self.batch.clear();
                             return;
@@ -947,24 +1033,31 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     }
                 } else if mt.kind == crate::p1mask::MaskKind::Pair {
                     // The children's first index: the rank of the pair's positions.
-                    let flags = t.pat.as_ref().unwrap().flags(&nd.s.centres, self.pair);
+                    let flags = t.pat.as_ref().unwrap().flags(&s.centres, self.pair);
                     while a != 0 {
                         let m = a.trailing_zeros() as usize;
                         a &= a - 1;
                         let g = unsafe { child_flags(&flags, m, t) };
                         let i = t.staging.rank24(crate::simd::movemask(&g)) as u64;
-                        let c = nd.s.apply(m, t);
-                        self.push_batch(c, i, nd.left - 1, m, Some(m as u8));
+                        let c = s.apply(m, t);
+                        self.push_child(nd, &c, i, m);
                     }
                 } else {
-                    let flags = nd.s.centre_flags();
+                    let flags = s.centre_flags();
                     while a != 0 {
                         let m = a.trailing_zeros() as usize;
                         a &= a - 1;
-                        let (ud, nud, rl) = flag_masks(&unsafe { child_flags(&flags, m, t) });
-                        let i = t.staging.big_index_n(ud, nud, rl);
-                        let c = nd.s.apply(m, t);
-                        self.push_batch(c, i, nd.left - 1, m, Some(m as u8));
+                        let g = unsafe { child_flags(&flags, m, t) };
+                        // The reduced table needs only the rank of the U/D positions.
+                        let i = if reduced {
+                            let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
+                            t.staging.rank24(!nud & MASK24) as u64
+                        } else {
+                            let (ud, nud, rl) = flag_masks(&g);
+                            t.staging.big_index_n(ud, nud, rl)
+                        };
+                        let c = s.apply(m, t);
+                        self.push_child(nd, &c, i, m);
                     }
                 }
             }
@@ -1022,7 +1115,18 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
 
     /// The last move below `s` (exact distance `d`, one move left): endpoint tests.
     /// `staging`: the moves that stage the centres, if known (from a move mask, `d` = 1).
-    fn leaf(&mut self, s: &P1State, d: u8, last: usize, staging: Option<u32>) {
+    /// `run`: the trailing run of same-axis moves of the path to `s` ([`trailing_run`]).
+    /// `batch`: the path to `s` is that of batch node `id` and move `m` (if any), not
+    /// `self.path`.
+    fn leaf(
+        &mut self,
+        s: &P1State,
+        d: u8,
+        last: usize,
+        staging: Option<u32>,
+        run: u32,
+        batch: Option<(u32, Option<u8>)>,
+    ) {
         // The last move must leave the wing permutation even, and the wings pairable in a
         // frame where the path's trailing run of same-axis moves has no phase-2 move (else
         // the shorter endpoint without them, with them opening phase 2, covers it): both
@@ -1033,17 +1137,12 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         } else {
             !WIDE_QUARTER
         };
-        let run = trailing_run(&self.path);
         while allowed != 0 {
             let m = allowed.trailing_zeros() as usize;
             allowed &= allowed - 1;
             self.nodes += 1;
             let pos = self.t.wing_dst[m].gather(&s.pos);
-            let run_m = if last < N_MOVES && (m / 3) % 3 == (last / 3) % 3 {
-                run | 1 << m
-            } else {
-                1 << m
-            };
+            let run_m = run_after(run, last, m);
             let mut frames = 0u8;
             for (f, fr) in self.t.frames.iter().enumerate() {
                 if fr.p2_mask & run_m == 0 && fr.wings_ok(&pos) {
@@ -1067,6 +1166,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 }
             }
             if frames != 0 {
+                if let Some((id, mv)) = batch {
+                    self.set_batch_path(id);
+                    self.path.extend(mv);
+                }
                 self.path.push(m as u8);
                 let go = (self.on_endpoint)(&self.path, frames);
                 self.path.pop();
@@ -1092,7 +1195,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             return;
         }
         if left == 1 {
-            self.leaf(s, d, last, None);
+            self.leaf(s, d, last, None, trailing_run(&self.path), None);
             return;
         }
         // Batches: with the move masks, or (counts only) per-pair searches with the virtual
@@ -1219,7 +1322,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 let c = s.apply(m, t);
                 if batched && dc == left - 1 && dc >= self.batch_min_left() {
                     let i = if K == K_MASK {
-                        idx[k]
+                        t.mask.as_ref().unwrap().pre_index_of_big(idx[k])
                     } else {
                         t.mask.as_ref().unwrap().pre_index(t, &c, self.pair)
                     };
