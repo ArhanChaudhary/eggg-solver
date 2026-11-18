@@ -21,9 +21,6 @@ fn main() {
     if let Some(kind) = &mask {
         load_mask(&mut p1, dir, kind == "big", true);
         p1.mask.as_ref().unwrap().collapse();
-        if std::env::var_os("EGGG_P1_DFS_SMALL").is_some() {
-            eggg_solver::solver::load_small(&mut p1, dir, 8, false);
-        }
     }
     let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(3);
     let mut h = std::collections::hash_map::DefaultHasher::new();

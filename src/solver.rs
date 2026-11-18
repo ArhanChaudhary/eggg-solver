@@ -984,11 +984,6 @@ pub fn load_pat(
     p1.pat = Some(crate::p1pat::load(dir, &p1.staging, big, threads, verbose));
 }
 
-/// Load (or build) the small staging table into `p1.small` (see [`P1Tables::small`]).
-pub fn load_small(p1: &mut P1Tables, dir: &std::path::Path, threads: usize, verbose: bool) {
-    p1.small = Some(load_p1(dir, false, threads, verbose).table);
-}
-
 /// Load (or build from the large staging table) the phase-1 move-mask table into `p1`: the
 /// large one (`big`, 18.9 GB) or the reduced one (0.8 GB).
 pub fn load_mask(p1: &mut P1Tables, dir: &std::path::Path, big: bool, verbose: bool) {
@@ -1015,9 +1010,6 @@ pub fn load_tables_with(
     if let Some(big) = p1_extra.1 {
         assert!(p1_big, "the move-mask table needs the large staging table");
         load_mask(&mut p1, dir, big, verbose);
-        if std::env::var_os("EGGG_P1_DFS_SMALL").is_some() {
-            load_small(&mut p1, dir, threads, verbose);
-        }
     }
     let p2_path = dir.join("p2-tau.tab");
     let p2 = {
