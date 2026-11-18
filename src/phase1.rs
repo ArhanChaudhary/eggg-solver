@@ -802,6 +802,8 @@ pub struct P1Tables {
     high_bytes: [u64; 3],
     /// Per move, the frames (bit f) in which it is a phase-2 move.
     p2_frames: [u8; N_MOVES],
+    /// Per set r of frames, the moves that are phase-2 moves in all frames but r's.
+    all_p2: [u32; 8],
     /// The pattern table (searches per colour pair, see [`crate::p1pat`]).
     pub pat: Option<crate::p1pat::PatTable>,
     /// The move-mask table (with the large staging table, see [`crate::p1mask`]).
@@ -869,6 +871,11 @@ impl P1Tables {
                 .filter(|&f| frames[f].p2_mask >> m & 1 == 1)
                 .fold(0, |a, f| a | 1 << f)
         });
+        let all_p2 = std::array::from_fn(|r| {
+            (0..N_MOVES)
+                .filter(|&m| (p2_frames[m] as usize | r) == 7)
+                .fold(0, |a, m| a | 1 << m)
+        });
         P1Tables {
             staging,
             table,
@@ -879,6 +886,7 @@ impl P1Tables {
             low_after,
             high_bytes,
             p2_frames,
+            all_p2,
             pat: None,
             mask: None,
         }
@@ -1335,12 +1343,13 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         // frame where the path's trailing run of same-axis moves has no phase-2 move (else
         // the shorter endpoint without them, with them opening phase 2, covers it): both
         // are tested before the centres.
-        let mut allowed = ALLOWED_AFTER[last] & staging.unwrap_or(u32::MAX);
-        allowed &= if s.parity {
-            WIDE_QUARTER
-        } else {
-            !WIDE_QUARTER
-        };
+        let allowed = ALLOWED_AFTER[last]
+            & staging.unwrap_or(u32::MAX)
+            & if s.parity {
+                WIDE_QUARTER
+            } else {
+                !WIDE_QUARTER
+            };
         // The frames in which the run before the last move has a phase-2 move (the last move
         // continues the run if on the same axis).
         let mut run_frames = 0;
@@ -1359,9 +1368,12 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         };
         let t = self.t;
         let (pos, high_bytes) = (s.pos, t.high_bytes);
-        while allowed != 0 {
-            let m = allowed.trailing_zeros() as usize;
-            allowed &= allowed - 1;
+        // A move that is a phase-2 move in every frame (with the run it continues) ends no
+        // endpoint: it is counted, not tested (the half turns, for one).
+        let mut test = allowed & !(t.all_p2[0] | same & t.all_p2[run_frames as usize]);
+        while test != 0 {
+            let m = test.trailing_zeros() as usize;
+            test &= test - 1;
             let excl = unsafe { *t.p2_frames.get_unchecked(m) } as u32
                 | run_frames as u32 & 0u32.wrapping_sub(same >> m & 1);
             let x = unsafe { t.low_after.get_unchecked(m) }.gather(&pos);
@@ -1392,7 +1404,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 self.path.pop();
                 if !go {
                     self.stop = true;
-                    self.nodes -= allowed.count_ones() as u64;
+                    // The moves after m were not tested.
+                    self.nodes -= (allowed >> m >> 1).count_ones() as u64;
                     return;
                 }
             }
