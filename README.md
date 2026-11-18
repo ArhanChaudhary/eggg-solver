@@ -56,7 +56,8 @@ large phase-1 table, `--p1-mask none` to turn it off) stores, per staging state,
 that decrease the staging distance: deep in the tree almost every node is at distance =
 moves left, and then one read of its mask replaces ~20 reads of its children; such nodes are
 expanded in batches with the masks prefetched a round ahead (10x fewer reads in all; phase 1
-5x faster on the M2). `--p1-mask big` is the same without the symmetry reduction (18.9 GB).
+5x faster on the M2; in 60 s runs on the M2, 8 threads, 20 positions: 39.70 -> 39.30 moves,
+and the masked solver reaches at 10 s what it reached at 60 s without them). `--p1-mask big` is the same without the symmetry reduction (18.9 GB).
 Experimental (see `src/p1pat.rs`): `--p1-pat small|big` (0.9 / 41 GB) runs one phase-1 search
 per colour pair, pruned by the distance to staged centres with that pair in a pattern phase
 2 can solve (0.53x reads, 1.4x faster on the M2); with `--p1-mask` too, the pair searches use
@@ -97,8 +98,8 @@ after 60 s.
 - `cargo test --release` (end-to-end tests use `./tables`, generating them if missing).
 - Benchmarks (random positions; best length after a time limit, multi- and single-threaded):
   `scripts/x86-build.sh LABEL REF` + `scripts/x86-bench.sh NAME...` on this machine,
-  `scripts/m2-build.sh` + `scripts/m2-bench.sh` on the ARM laptop (each under an exclusive
-  benchmark lock), then `scripts/compare.py A B` for a before/after table and
+  `scripts/m2-build.sh` + `scripts/m2-bench.sh` (and `scripts/m2-long.sh` for paired long
+  runs) on the ARM laptop (each under an exclusive benchmark lock), then `scripts/compare.py A B` for a before/after table and
   `scripts/paired.py A.json B.json` for a per-position paired comparison (runs of one build
   reproduce per-position lengths, so small differences are measurable).
 - `examples/` holds deterministic checks used during optimisation: `p1check` (phase-1
