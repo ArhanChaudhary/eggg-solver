@@ -446,8 +446,12 @@ impl<'a, 'r> Run<'a, 'r> {
             // Phase 3 gets about 1.5 times the production time so far (shallow levels over the
             // whole pool are cheap; deep ones wait for a bigger pool).
             let t1 = Instant::now();
+            // Until a first solution exists, phase 3 gets three times that: otherwise a fast
+            // phase 1 grows the pool faster than phase 3 can finish the levels that hold the
+            // first solution, and the levels only get costlier.
+            let factor = if self.best.is_some() { 1.5 } else { 4.5 };
             let budget =
-                (produce.mul_f64(1.5).saturating_sub(check)).max(Duration::from_millis(10));
+                (produce.mul_f64(factor).saturating_sub(check)).max(Duration::from_millis(10));
             self.phase3_levels(t1 + budget);
             self.stats.time[2] += t1.elapsed();
             check += t1.elapsed();

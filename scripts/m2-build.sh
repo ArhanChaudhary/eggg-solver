@@ -1,5 +1,6 @@
 #!/bin/bash
-# Build git REF on the M2 laptop as ~/eggg/bin/eggg-LABEL (untimed: nice 19, no lock).
+# Build git REF on the M2 laptop as ~/eggg/bin/eggg-LABEL (nice 19, under the exclusive
+# /tmp/m2-bench.lock: a release build and link can use over 1 GB, and the M2 is shared).
 #   scripts/m2-build.sh LABEL REF
 set -e
 label=${1:?usage: m2-build.sh LABEL REF}; ref=${2:?}
@@ -11,4 +12,4 @@ git archive "$ref" | tar x -C "$tmp"
 rsync -az --delete -e "$E" "$tmp/" arhan@192.168.191.121:eggg/src/
 rm -rf "$tmp"
 $M2 ". ~/fto/env.sh; export CARGO_TARGET_DIR=~/eggg/target TMPDIR=~/eggg/tmp; mkdir -p ~/eggg/tmp ~/eggg/bin;
-     find ~/eggg/src -name "*.rs" -exec touch {} +; cd ~/eggg/src && nice -n 19 cargo build --release 2>&1 | tail -2 && cp ~/eggg/target/release/eggg-solver ~/eggg/bin/eggg-$label && echo built eggg-$label" 2>&1 | grep -E "built|error|warning|Finished"
+     find ~/eggg/src -name "*.rs" -exec touch {} +; cd ~/eggg/src && flock -x /tmp/m2-bench.lock nice -n 19 cargo build --release 2>&1 | tail -2 && cp ~/eggg/target/release/eggg-solver ~/eggg/bin/eggg-$label && echo built eggg-$label" 2>&1 | grep -E "built|error|warning|Finished"
