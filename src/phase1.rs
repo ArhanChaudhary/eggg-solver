@@ -1724,6 +1724,10 @@ mod tests {
         if with_pat {
             crate::solver::load_pat(&mut t, dir, false, 8, false);
         }
+        let mut small = dir
+            .join("p1-staging2.tab")
+            .exists()
+            .then(|| crate::solver::load_p1(dir, false, 8, false).table);
         let mut rng = rand::thread_rng();
         for _ in 0..3 {
             let root = P1State::from_cube(&Cube::random(&mut rng));
@@ -1733,6 +1737,12 @@ mod tests {
                 let want = endpoint_set(&t, &root, len, false);
                 t.mask = Some(crate::p1mask::MaskTable::virtual_table());
                 assert_eq!(endpoint_set(&t, &root, len, false), want);
+                if small.is_some() {
+                    // The depth-first part reading the small staging table.
+                    t.small = small.take();
+                    assert_eq!(endpoint_set(&t, &root, len, false), want);
+                    small = t.small.take();
+                }
                 t.mask = None;
                 if with_pat {
                     assert_eq!(endpoint_set(&t, &root, len, true), want);
