@@ -46,6 +46,14 @@ mod imp {
     }
 
     #[inline(always)]
+    pub fn is_zero(a: &V32) -> bool {
+        unsafe {
+            let v = ld(a);
+            _mm256_testz_si256(v, v) != 0
+        }
+    }
+
+    #[inline(always)]
     pub fn add(a: &V32, b: &V32) -> V32 {
         unsafe { st(_mm256_add_epi8(ld(a), ld(b))) }
     }
@@ -132,9 +140,19 @@ mod imp {
             let (a0, a1) = ld(a);
             let m0 = vandq_u8(vcltzq_s8(vreinterpretq_s8_u8(a0)), w);
             let m1 = vandq_u8(vcltzq_s8(vreinterpretq_s8_u8(a1)), w);
-            let b0 = vaddv_u8(vget_low_u8(m0)) as u32 | (vaddv_u8(vget_high_u8(m0)) as u32) << 8;
-            let b1 = vaddv_u8(vget_low_u8(m1)) as u32 | (vaddv_u8(vget_high_u8(m1)) as u32) << 8;
-            b0 | b1 << 16
+            // Pairwise sums: bytes, then quads, then the four mask bytes in lane 0.
+            let s = vpaddq_u8(m0, m1);
+            let s = vpaddq_u8(s, s);
+            let s = vpaddq_u8(s, s);
+            vgetq_lane_u32::<0>(vreinterpretq_u32_u8(s))
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_zero(a: &V32) -> bool {
+        unsafe {
+            let (a0, a1) = ld(a);
+            vmaxvq_u8(vorrq_u8(a0, a1)) == 0
         }
     }
 
@@ -207,6 +225,11 @@ mod imp {
     }
 
     #[inline(always)]
+    pub fn is_zero(a: &V32) -> bool {
+        a.0.iter().all(|&x| x == 0)
+    }
+
+    #[inline(always)]
     pub fn add(a: &V32, b: &V32) -> V32 {
         zip(a, b, u8::wrapping_add)
     }
@@ -237,7 +260,7 @@ mod imp {
     }
 }
 
-pub use imp::{add, and, gather, min, movemask, shl, shuf, sub, xor};
+pub use imp::{add, and, gather, is_zero, min, movemask, shl, shuf, sub, xor};
 
 impl V32 {
     pub const ZERO: V32 = V32([0; 32]);
@@ -306,11 +329,24 @@ mod tests {
         for i in 0..32 {
             assert_eq!(m >> i & 1, (v[i] >> 7) as u32);
         }
+        for k in 0..1000u32 {
+            let x = V32(std::array::from_fn(|i| {
+                (k.wrapping_mul(2654435761) >> (i % 24)) as u8 ^ (i as u8 * 37)
+            }));
+            let want = (0..32).fold(0, |a, i| a | ((x.0[i] >> 7) as u32) << i);
+            assert_eq!(movemask(&x), want);
+        }
         for bit in 0..8 {
             let bm = a.bit_mask(bit);
             for i in 0..32 {
                 assert_eq!(bm >> i & 1, (v[i] >> bit & 1) as u32);
             }
+        }
+        assert!(is_zero(&V32::ZERO));
+        for i in 0..32 {
+            let mut z = V32::ZERO;
+            z.0[i] = 1 << (i % 8);
+            assert!(!is_zero(&z));
         }
         let mn = min(&a, &b);
         let ad = add(&a, &b);

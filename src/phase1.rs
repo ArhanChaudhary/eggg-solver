@@ -50,6 +50,32 @@ pub fn pext(x: u32, m: u32) -> u32 {
     }
 }
 
+/// The bit counts of the four bytes of `x` (one byte each).
+#[inline(always)]
+pub(crate) fn byte_counts(x: u32) -> u32 {
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    unsafe {
+        use std::arch::aarch64::*;
+        vget_lane_u32::<0>(vreinterpret_u32_u8(vcnt_u8(vcreate_u8(x as u64))))
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    {
+        (0..4).fold(0, |a, k| a | (x >> (8 * k) & 255).count_ones() << (8 * k))
+    }
+}
+
+/// Without BMI2: per mask byte, per value byte, the value's bits under the mask, packed.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+pub(crate) fn pext8_table() -> Box<[[u8; 256]; 256]> {
+    let mut t: Box<[[u8; 256]; 256]> = vec![[0u8; 256]; 256].try_into().unwrap();
+    for (m, row) in t.iter_mut().enumerate() {
+        for (x, e) in row.iter_mut().enumerate() {
+            *e = pext(x as u32, m as u32) as u8;
+        }
+    }
+    t
+}
+
 #[inline(always)]
 pub fn pdep(x: u32, m: u32) -> u32 {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
@@ -92,6 +118,13 @@ pub struct Staging {
     /// Byte-sliced colex rank of 8-of-24 masks, by byte and number of bits below it (sized
     /// so that no count of the two lower bytes needs a bounds check; only 0..=8 are used).
     rank_t: [[[u32; 256]; 17]; 3],
+    /// Without BMI2: [`pext`] of a byte by lookup (see [`Staging::pext24`]).
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    pext8: Box<[[u8; 256]; 256]>,
+    /// NEON: per class, the 16 positions outside its representative's U/D mask, in order
+    /// (see [`Staging::fast_index_flags`]).
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    rem_pos: Vec<[u8; 16]>,
 }
 
 fn perm_tables(perm: &[u8; 24]) -> [[u32; 256]; 3] {
@@ -221,7 +254,6 @@ impl Staging {
                 h.as_mut_slice().copy_from_slice(&a_info);
                 h
             },
-            class_rep,
             stab,
             sym_perm,
             sym_gather,
@@ -229,6 +261,36 @@ impl Staging {
             unl,
             unl_inv,
             rank_t,
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+            pext8: pext8_table(),
+            #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+            rem_pos: class_rep
+                .iter()
+                .map(|&r| {
+                    let mut p = (0..24u8).filter(|&i| r >> i & 1 == 0);
+                    std::array::from_fn(|_| p.next().unwrap())
+                })
+                .collect(),
+            class_rep,
+        }
+    }
+
+    /// [`pext`] of 24-bit masks: BMI2 on x86-64, else three byte lookups.
+    #[inline(always)]
+    pub(crate) fn pext24(&self, x: u32, m: u32) -> u32 {
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        {
+            pext(x, m)
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        {
+            let t = &self.pext8;
+            let p0 = t[(m & 255) as usize][(x & 255) as usize] as u32;
+            let p1 = t[(m >> 8 & 255) as usize][(x >> 8 & 255) as usize] as u32;
+            let p2 = t[(m >> 16 & 255) as usize][(x >> 16 & 255) as usize] as u32;
+            let c = byte_counts(m);
+            let c0 = c & 255;
+            p0 | p1 << c0 | p2 << (c0 + (c >> 8 & 255))
         }
     }
 
@@ -237,11 +299,16 @@ impl Staging {
         let b0 = m & 255;
         let b1 = m >> 8 & 255;
         let b2 = m >> 16;
-        let c0 = b0.count_ones() as usize;
-        let c1 = c0 + b1.count_ones() as usize;
-        self.rank_t[0][0][b0 as usize]
-            + self.rank_t[1][c0][b1 as usize]
-            + self.rank_t[2][c1][b2 as usize]
+        let c = byte_counts(m);
+        let c0 = (c & 255) as usize;
+        let c1 = c0 + (c >> 8 & 255) as usize;
+        debug_assert!(c0 <= 8 && c1 <= 16);
+        // SAFETY: a byte has at most 8 bits set (c0 <= 8, c1 <= 16).
+        unsafe {
+            self.rank_t[0][0][b0 as usize]
+                + self.rank_t.get_unchecked(1).get_unchecked(c0)[b1 as usize]
+                + self.rank_t.get_unchecked(2).get_unchecked(c1)[b2 as usize]
+        }
     }
 
     /// Canonical table index of the centre classes given the U/D-colour and R/L-colour
@@ -281,17 +348,37 @@ impl Staging {
         let s = (info & 255) as usize;
         let b = apply_mask(&self.sym_perm[s], rl);
         let rem = !self.class_rep[class] & MASK24;
-        (class * N_SPLIT + self.unl[pext(b, rem) as u16 as usize] as usize) as u64
+        (class * N_SPLIT + self.unl[self.pext24(b, rem) as u16 as usize] as usize) as u64
     }
 
     /// [`Staging::fast_index`] from the flags of the centres (see [`P1State::centre_flags`]).
     #[inline(always)]
     pub(crate) fn fast_index_flags(&self, info: u32, flags: &V32) -> u64 {
         let class = (info >> 8) as usize;
-        let h = flags.gather(&self.sym_gather[(info & 255) as usize]);
-        let b = crate::simd::movemask(&h);
-        let rem = crate::simd::movemask(&crate::simd::add(&h, &h));
-        (class * N_SPLIT + self.unl[pext(b, rem) as u16 as usize] as usize) as u64
+        let g = &self.sym_gather[(info & 255) as usize];
+        // NEON: the R/L flags at the image's positions outside the class representative's
+        // U/D mask, in order, by two table lookups (instead of two movemasks and a pext).
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        let b = unsafe {
+            use std::arch::aarch64::*;
+            let ld = |v: &V32| uint8x16x2_t(vld1q_u8(v.0.as_ptr()), vld1q_u8(v.0.as_ptr().add(16)));
+            let rp = vld1q_u8(self.rem_pos[class].as_ptr());
+            let h = vqtbl2q_u8(ld(flags), vqtbl2q_u8(ld(g), rp));
+            const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+            let m = vandq_u8(vcltzq_s8(vreinterpretq_s8_u8(h)), vld1q_u8(W.as_ptr()));
+            let m = vpaddq_u8(m, m);
+            let m = vpaddq_u8(m, m);
+            let m = vpaddq_u8(m, m);
+            vgetq_lane_u16::<0>(vreinterpretq_u16_u8(m))
+        };
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+        let b = {
+            let h = flags.gather(g);
+            let b = crate::simd::movemask(&h);
+            let rem = crate::simd::movemask(&crate::simd::add(&h, &h));
+            self.pext24(b, rem) as u16
+        };
+        (class * N_SPLIT + self.unl[b as usize] as usize) as u64
     }
 
     pub fn rep_of(&self, idx: u64) -> (u32, u32) {
@@ -312,7 +399,51 @@ impl Staging {
     /// [`Staging::big_index`], given also the complement `nud` of the U/D mask.
     #[inline(always)]
     pub(crate) fn big_index_n(&self, ud: u32, nud: u32, rl: u32) -> u64 {
-        self.rank24(ud) as u64 * N_SPLIT as u64 + self.unl[pext(rl, nud) as u16 as usize] as u64
+        self.rank24(ud) as u64 * N_SPLIT as u64
+            + self.unl[self.pext24(rl, nud) as u16 as usize] as u64
+    }
+
+    /// [`Staging::big_index`] from the state's centre flags (see [`P1State::centre_flags`]).
+    #[inline(always)]
+    pub(crate) fn big_index_flags(&self, g: &V32) -> u64 {
+        // NEON: both position masks by one pairwise-add chain, and the bit counts of their
+        // bytes by one count.
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        unsafe {
+            use std::arch::aarch64::*;
+            const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+            let w = vld1q_u8(W.as_ptr());
+            let (a0, a1) = (vld1q_u8(g.0.as_ptr()), vld1q_u8(g.0.as_ptr().add(16)));
+            let r0 = vandq_u8(vcltzq_s8(vreinterpretq_s8_u8(a0)), w);
+            let r1 = vandq_u8(vcltzq_s8(vreinterpretq_s8_u8(a1)), w);
+            let f = vdupq_n_u8(0x40);
+            let n0 = vandq_u8(vtstq_u8(a0, f), w);
+            let n1 = vandq_u8(vtstq_u8(a1, f), w);
+            let z = vpaddq_u8(vpaddq_u8(r0, r1), vpaddq_u8(n0, n1));
+            // Bytes 0..3: the R/L mask; bytes 4..7: the mask of the other colours.
+            let z = vget_low_u8(vpaddq_u8(z, z));
+            let x = vget_lane_u64::<0>(vreinterpret_u64_u8(z));
+            let c = vget_lane_u64::<0>(vreinterpret_u64_u8(vcnt_u8(z)));
+            let (rl, nud) = (x as u32, (x >> 32) as u32);
+            let ud = !nud & MASK24;
+            // Bit counts of the bytes of `nud` (each at most 8; U/D's are 8 minus them).
+            let (n0, n1) = ((c >> 32 & 255) as u32, (c >> 40 & 255) as u32);
+            debug_assert!(n0 <= 8 && n1 <= 8);
+            let (c0, c1) = ((8 - n0) as usize, (16 - n0 - n1) as usize);
+            let rank = self.rank_t[0][0][(ud & 255) as usize]
+                + self.rank_t.get_unchecked(1).get_unchecked(c0)[(ud >> 8 & 255) as usize]
+                + self.rank_t.get_unchecked(2).get_unchecked(c1)[(ud >> 16 & 255) as usize];
+            let t = &self.pext8;
+            let split = t[(nud & 255) as usize][(rl & 255) as usize] as u32
+                | (t[(nud >> 8 & 255) as usize][(rl >> 8 & 255) as usize] as u32) << n0
+                | (t[(nud >> 16 & 255) as usize][(rl >> 16 & 255) as usize] as u32) << (n0 + n1);
+            rank as u64 * N_SPLIT as u64 + self.unl[split as u16 as usize] as u64
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+        {
+            let (ud, nud, rl) = flag_masks(g);
+            self.big_index_n(ud, nud, rl)
+        }
     }
 
     pub fn big_len() -> usize {
@@ -664,6 +795,13 @@ pub struct P1Tables {
     pub centre_idx: [V32; N_MOVES],
     /// Destination slot of each slot under each move (applied to wing positions).
     pub wing_dst: [V32; N_MOVES],
+    /// Per move, the frames (bit f) in which it is a phase-2 move.
+    p2_frames: [u8; N_MOVES],
+    /// Per set r of frames, the moves that are phase-2 moves in all frames but r's.
+    all_p2: [u32; 8],
+    /// Per move m, per position i: the source (as in `centre_idx[m]`) of the first position
+    /// on i's axis (see [`P1Tables::staged_after`]).
+    stage_rep: [V32; N_MOVES],
     /// The pattern table (searches per colour pair, see [`crate::p1pat`]).
     pub pat: Option<crate::p1pat::PatTable>,
     /// The move-mask table (with the large staging table, see [`crate::p1mask`]).
@@ -689,6 +827,23 @@ impl P1Tables {
             }
             d
         });
+        let p2_frames = std::array::from_fn(|m| {
+            (0..3)
+                .filter(|&f| frames[f].p2_mask >> m & 1 == 1)
+                .fold(0, |a, f| a | 1 << f)
+        });
+        let all_p2 = std::array::from_fn(|r| {
+            (0..N_MOVES)
+                .filter(|&m| (p2_frames[m] as usize | r) == 7)
+                .fold(0, |a, m| a | 1 << m)
+        });
+        let stage_rep = std::array::from_fn(|m| {
+            let mut v: V32 = centre_idx[m];
+            for i in 0..24 {
+                v.0[i] = centre_idx[m].0[4 * ((i / 4) % 3)];
+            }
+            v
+        });
         P1Tables {
             staging,
             table,
@@ -696,6 +851,9 @@ impl P1Tables {
             frames,
             centre_idx,
             wing_dst,
+            p2_frames,
+            all_p2,
+            stage_rep,
             pat: None,
             mask: None,
         }
@@ -768,6 +926,17 @@ impl P1Tables {
         out
     }
 
+    /// Are the centres staged after move `m` from `centres` (staging distance 0: on each
+    /// axis, the 8 centres of one colour pair)?
+    #[inline(always)]
+    pub fn staged_after(&self, centres: &V32, m: usize) -> bool {
+        debug_assert!(m < N_MOVES);
+        const PAIR: V32 = V32([0xfe; 32]);
+        let a = centres.gather(unsafe { self.centre_idx.get_unchecked(m) });
+        let b = centres.gather(unsafe { self.stage_rep.get_unchecked(m) });
+        crate::simd::is_zero(&crate::simd::and(&crate::simd::xor(&a, &b), &PAIR))
+    }
+
     /// Which frames accept this staged state as an endpoint (bit f), given the trailing run
     /// of same-axis moves of its path ([`trailing_run`]).
     #[inline]
@@ -818,21 +987,87 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     /// batches (see [`Search1::run_batch`]).
     batch: Vec<BNode>,
     batch_next: Vec<BNode>,
+    /// The paths of the batch nodes, as a tree: per node (by [`BNode::id`]), its parent's id
+    /// and its last move, or for a node queued by the depth-first search, [`ROOT`] | the
+    /// offset in `batch_roots` of its path (its length, then the moves).
+    batch_tree: Vec<(u32, u8)>,
+    batch_roots: Vec<u8>,
     batch_path: Vec<u8>,
 }
 
-/// A node of a batch: its state, mask-table index and path (moves left = staging distance).
+/// See [`Search1::batch_tree`].
+const ROOT: u32 = 1 << 31;
+
+/// A node of a batch (moves left = staging distance): its state, mask-table index, and its
+/// path's entry in [`Search1::batch_tree`].
 #[derive(Clone, Copy)]
 struct BNode {
-    s: P1State,
-    /// The large staging table's index (for the reduced mask table: its index, once
-    /// resolved at the start of the node's round, with `sym`).
+    centres: V32,
+    pos: V32,
+    /// The mask table's first index (see `MaskTable::pre_index`; for the reduced and pair
+    /// tables, their index, once resolved at the start of the node's round, with `sym`).
     idx: u64,
+    id: u32,
+    /// The moves of its path's trailing run of same-axis moves (see [`trailing_run`]).
+    run: u32,
+    parity: bool,
     sym: u8,
     left: u8,
     last: u8,
-    plen: u8,
-    path: [u8; 44],
+}
+
+impl BNode {
+    #[inline(always)]
+    fn state(&self) -> P1State {
+        P1State {
+            centres: self.centres,
+            pos: self.pos,
+            parity: self.parity,
+        }
+    }
+}
+
+/// Per move, the last moves a leaf with even wing parity after it counts.
+const EVEN_LEAF_MOVES: [u8; N_MOVES] = {
+    let mut t = [0u8; N_MOVES];
+    let mut m = 0;
+    while m < N_MOVES {
+        t[m] = (ALLOWED_AFTER[m] & !WIDE_QUARTER).count_ones() as u8;
+        m += 1;
+    }
+    t
+};
+
+/// The wide moves (Uw, Rw, Fw and their powers).
+const WIDE_MOVES: u32 = 0x1ff << 18;
+
+/// Per move (and none, [`N_MOVES`]), the moves on its axis (move m turns a face of axis
+/// (m / 3) % 3): the moves that continue a trailing run of same-axis moves.
+const SAME_AXIS: [u32; N_MOVES + 1] = {
+    let mut t = [0u32; N_MOVES + 1];
+    let mut a = 0;
+    while a < N_MOVES {
+        let mut m = 0;
+        while m < N_MOVES {
+            if (m / 3) % 3 == (a / 3) % 3 {
+                t[a] |= 1 << m;
+            }
+            m += 1;
+        }
+        a += 1;
+    }
+    t
+};
+
+/// The trailing run of same-axis moves after move `m`, given the run `run` before it and the
+/// move `last` before it.
+#[inline(always)]
+fn run_after(run: u32, last: usize, m: usize) -> u32 {
+    if SAME_AXIS[last] >> m & 1 == 1 {
+        run | 1 << m
+    } else {
+        1 << m
+    }
 }
 
 /// The table guiding a search ([`Search1::dfs_t`]'s `K`).
@@ -856,31 +1091,75 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             pair: ALL_PAIRS,
             batch: vec![],
             batch_next: vec![],
+            batch_tree: vec![],
+            batch_roots: vec![],
             batch_path: Vec::with_capacity(48),
         }
     }
 
-    /// Queue a node at staging distance `left` = moves left (>= 2) for a batch.
+    /// Queue a node at staging distance `left` = moves left (>= 2) for a batch: the state `s`
+    /// after the search's path and `m` (if any), its mask table's first index `idx`.
     #[inline(always)]
     fn push_batch(&mut self, s: P1State, idx: u64, left: u8, last: usize, m: Option<u8>) {
-        let mut path = [0u8; 44];
-        let n = self.path.len();
-        path[..n].copy_from_slice(&self.path);
-        let mut plen = n as u8;
+        let off = self.batch_roots.len();
+        self.batch_roots.push(0);
+        self.batch_roots.extend_from_slice(&self.path);
         if let Some(m) = m {
-            path[n] = m;
-            plen += 1;
+            self.batch_roots.push(m);
         }
+        let n = self.batch_roots.len() - off - 1;
+        self.batch_roots[off] = n as u8;
+        let run = trailing_run(&self.batch_roots[off + 1..]);
+        let id = self.batch_tree.len() as u32;
+        self.batch_tree.push((ROOT | off as u32, 0));
         self.t.mask.as_ref().unwrap().prefetch(self.t, idx);
         self.batch.push(BNode {
-            s,
+            centres: s.centres,
+            pos: s.pos,
             idx,
+            id,
+            run,
+            parity: s.parity,
             sym: 0,
             left,
             last: last as u8,
-            plen,
-            path,
         });
+    }
+
+    /// Queue the child `c` (after move `m`, first index `idx`) of batch node `nd`.
+    #[inline(always)]
+    fn push_child(&mut self, nd: &BNode, c: &P1State, idx: u64, m: usize) {
+        let id = self.batch_tree.len() as u32;
+        self.batch_tree.push((nd.id, m as u8));
+        self.t.mask.as_ref().unwrap().prefetch(self.t, idx);
+        self.batch.push(BNode {
+            centres: c.centres,
+            pos: c.pos,
+            idx,
+            id,
+            run: run_after(nd.run, nd.last as usize, m),
+            parity: c.parity,
+            sym: 0,
+            left: nd.left - 1,
+            last: m as u8,
+        });
+    }
+
+    /// Set `self.path` to the path of batch node `id` (see [`Search1::batch_tree`]).
+    #[cold]
+    fn set_batch_path(&mut self, id: u32) {
+        let mut tail = vec![];
+        let mut e = self.batch_tree[id as usize];
+        while e.0 & ROOT == 0 {
+            tail.push(e.1);
+            e = self.batch_tree[e.0 as usize];
+        }
+        let off = (e.0 & !ROOT) as usize;
+        let n = self.batch_roots[off] as usize;
+        self.path.clear();
+        self.path
+            .extend_from_slice(&self.batch_roots[off + 1..off + 1 + n]);
+        self.path.extend(tail.iter().rev());
     }
 
     /// Search the subtrees of the queued nodes: in rounds, each node's children are the
@@ -891,11 +1170,14 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         std::mem::swap(&mut self.path, &mut self.batch_path);
         self.run_batch_rounds();
         std::mem::swap(&mut self.path, &mut self.batch_path);
+        self.batch_tree.clear();
+        self.batch_roots.clear();
     }
 
     fn run_batch_rounds(&mut self) {
         let t = self.t;
         let mt = t.mask.as_ref().unwrap();
+        let reduced = mt.kind == crate::p1mask::MaskKind::Reduced;
         while !self.batch.is_empty() {
             let mut cur = std::mem::take(&mut self.batch);
             std::mem::swap(&mut self.batch, &mut self.batch_next);
@@ -916,30 +1198,53 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             ) {
                 // The reduced table's index needs the class info (prefetched at the push).
                 for nd in cur.iter_mut() {
-                    (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.s, self.pair);
+                    (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.state(), self.pair);
                 }
             }
             for nd in &cur {
+                let s = nd.state();
                 let mut a =
-                    mt.get(t, nd.idx, nd.sym, &nd.s, self.pair) & ALLOWED_AFTER[nd.last as usize];
+                    mt.get(t, nd.idx, nd.sym, &s, self.pair) & ALLOWED_AFTER[nd.last as usize];
                 self.nodes += a.count_ones() as u64;
                 self.reads += 1;
-                self.path.clear();
-                self.path.extend_from_slice(&nd.path[..nd.plen as usize]);
                 if nd.left == 1 {
-                    self.leaf(&nd.s, 1, nd.last as usize, Some(a));
+                    self.leaf(
+                        &s,
+                        1,
+                        nd.last as usize,
+                        Some(a),
+                        nd.run,
+                        Some((nd.id, None)),
+                    );
                     if self.stop {
                         self.batch.clear();
                         return;
                     }
                 } else if nd.left == 2 && !mt.batch_leaves {
+                    // Over all pairs, a child (at distance 1) whose wings have even parity has
+                    // no endpoint below it: its last move must not be a wide quarter turn, and
+                    // then cannot stage the centres or is a phase-2 move in every frame (see
+                    // `leaf`). Its last moves are counted, not tested.
+                    if self.pair == ALL_PAIRS {
+                        let even = if s.parity {
+                            WIDE_QUARTER
+                        } else {
+                            !WIDE_QUARTER
+                        };
+                        let mut b = a & even;
+                        a &= !even;
+                        while b != 0 {
+                            let m = b.trailing_zeros() as usize;
+                            b &= b - 1;
+                            self.nodes += EVEN_LEAF_MOVES[m] as u64;
+                        }
+                    }
                     while a != 0 {
                         let m = a.trailing_zeros() as usize;
                         a &= a - 1;
-                        let c = nd.s.apply(m, t);
-                        self.path.push(m as u8);
-                        self.leaf(&c, 1, m, None);
-                        self.path.pop();
+                        let c = s.apply(m, t);
+                        let run = run_after(nd.run, nd.last as usize, m);
+                        self.leaf(&c, 1, m, None, run, Some((nd.id, Some(m as u8))));
                         if self.stop {
                             self.batch.clear();
                             return;
@@ -947,24 +1252,30 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     }
                 } else if mt.kind == crate::p1mask::MaskKind::Pair {
                     // The children's first index: the rank of the pair's positions.
-                    let flags = t.pat.as_ref().unwrap().flags(&nd.s.centres, self.pair);
+                    let flags = t.pat.as_ref().unwrap().flags(&s.centres, self.pair);
                     while a != 0 {
                         let m = a.trailing_zeros() as usize;
                         a &= a - 1;
                         let g = unsafe { child_flags(&flags, m, t) };
                         let i = t.staging.rank24(crate::simd::movemask(&g)) as u64;
-                        let c = nd.s.apply(m, t);
-                        self.push_batch(c, i, nd.left - 1, m, Some(m as u8));
+                        let c = s.apply(m, t);
+                        self.push_child(nd, &c, i, m);
                     }
                 } else {
-                    let flags = nd.s.centre_flags();
+                    let flags = s.centre_flags();
                     while a != 0 {
                         let m = a.trailing_zeros() as usize;
                         a &= a - 1;
-                        let (ud, nud, rl) = flag_masks(&unsafe { child_flags(&flags, m, t) });
-                        let i = t.staging.big_index_n(ud, nud, rl);
-                        let c = nd.s.apply(m, t);
-                        self.push_batch(c, i, nd.left - 1, m, Some(m as u8));
+                        let g = unsafe { child_flags(&flags, m, t) };
+                        // The reduced table needs only the rank of the U/D positions.
+                        let i = if reduced {
+                            let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
+                            t.staging.rank24(!nud & MASK24) as u64
+                        } else {
+                            t.staging.big_index_flags(&g)
+                        };
+                        let c = s.apply(m, t);
+                        self.push_child(nd, &c, i, m);
                     }
                 }
             }
@@ -1022,31 +1333,67 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
 
     /// The last move below `s` (exact distance `d`, one move left): endpoint tests.
     /// `staging`: the moves that stage the centres, if known (from a move mask, `d` = 1).
-    fn leaf(&mut self, s: &P1State, d: u8, last: usize, staging: Option<u32>) {
+    /// `run`: the trailing run of same-axis moves of the path to `s` ([`trailing_run`]).
+    /// `batch`: the path to `s` is that of batch node `id` and move `m` (if any), not
+    /// `self.path`.
+    fn leaf(
+        &mut self,
+        s: &P1State,
+        d: u8,
+        last: usize,
+        staging: Option<u32>,
+        run: u32,
+        batch: Option<(u32, Option<u8>)>,
+    ) {
         // The last move must leave the wing permutation even, and the wings pairable in a
         // frame where the path's trailing run of same-axis moves has no phase-2 move (else
         // the shorter endpoint without them, with them opening phase 2, covers it): both
         // are tested before the centres.
-        let mut allowed = ALLOWED_AFTER[last] & staging.unwrap_or(u32::MAX);
-        allowed &= if s.parity {
-            WIDE_QUARTER
-        } else {
-            !WIDE_QUARTER
-        };
-        let run = trailing_run(&self.path);
-        while allowed != 0 {
-            let m = allowed.trailing_zeros() as usize;
-            allowed &= allowed - 1;
-            self.nodes += 1;
-            let pos = self.t.wing_dst[m].gather(&s.pos);
-            let run_m = if last < N_MOVES && (m / 3) % 3 == (last / 3) % 3 {
-                run | 1 << m
+        let allowed = ALLOWED_AFTER[last]
+            & staging.unwrap_or(u32::MAX)
+            & if s.parity {
+                WIDE_QUARTER
             } else {
-                1 << m
+                !WIDE_QUARTER
             };
+        // The frames in which the run before the last move has a phase-2 move (the last move
+        // continues the run if on the same axis).
+        let mut run_frames = 0;
+        let mut r = run;
+        while r != 0 {
+            run_frames |= self.t.p2_frames[r.trailing_zeros() as usize];
+            r &= r - 1;
+        }
+        // Every allowed move is a node (the ones not tested after a stop are taken back).
+        self.nodes += allowed.count_ones() as u64;
+        // The moves that continue the run (on the last move's axis).
+        let same = SAME_AXIS[last];
+        let t = self.t;
+        let pos = s.pos;
+        // A move that is a phase-2 move in every frame (with the run it continues) ends no
+        // endpoint: it is counted, not tested (the half turns, for one).
+        let mut test = allowed & !(t.all_p2[0] | same & t.all_p2[run_frames as usize]);
+        // Without the staging moves from a mask, the search over all pairs tests that the move
+        // stages the centres first (the cheaper and less selective test; no table read). From
+        // unstaged centres (d >= 1) only a wide move can stage them: an outer move keeps every
+        // face's centres on that face.
+        let check_staged = staging.is_none() && self.pair == ALL_PAIRS;
+        if check_staged && d >= 1 {
+            test &= WIDE_MOVES;
+        }
+        let centres = s.centres;
+        while test != 0 {
+            let m = test.trailing_zeros() as usize;
+            test &= test - 1;
+            if check_staged && !t.staged_after(&centres, m) {
+                continue;
+            }
+            let excl = unsafe { *t.p2_frames.get_unchecked(m) } as u32
+                | run_frames as u32 & 0u32.wrapping_sub(same >> m & 1);
+            let p = unsafe { t.wing_dst.get_unchecked(m) }.gather(&pos);
             let mut frames = 0u8;
-            for (f, fr) in self.t.frames.iter().enumerate() {
-                if fr.p2_mask & run_m == 0 && fr.wings_ok(&pos) {
+            for (f, fr) in t.frames.iter().enumerate() {
+                if excl >> f & 1 == 0 && fr.wings_ok(&p) {
                     frames |= 1 << f;
                 }
             }
@@ -1054,7 +1401,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 continue;
             }
             let c = s.apply(m, self.t);
-            if staging.is_none() {
+            if staging.is_none() && !check_staged {
                 self.reads += 1;
                 if Mod3Table::decode(d, self.value(&c)) != 0 {
                     continue;
@@ -1067,11 +1414,17 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 }
             }
             if frames != 0 {
+                if let Some((id, mv)) = batch {
+                    self.set_batch_path(id);
+                    self.path.extend(mv);
+                }
                 self.path.push(m as u8);
                 let go = (self.on_endpoint)(&self.path, frames);
                 self.path.pop();
                 if !go {
                     self.stop = true;
+                    // The moves after m were not tested.
+                    self.nodes -= (allowed >> m >> 1).count_ones() as u64;
                     return;
                 }
             }
@@ -1092,7 +1445,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             return;
         }
         if left == 1 {
-            self.leaf(s, d, last, None);
+            self.leaf(s, d, last, None, trailing_run(&self.path), None);
             return;
         }
         // Batches: with the move masks, or (counts only) per-pair searches with the virtual
@@ -1126,8 +1479,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             while a != 0 {
                 let m = a.trailing_zeros() as usize;
                 a &= a - 1;
-                let (ud, nud, rl) = flag_masks(&unsafe { child_flags(&flags, m, t) });
-                let i = t.staging.big_index_n(ud, nud, rl);
+                let i = t
+                    .staging
+                    .big_index_flags(&unsafe { child_flags(&flags, m, t) });
                 t.table.prefetch(i);
                 unsafe { *idx.get_unchecked_mut(nk) = i };
                 nk += 1;
@@ -1219,7 +1573,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 let c = s.apply(m, t);
                 if batched && dc == left - 1 && dc >= self.batch_min_left() {
                     let i = if K == K_MASK {
-                        idx[k]
+                        t.mask.as_ref().unwrap().pre_index_of_big(idx[k])
                     } else {
                         t.mask.as_ref().unwrap().pre_index(t, &c, self.pair)
                     };
@@ -1264,6 +1618,21 @@ mod tests {
     }
 
     #[test]
+    fn pext24_matches_pext() {
+        use rand::Rng;
+        let st = Staging::new();
+        let mut rng = rand::thread_rng();
+        for _ in 0..100000 {
+            let (x, m) = (rng.r#gen::<u32>() & MASK24, rng.r#gen::<u32>() & MASK24);
+            assert_eq!(st.pext24(x, m), pext(x, m));
+            assert_eq!(
+                byte_counts(x),
+                (0..4).fold(0, |a, k| a | (x >> (8 * k) & 255).count_ones() << (8 * k))
+            );
+        }
+    }
+
+    #[test]
     fn child_masks_match_apply() {
         let t = P1Tables::with_table(Staging::new(), Mod3Table::from_depths(&[0]));
         let mut rng = rand::thread_rng();
@@ -1276,6 +1645,7 @@ mod tests {
                     let (ud, rl) = c.masks();
                     let g = unsafe { child_flags(&flags, m, &t) };
                     assert_eq!(flag_masks(&g), (ud, !ud & MASK24, rl));
+                    assert_eq!(t.staging.big_index_flags(&g), t.staging.big_index(ud, rl));
                     assert_eq!(
                         t.staging.big_index_n(ud, !ud & MASK24, rl),
                         t.staging.big_index(ud, rl)
@@ -1347,6 +1717,52 @@ mod tests {
                 if with_pat {
                     assert_eq!(endpoint_set(&t, &root, len, true), want);
                 }
+            }
+        }
+    }
+
+    /// [`P1Tables::staged_after`] agrees with the definition (and with the staging table's
+    /// goal, distance 0, where the large table is in ./tables).
+    #[test]
+    fn staged_after_matches_definition() {
+        let t = P1Tables::with_table(Staging::new(), Mod3Table::from_depths(&[0]));
+        let mut rng = rand::thread_rng();
+        let mut seen = [0u32; 2];
+        for k in 0..20000 {
+            let mut s = P1State::from_cube(&Cube::SOLVED);
+            for j in 0..k % 4 {
+                s = s.apply((k * 11 + j * 7) % N_MOVES, &t);
+            }
+            if k % 3 == 0 {
+                s = P1State::from_cube(&Cube::random(&mut rng));
+            }
+            for m in 0..N_MOVES {
+                let c = s.apply(m, &t);
+                let want = (0..3).all(|a| {
+                    let p: Vec<u8> = (0..24)
+                        .filter(|&i| (i / 4) % 3 == a)
+                        .map(|i| c.centres.0[i] >> 1)
+                        .collect();
+                    p.iter().all(|&x| x == p[0])
+                });
+                assert_eq!(t.staged_after(&s.centres, m), want);
+                seen[want as usize] += 1;
+            }
+        }
+        assert!(seen[0] > 0 && seen[1] > 0);
+        // The leaf's shortcuts: the wide half turns are phase-2 moves in every frame, and an
+        // outer move never changes whether the centres are staged.
+        assert_eq!(WIDE_MOVES & !WIDE_QUARTER & !t.all_p2[0], 0);
+        let s = P1State::from_cube(&Cube::random(&mut rng));
+        for m in (0..N_MOVES).filter(|&m| WIDE_MOVES >> m & 1 == 0) {
+            let c = s.apply(m, &t);
+            for a in 0..6 {
+                let face = |x: &P1State| {
+                    let mut v: Vec<u8> = x.centres.0[4 * a..4 * a + 4].to_vec();
+                    v.sort();
+                    v
+                };
+                assert_eq!(face(&s), face(&c));
             }
         }
     }
