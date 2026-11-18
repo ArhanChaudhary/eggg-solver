@@ -121,6 +121,10 @@ pub struct Staging {
     /// Without BMI2: [`pext`] of a byte by lookup (see [`Staging::pext24`]).
     #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
     pext8: Box<[[u8; 256]; 256]>,
+    /// NEON: per class, the 16 positions outside its representative's U/D mask, in order
+    /// (see [`Staging::fast_index_flags`]).
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    rem_pos: Vec<[u8; 16]>,
 }
 
 fn perm_tables(perm: &[u8; 24]) -> [[u32; 256]; 3] {
@@ -250,7 +254,6 @@ impl Staging {
                 h.as_mut_slice().copy_from_slice(&a_info);
                 h
             },
-            class_rep,
             stab,
             sym_perm,
             sym_gather,
@@ -260,6 +263,15 @@ impl Staging {
             rank_t,
             #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
             pext8: pext8_table(),
+            #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+            rem_pos: class_rep
+                .iter()
+                .map(|&r| {
+                    let mut p = (0..24u8).filter(|&i| r >> i & 1 == 0);
+                    std::array::from_fn(|_| p.next().unwrap())
+                })
+                .collect(),
+            class_rep,
         }
     }
 
@@ -343,10 +355,30 @@ impl Staging {
     #[inline(always)]
     pub(crate) fn fast_index_flags(&self, info: u32, flags: &V32) -> u64 {
         let class = (info >> 8) as usize;
-        let h = flags.gather(&self.sym_gather[(info & 255) as usize]);
-        let b = crate::simd::movemask(&h);
-        let rem = crate::simd::movemask(&crate::simd::add(&h, &h));
-        (class * N_SPLIT + self.unl[self.pext24(b, rem) as u16 as usize] as usize) as u64
+        let g = &self.sym_gather[(info & 255) as usize];
+        // NEON: the R/L flags at the image's positions outside the class representative's
+        // U/D mask, in order, by two table lookups (instead of two movemasks and a pext).
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        let b = unsafe {
+            use std::arch::aarch64::*;
+            let ld = |v: &V32| uint8x16x2_t(vld1q_u8(v.0.as_ptr()), vld1q_u8(v.0.as_ptr().add(16)));
+            let rp = vld1q_u8(self.rem_pos[class].as_ptr());
+            let h = vqtbl2q_u8(ld(flags), vqtbl2q_u8(ld(g), rp));
+            const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+            let m = vandq_u8(vcltzq_s8(vreinterpretq_s8_u8(h)), vld1q_u8(W.as_ptr()));
+            let m = vpaddq_u8(m, m);
+            let m = vpaddq_u8(m, m);
+            let m = vpaddq_u8(m, m);
+            vgetq_lane_u16::<0>(vreinterpretq_u16_u8(m))
+        };
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+        let b = {
+            let h = flags.gather(g);
+            let b = crate::simd::movemask(&h);
+            let rem = crate::simd::movemask(&crate::simd::add(&h, &h));
+            self.pext24(b, rem) as u16
+        };
+        (class * N_SPLIT + self.unl[b as usize] as usize) as u64
     }
 
     pub fn rep_of(&self, idx: u64) -> (u32, u32) {
