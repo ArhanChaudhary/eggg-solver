@@ -431,6 +431,12 @@ pub struct Search2<'a> {
     pub path: Vec<u8>,
     pub nodes: u64,
     pub abort: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Give up at this time (the clock is read every ~4096 nodes).
+    pub deadline: Option<std::time::Instant>,
+    /// Set when the search gave up (abort flag or deadline) before finishing.
+    pub aborted: bool,
+    /// Node count at which the clock is read next.
+    clock: u64,
 }
 
 impl<'a> Search2<'a> {
@@ -440,14 +446,38 @@ impl<'a> Search2<'a> {
             path: Vec::with_capacity(24),
             nodes: 0,
             abort: None,
+            deadline: None,
+            aborted: false,
+            clock: 0,
         }
+    }
+
+    /// Whether to give up: the abort flag is raised, or the deadline has passed (checked every
+    /// ~4096 nodes). Sets `aborted`.
+    #[inline(always)]
+    fn halted(&mut self) -> bool {
+        if self
+            .abort
+            .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+            || (self.nodes >= self.clock && self.past_deadline())
+        {
+            self.aborted = true;
+        }
+        self.aborted
+    }
+
+    #[cold]
+    fn past_deadline(&mut self) -> bool {
+        self.clock = self.nodes + 4096;
+        self.deadline
+            .is_some_and(|d| std::time::Instant::now() >= d)
     }
 
     /// Explore below (centre coord, tau with exact tau distance `dt`); `last` is the previous
     /// move (27-move index, `N_MOVES` for none) and `after` the moves allowed next
     /// (`ALLOWED_AFTER[last]`, or at the root the moves allowed after phase 1, see
     /// [`first_moves`]). Calls `found` for each solution; stops when it returns false. Returns
-    /// false if stopped.
+    /// false if stopped (by `found`, or by `abort`/`deadline`: then `aborted` is set).
     #[allow(clippy::too_many_arguments)]
     pub fn dfs(
         &mut self,
@@ -471,11 +501,7 @@ impl<'a> Search2<'a> {
                 continue;
             }
             self.nodes += 1;
-            if self.nodes & 4095 == 0
-                && self
-                    .abort
-                    .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
-            {
+            if self.nodes & 4095 == 0 && self.halted() {
                 return false;
             }
             let c2 = self.t.centre_move[cc as usize][i];
@@ -546,10 +572,7 @@ impl<'a> Search2<'a> {
             nk += 1;
         }
         self.nodes += nk as u64;
-        if self
-            .abort
-            .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
-        {
+        if self.halted() {
             return false;
         }
         // Stage 2: read, decode, descend.

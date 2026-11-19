@@ -30,6 +30,13 @@ use std::time::{Duration, Instant};
 /// The deepest phase-2 level is best - DEEPEST_MARGIN (see `Run::phase2`).
 const DEEPEST_MARGIN: usize = 13;
 
+/// Once a solution exists, a round that would run past the time limit is cut short: its
+/// phase 1 stops after this share of the time left when the round starts, and phase 2 stops
+/// after `P2_SHARE` of it, so that phases 2 and 3 still search the round's endpoints (see
+/// `Run::rounds`).
+const P1_SHARE: f64 = 1.0 / 1.3;
+const P2_SHARE: f64 = 0.96;
+
 pub struct Tables {
     pub p1: P1Tables,
     pub p2: P2Tables,
@@ -197,6 +204,37 @@ fn par_jobs(n: usize, threads: usize, stop: &AtomicBool, work: impl Fn(usize) + 
     });
 }
 
+/// Tells the phase-1 jobs of a batch to hand back their unstarted subtrees: raised when enough
+/// endpoints are found or threads run out of jobs, and at time `at` (the round's phase-1 cut).
+struct Close {
+    flag: AtomicBool,
+    at: Option<Instant>,
+}
+
+impl Close {
+    fn new(at: Option<Instant>) -> Self {
+        Close {
+            flag: AtomicBool::new(false),
+            at,
+        }
+    }
+
+    fn raise(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+
+    fn is_raised(&self) -> bool {
+        if self.flag.load(Ordering::Relaxed) {
+            return true;
+        }
+        if self.at.is_some_and(|t| Instant::now() >= t) {
+            self.raise();
+            return true;
+        }
+        false
+    }
+}
+
 /// Phase-1 search below `srch.path` (state `st`, staging distance `d`, exactly `left` more
 /// moves), expanding the first `split` levels here so that the job can be cut short: once
 /// `close` is raised, each subtree not yet started at those levels is pushed to `spill` (as
@@ -210,7 +248,7 @@ fn p1_run<F: FnMut(&[u8], u8) -> bool>(
     left: u8,
     last: usize,
     split: u8,
-    close: &AtomicBool,
+    close: &Close,
     spill: &mut Vec<Vec<u8>>,
 ) {
     if split == 0 || left <= 3 {
@@ -229,7 +267,7 @@ fn p1_run<F: FnMut(&[u8], u8) -> bool>(
             continue;
         }
         srch.path.push(m as u8);
-        if close.load(Ordering::Relaxed) {
+        if close.is_raised() {
             spill.push(srch.path.clone());
         } else {
             p1_run(srch, &c, dc, left - 1, m, split - 1, close, spill);
@@ -319,6 +357,11 @@ struct Run<'a, 'r> {
     /// Set once a solution exists (the time limit only applies from then on).
     have: &'r AtomicBool,
     start: Instant,
+    /// When the run stops once a solution exists (the earlier of the time and hard limits).
+    limit: Instant,
+    /// This round's phase 1 stops at `p1_cut`, and phase 2 at `p2_cut` (None: no cut).
+    p1_cut: Option<Instant>,
+    p2_cut: Option<Instant>,
     best: Option<Solution>,
     report: &'r mut dyn FnMut(&Solution),
     target: Option<usize>,
@@ -385,6 +428,9 @@ impl<'a> Solver<'a> {
             threads,
             stop: &stop,
             start,
+            limit: hard.map_or(deadline, |h| deadline.min(start + h)),
+            p1_cut: None,
+            p2_cut: None,
             have: &have,
             best: None,
             report,
@@ -462,6 +508,20 @@ impl<'a, 'r> Run<'a, 'r> {
             }
             self.stats.rounds += 1;
             let t0 = Instant::now();
+            // Once a solution exists, a round that would run past the time limit is cut short.
+            // Each round's phase 1 takes about as long as all the earlier rounds together, and
+            // phases 2 and 3 only run after it: without the cut, the last round's endpoints
+            // would never be searched (~28% of the run on average). Earlier rounds end long
+            // before the cut and are unchanged.
+            (self.p1_cut, self.p2_cut) = if self.best.is_some() {
+                let left = self.limit.saturating_duration_since(t0);
+                (
+                    Some(t0 + left.mul_f64(P1_SHARE)),
+                    Some(t0 + left.mul_f64(P2_SHARE)),
+                )
+            } else {
+                (None, None)
+            };
             let tp = Instant::now();
             self.phase1(want1);
             self.stats.time[0] += tp.elapsed();
@@ -559,9 +619,14 @@ impl<'a, 'r> Run<'a, 'r> {
         out
     }
 
-    /// Collect phase-1 endpoints until there are `want` candidates in total.
+    /// Collect phase-1 endpoints until there are `want` candidates in total (or until the
+    /// round's phase-1 cut).
     fn phase1(&mut self, want: usize) {
-        while self.made_cands < want && !self.stopped() && self.level.len <= 40 {
+        while self.made_cands < want
+            && !self.stopped()
+            && self.level.len <= 40
+            && !self.p1_cut.is_some_and(|c| Instant::now() >= c)
+        {
             if self.level.next >= self.level.jobs.len() {
                 let len = self.level.len + 1;
                 self.level = Level1 {
@@ -580,10 +645,10 @@ impl<'a, 'r> Run<'a, 'r> {
             let claimed = AtomicUsize::new(first);
             let found = AtomicUsize::new(0);
             let nodes = AtomicU64::new(0);
-            // Raised when enough endpoints are found, or when a quarter of the threads have
-            // run out of jobs: running jobs then hand back their unstarted subtrees, so that no
-            // thread waits long for the slowest job.
-            let close = AtomicBool::new(false);
+            // Raised when enough endpoints are found, when a quarter of the threads have run
+            // out of jobs, or at the round's phase-1 cut: running jobs then hand back their
+            // unstarted subtrees, so that no thread waits long for the slowest job.
+            let close = Close::new(self.p1_cut);
             let idle = AtomicUsize::new(0);
             let out = Mutex::new(vec![]);
             std::thread::scope(|s| {
@@ -592,13 +657,13 @@ impl<'a, 'r> Run<'a, 'r> {
                         let mut local = vec![];
                         let mut n = 0;
                         loop {
-                            if stop.load(Ordering::Relaxed) || close.load(Ordering::Relaxed) {
+                            if stop.load(Ordering::Relaxed) || close.is_raised() {
                                 break;
                             }
                             let j = claimed.fetch_add(1, Ordering::Relaxed);
                             if j >= jobs.len() {
                                 if (idle.fetch_add(1, Ordering::Relaxed) + 1) * 4 >= threads {
-                                    close.store(true, Ordering::Relaxed);
+                                    close.raise();
                                 }
                                 break;
                             }
@@ -620,7 +685,7 @@ impl<'a, 'r> Run<'a, 'r> {
                             n += srch.nodes;
                             let k: usize = eps.iter().map(|e| e.1.count_ones() as usize).sum();
                             if found.fetch_add(k, Ordering::Relaxed) + k >= need {
-                                close.store(true, Ordering::Relaxed);
+                                close.raise();
                             }
                             local.push((j, eps, spill));
                         }
@@ -630,6 +695,11 @@ impl<'a, 'r> Run<'a, 'r> {
                 }
             });
             self.stats.nodes1 += nodes.load(Ordering::Relaxed);
+            if self.stopped() {
+                // The run is over: these endpoints would never be searched (making their
+                // candidates took up to seconds past the time limit in long runs).
+                break;
+            }
             let next = claimed.load(Ordering::Relaxed).min(jobs.len());
             let mut results = out.into_inner().unwrap();
             results.sort_by_key(|r| r.0);
@@ -717,7 +787,11 @@ impl<'a, 'r> Run<'a, 'r> {
             .map(|c| c.moves1.len() + c.h2.max(c.done2) as usize)
             .min()
             .unwrap_or(99);
-        while self.made_reds < want && !self.stopped() && t12 <= cap {
+        while self.made_reds < want
+            && !self.stopped()
+            && t12 <= cap
+            && !self.p2_cut.is_some_and(|c| Instant::now() >= c)
+        {
             for r in self.phase2_level(t12, want - self.made_reds) {
                 let key = (r.frame, r.c3);
                 match self.red_index.get(&key) {
@@ -738,7 +812,8 @@ impl<'a, 'r> Run<'a, 'r> {
     /// Phase-2 searches of total length `t12` for every candidate that can reach it.
     /// Stops starting searches once `need` reductions are found: each level has ~8x the
     /// reductions of the one below, and finishing it would overshoot the round's target (the
-    /// candidates not searched keep the level for the next round).
+    /// candidates not searched keep the level for the next round). Searches still running at
+    /// the round's phase-2 cut stop there (keeping the reductions found so far, and the level).
     fn phase2_level(&mut self, t12: usize, need: usize) -> Vec<Reduction> {
         let t = self.t;
         let best = self.best_len();
@@ -757,12 +832,13 @@ impl<'a, 'r> Run<'a, 'r> {
         let nodes = AtomicU64::new(0);
         let stop = self.stop;
         let made = AtomicUsize::new(0);
-        let ran: Vec<AtomicBool> = (0..jobs.len()).map(|_| AtomicBool::new(false)).collect();
+        // The searches that ran to the end.
+        let complete: Vec<AtomicBool> = (0..jobs.len()).map(|_| AtomicBool::new(false)).collect();
+        let cut = self.p2_cut;
         par_jobs(jobs.len(), self.threads, stop, |j| {
-            if made.load(Ordering::Relaxed) >= need {
+            if made.load(Ordering::Relaxed) >= need || cut.is_some_and(|c| Instant::now() >= c) {
                 return;
             }
-            ran[j].store(true, Ordering::Relaxed);
             let c = &cands[jobs[j]];
             let l2 = (t12 - c.moves1.len()) as u8;
             let rot = frame_rotation(c.frame);
@@ -780,6 +856,7 @@ impl<'a, 'r> Run<'a, 'r> {
             let first = first_moves(&tail);
             let mut srch = Search2::new(&t.p2);
             srch.abort = Some(stop);
+            srch.deadline = cut;
             // Each solution becomes a reduction as soon as it is found, and only the ones that
             // could still beat the best are kept (a deep level can have millions of solutions
             // per search, nearly all hopeless).
@@ -817,13 +894,11 @@ impl<'a, 'r> Run<'a, 'r> {
             }
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
             made.fetch_add(local.len(), Ordering::Relaxed);
+            complete[j].store(!srch.aborted, Ordering::Relaxed);
             out.lock().unwrap().push((j, local));
         });
-        if !self.stopped() {
-            for (k, &j) in jobs.iter().enumerate() {
-                if !ran[k].load(Ordering::Relaxed) {
-                    continue;
-                }
+        for (k, &j) in jobs.iter().enumerate() {
+            if complete[k].load(Ordering::Relaxed) {
                 let c = &mut self.cands[j];
                 c.done2 = c.done2.max((t12 - c.moves1.len()) as u8 + 1);
             }
@@ -1582,6 +1657,48 @@ mod tests {
         assert!(total > 100, "too few reductions to test ({total})");
     }
 
+    /// A phase-2 search past its deadline gives up within ~4096 nodes and says so; one with a
+    /// later deadline finds the same solutions as one without.
+    #[test]
+    fn phase2_deadline() {
+        use crate::phase2::P2_MOVES;
+        let t = load_tables(std::path::Path::new("tables"), 3, 8, false);
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(11);
+        let search = |c: &Candidate, left: u8, deadline: Option<Instant>| {
+            let mut srch = Search2::new(&t.p2);
+            srch.deadline = deadline;
+            let mut sols = vec![];
+            let all = ALLOWED_AFTER[N_MOVES];
+            srch.dfs(c.centre, &c.tau, c.dt, left, N_MOVES, all, &mut |p| {
+                sols.push(p.to_vec());
+                true
+            });
+            (sols, srch.aborted, srch.nodes)
+        };
+        let mut big = 0;
+        for _ in 0..6 {
+            let mut cube = Cube::SOLVED;
+            for _ in 0..12 {
+                let m = P2_MOVES[rand::Rng::gen_range(&mut rng, 0..P2_MOVES.len())];
+                cube = cube.apply_perm(&MOVE_PERMS[m as usize]);
+            }
+            let c = make_candidate(&t, &cube, &[], 0).unwrap();
+            let left = c.h2 + 2;
+            let (want, aborted, nodes) = search(&c, left, None);
+            assert!(!aborted);
+            let later = Instant::now() + Duration::from_secs(3600);
+            let (got, aborted, _) = search(&c, left, Some(later));
+            assert!(!aborted);
+            assert_eq!(got, want);
+            if nodes > 10_000 {
+                let (_, aborted, n) = search(&c, left, Some(Instant::now()));
+                assert!(aborted && n <= 4096, "{n} nodes");
+                big += 1;
+            }
+        }
+        assert!(big > 0, "no search big enough to test the deadline");
+    }
+
     /// Jobs cut short at random points, with their handed-back subtrees searched later, find
     /// exactly the endpoints of one uninterrupted search.
     #[test]
@@ -1610,14 +1727,14 @@ mod tests {
                 let mut queue: Vec<Vec<u8>> = vec![vec![]];
                 let mut count = 0usize;
                 while let Some(prefix) = queue.pop() {
-                    let close = AtomicBool::new(false);
+                    let close = Close::new(None);
                     let (st, d) = root.after(&prefix, d0, &t);
                     let mut spill = vec![];
                     let mut srch = Search1::new(&t, |p: &[u8], f| {
                         got.push((p.to_vec(), f));
                         count += 1;
                         if count % 3 == scramble % 3 {
-                            close.store(true, Ordering::Relaxed);
+                            close.raise();
                         }
                         true
                     });
