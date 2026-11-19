@@ -603,28 +603,35 @@ impl<'a> Search2<'a> {
         if self.halted() {
             return false;
         }
-        // Stage 2: table indices of both views, entries prefetched.
-        let mut idx = [(0usize, 0usize); 17];
+        // Stage 2: table indices of the U/D view, entries prefetched.
+        let mut idx = [0usize; 17];
         for k in 0..nk {
-            let (c2, t2, ru, rf, _) = &kids[k];
-            let a = j.index_lane::<0>(*ru, t2, c2 & 1);
-            j.prefetch(a);
-            let b = j.index_lane::<1>(*rf, t2, c2 & 1);
-            j.prefetch(b);
-            idx[k] = (a, b);
+            let (c2, t2, ru, _, _) = &kids[k];
+            idx[k] = j.index_lane::<0>(*ru, t2, c2 & 1);
+            j.prefetch(idx[k]);
         }
-        // Stage 3: read, decode, descend.
+        // Stage 3: the U/D bound; the F/B view's table indices of the children within it
+        // (~1 in 6), entries prefetched.
+        let mut live = [(0usize, 0u8, 0usize); 17];
+        let mut nl = 0;
         for k in 0..nk {
-            let (c2, t2, _, _, m) = kids[k];
-            let (a, b) = idx[k];
-            let d2 = Mod3Table::decode(dj, j.get(a));
+            let d2 = Mod3Table::decode(dj, j.get(idx[k]));
             if d2 >= left {
                 continue;
             }
+            let (c2, t2, _, rf, _) = &kids[k];
+            let b = j.index_lane::<1>(*rf, t2, c2 & 1);
+            j.prefetch(b);
+            live[nl] = (k, d2, b);
+            nl += 1;
+        }
+        // Stage 4: the F/B bound, descend.
+        for &(k, d2, b) in &live[..nl] {
             let e2 = Mod3Table::decode(df, j.get(b));
             if e2 >= left {
                 continue;
             }
+            let (c2, t2, _, _, m) = kids[k];
             self.path.push(m);
             let go = self.joint_rec(
                 c2,
