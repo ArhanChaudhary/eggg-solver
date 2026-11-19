@@ -1,5 +1,5 @@
-//! Joint phase-2 table checks: admissibility, dominance over tau, and the phase-2 gap and node
-//! counts on real phase-1 endpoints, with and without the joint table.
+//! Joint phase-2 table checks (both views): admissibility, dominance over tau, and the phase-2
+//! gap and node counts on real phase-1 endpoints, with and without the joint table.
 use eggg_solver::cube::Cube;
 use eggg_solver::moves::{ALLOWED_AFTER, MOVE_PERMS, N_MOVES};
 use eggg_solver::phase1::{P1State, Search1};
@@ -31,8 +31,9 @@ fn main() {
         let cc = p2.centre_coord_of(&c);
         let tau = p2.tau_of(&c);
         let dj = j.distance(cc / 1680, &tau, cc & 1);
+        let df = j.distance_fb(cc, &tau);
         let dt = p2.tau_distance(&tau);
-        if dj as usize > k || dj < dt {
+        if dj as usize > k || df as usize > k || dj < dt {
             bad += 1;
         }
     }
@@ -66,6 +67,7 @@ fn main() {
             let tau = p2.tau_of(&x);
             let dt = p2.tau_distance(&tau);
             let dj = j.distance(cc / 1680, &tau, cc & 1);
+            let df = j.distance_fb(cc, &tau);
             let hc = p2.centre_dist[cc as usize];
             let mut l2 = 0;
             let mut s_old = Search2::new(p2);
@@ -89,12 +91,13 @@ fn main() {
                 }
             }
             let mut s_new = Search2::new(p2);
-            for d in hc.max(dj)..25 {
+            for d in hc.max(dj).max(df)..25 {
                 let mut found = false;
                 s_new.dfs_joint(
                     cc,
                     &tau,
                     dj,
+                    df,
                     d,
                     N_MOVES,
                     ALLOWED_AFTER[N_MOVES],
@@ -112,7 +115,7 @@ fn main() {
             n_new += s_new.nodes;
             sum_l2 += l2 as usize;
             sum_ht += hc.max(dt) as usize;
-            sum_hj += hc.max(dj) as usize;
+            sum_hj += hc.max(dj).max(df) as usize;
             cnt += 1;
         }
     }

@@ -533,13 +533,35 @@ impl<'a> Search2<'a> {
 }
 
 impl<'a> Search2<'a> {
-    /// [`Search2::dfs`] with the joint table: `dj` is the exact joint distance.
+    /// [`Search2::dfs`] with the joint table: `dj` and `df` are the exact joint distances of
+    /// the state and of its F/B view (the table read for the F/B centre pattern, see
+    /// [`crate::p2joint::FbView`]); the two bounds together expand several times fewer nodes
+    /// than the U/D one alone at deep levels.
     #[allow(clippy::too_many_arguments)]
     pub fn dfs_joint(
         &mut self,
         cc: u32,
         tau: &[u8; 16],
         dj: u8,
+        df: u8,
+        left: u8,
+        last: usize,
+        after: u32,
+        found: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> bool {
+        let tf = self.t.joint.as_ref().unwrap().fb.tau(tau);
+        self.joint_rec(cc, tau, &tf, dj, df, left, last, after, found)
+    }
+
+    /// [`Search2::dfs_joint`] below a state whose F/B view has tau `tf`.
+    #[allow(clippy::too_many_arguments)]
+    fn joint_rec(
+        &mut self,
+        cc: u32,
+        tau: &[u8; 16],
+        tf: &[u8; 16],
+        dj: u8,
+        df: u8,
         left: u8,
         last: usize,
         after: u32,
@@ -553,9 +575,11 @@ impl<'a> Search2<'a> {
         }
         let t = self.t;
         let j = t.joint.as_ref().unwrap();
+        let fb = &j.fb;
         let allowed = after & PHASE2_MASK & if left == 1 { last_mask(last) } else { u32::MAX };
-        // Stage 1: children with the centre bound, joint entries prefetched.
-        let mut kids = [(0u32, [0u8; 16], 0usize, 0u8); 17];
+        // Stage 1: children within the centre bound; the class-table entries of both views
+        // prefetched (the class table is 3.3 MB: its misses would stall every index).
+        let mut kids = [(0u32, [0u8; 16], [0u8; 16], 0usize, 0usize, 0u8); 17];
         let mut nk = 0;
         for (i, &m) in P2_MOVES.iter().enumerate() {
             if allowed >> m & 1 == 0 {
@@ -566,27 +590,47 @@ impl<'a> Search2<'a> {
                 continue;
             }
             let t2 = t.tau_move(tau, i);
-            let idx = j.index(c2 / 1680, &t2, c2 & 1);
-            j.prefetch(idx);
-            kids[nk] = (c2, t2, idx, m);
+            let f2 = fb.tau_move(tf, i);
+            let ru = j.raw(c2 / 1680, &t2);
+            j.prefetch_cls(ru);
+            let rf = j.raw(fb.ud(c2), &f2);
+            j.prefetch_cls(rf);
+            kids[nk] = (c2, t2, f2, ru, rf, m);
             nk += 1;
         }
         self.nodes += nk as u64;
         if self.halted() {
             return false;
         }
-        // Stage 2: read, decode, descend.
+        // Stage 2: table indices of both views, entries prefetched.
+        let mut idx = [(0usize, 0usize); 17];
         for k in 0..nk {
-            let (c2, t2, idx, m) = kids[k];
-            let d2 = Mod3Table::decode(dj, j.get(idx));
+            let (c2, t2, f2, ru, rf, _) = &kids[k];
+            let a = j.index_raw(*ru, t2, c2 & 1);
+            j.prefetch(a);
+            let b = j.index_raw(*rf, f2, c2 & 1);
+            j.prefetch(b);
+            idx[k] = (a, b);
+        }
+        // Stage 3: read, decode, descend.
+        for k in 0..nk {
+            let (c2, t2, f2, _, _, m) = kids[k];
+            let (a, b) = idx[k];
+            let d2 = Mod3Table::decode(dj, j.get(a));
             if d2 >= left {
                 continue;
             }
+            let e2 = Mod3Table::decode(df, j.get(b));
+            if e2 >= left {
+                continue;
+            }
             self.path.push(m);
-            let go = self.dfs_joint(
+            let go = self.joint_rec(
                 c2,
                 &t2,
+                &f2,
                 d2,
+                e2,
                 left - 1,
                 m as usize,
                 after_child(after, m as usize),
@@ -610,6 +654,8 @@ pub struct Task2 {
     tau: [u8; 16],
     /// The subtree root's exact distance in the table the search uses (joint or pairing).
     d: u8,
+    /// With the joint table, the exact distance of the root's F/B view.
+    df: u8,
     left: u8,
     last: usize,
     after: u32,
@@ -617,7 +663,8 @@ pub struct Task2 {
 
 impl<'a> Search2<'a> {
     /// The subtrees `depth` moves below the root of a search (the arguments of
-    /// [`Search2::dfs_joint`] if the joint table is loaded, else of [`Search2::dfs`]), in
+    /// [`Search2::dfs_joint`] if the joint table is loaded, else of [`Search2::dfs`] with `df`
+    /// unused), in
     /// search order: [`Search2::run_task`] on each, in turn, finds exactly the solutions of the
     /// whole search, in the same order. Empty if the search has no subtree that deep.
     #[allow(clippy::too_many_arguments)]
@@ -626,6 +673,7 @@ impl<'a> Search2<'a> {
         cc: u32,
         tau: &[u8; 16],
         d: u8,
+        df: u8,
         left: u8,
         last: usize,
         after: u32,
@@ -633,7 +681,7 @@ impl<'a> Search2<'a> {
     ) -> Vec<Task2> {
         let mut out = vec![];
         self.path.clear();
-        self.expand(cc, tau, d, left, last, after, depth, &mut out);
+        self.expand(cc, tau, d, df, left, last, after, depth, &mut out);
         out
     }
 
@@ -643,6 +691,7 @@ impl<'a> Search2<'a> {
         cc: u32,
         tau: &[u8; 16],
         d: u8,
+        df: u8,
         left: u8,
         last: usize,
         after: u32,
@@ -655,6 +704,7 @@ impl<'a> Search2<'a> {
                 cc,
                 tau: *tau,
                 d,
+                df,
                 left,
                 last,
                 after,
@@ -674,17 +724,39 @@ impl<'a> Search2<'a> {
                 continue;
             }
             let t2 = t.tau_move(tau, i);
-            let v = match &t.joint {
-                Some(j) => j.get(j.index(c2 / 1680, &t2, c2 & 1)),
-                None => t.tau_value(&t2),
+            let (v, w) = match &t.joint {
+                Some(j) => (
+                    j.get(j.index(c2 / 1680, &t2, c2 & 1)),
+                    j.get(j.index(j.fb.ud(c2), &j.fb.tau(&t2), c2 & 1)),
+                ),
+                None => (t.tau_value(&t2), 0),
             };
             let d2 = Mod3Table::decode(d, v);
             if d2 >= left {
                 continue;
             }
+            let e2 = if t.joint.is_some() {
+                let e2 = Mod3Table::decode(df, w);
+                if e2 >= left {
+                    continue;
+                }
+                e2
+            } else {
+                0
+            };
             self.path.push(m);
             let after2 = after_child(after, m as usize);
-            self.expand(c2, &t2, d2, left - 1, m as usize, after2, depth - 1, out);
+            self.expand(
+                c2,
+                &t2,
+                d2,
+                e2,
+                left - 1,
+                m as usize,
+                after2,
+                depth - 1,
+                out,
+            );
             self.path.pop();
         }
     }
@@ -695,7 +767,7 @@ impl<'a> Search2<'a> {
         self.path.clone_from(&task.path);
         let (cc, tau, d, left) = (task.cc, &task.tau, task.d, task.left);
         if self.t.joint.is_some() {
-            self.dfs_joint(cc, tau, d, left, task.last, task.after, found)
+            self.dfs_joint(cc, tau, d, task.df, left, task.last, task.after, found)
         } else {
             self.dfs(cc, tau, d, left, task.last, task.after, found)
         }
