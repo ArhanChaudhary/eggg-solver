@@ -1784,7 +1784,7 @@ mod tests {
                 let m = P2_MOVES[rand::Rng::gen_range(&mut rng, 0..P2_MOVES.len())];
                 cube = cube.apply_perm(&MOVE_PERMS[m as usize]);
             }
-            let c = make_candidate(&t, &cube, &[], 0).unwrap();
+            let c = candidate(&t, &cube, &[], 0, usize::MAX).unwrap();
             let left = c.h2 + 2;
             let (want, aborted, nodes) = search(&c, left, None);
             assert!(!aborted);
@@ -1818,7 +1818,7 @@ mod tests {
                     let m = P2_MOVES[rand::Rng::gen_range(&mut rng, 0..P2_MOVES.len())];
                     cube = cube.apply_perm(&MOVE_PERMS[m as usize]);
                 }
-                let c = make_candidate(t, &cube, &[], 0).unwrap();
+                let c = candidate(t, &cube, &[], 0, usize::MAX).unwrap();
                 let (_, last1, first) = phase2_root(&c);
                 for left in c.dt..c.h2 + 4 {
                     let mut want = vec![];
@@ -1891,6 +1891,7 @@ mod tests {
                     next: 0,
                 },
                 made_cands: 0,
+                cand_time: Duration::ZERO,
                 made_reds: 0,
                 cands: vec![],
                 reds: vec![],
