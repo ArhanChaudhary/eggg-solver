@@ -1594,6 +1594,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             test &= WIDE_MOVES;
         }
         self.prof[8] += test.count_ones() as u64;
+        if d == 0 {
+            self.prof[23] += test.count_ones() as u64;
+        }
         let centres = s.centres;
         while test != 0 {
             let m = test.trailing_zeros() as usize;
@@ -1602,6 +1605,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 continue;
             }
             self.prof[9] += 1;
+            if d >= 1 {
+                self.prof[21] += 1;
+            }
             let excl = unsafe { *t.p2_frames.get_unchecked(m) } as u32
                 | run_frames as u32 & 0u32.wrapping_sub(same >> m & 1);
             let p = unsafe { t.wing_dst.get_unchecked(m) }.gather(&pos);
@@ -1630,6 +1636,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             }
             if frames != 0 {
                 self.prof[11] += 1;
+                if d >= 1 {
+                    self.prof[22] += 1;
+                }
                 self.prof[12] += frames.count_ones() as u64;
                 if let Some((id, mv)) = batch {
                     self.set_batch_path(id);

@@ -26,6 +26,7 @@ fn main() {
     let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(3);
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let (mut nodes, mut reads, mut eps) = (0u64, 0u64, 0usize);
+    let mut prof = [0u64; 24];
     let t0 = Instant::now();
     for _ in 0..cubes {
         let cube = Cube::random(&mut rng);
@@ -40,6 +41,9 @@ fn main() {
             s.dfs(&root, d0, len, N_MOVES);
             nodes += s.nodes;
             reads += s.reads;
+            for (a, b) in prof.iter_mut().zip(s.prof) {
+                *a += b;
+            }
             eps += found.len();
             found.hash(&mut h);
         }
@@ -49,4 +53,5 @@ fn main() {
         h.finish(),
         t0.elapsed().as_secs_f64()
     );
+    println!("prof {prof:?}");
 }
