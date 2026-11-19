@@ -378,7 +378,14 @@ pub fn save(path: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("tmp");
+    // A temporary name of its own, so concurrent saves of the same table (e.g. tests that
+    // generate a missing table in parallel) never write or rename each other's file.
+    static SAVES: AtomicUsize = AtomicUsize::new(0);
+    let tmp = path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        SAVES.fetch_add(1, Ordering::Relaxed)
+    ));
     {
         let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
         f.write_all(MAGIC)?;
@@ -472,6 +479,29 @@ impl Drop for LoadGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Concurrent saves of the same table (as parallel tests generating a missing table do)
+    /// all succeed and leave a valid file.
+    #[test]
+    fn concurrent_saves_of_one_table() {
+        let dir = std::env::temp_dir().join(format!("eggg-save-test-{}", std::process::id()));
+        let path = dir.join("t.tab");
+        let bytes: Vec<u8> = (0..(1usize << 20)).map(|i| (i * 31 % 253) as u8).collect();
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| save(&path, "t", &bytes).unwrap());
+            }
+        });
+        let mut out = vec![0u8; bytes.len()];
+        load(&path, "t", &mut out).unwrap();
+        assert_eq!(out, bytes);
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "temporary files left"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn chunked_load_matches_checksum_and_rejects_corruption() {
