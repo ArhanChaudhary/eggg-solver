@@ -2,9 +2,10 @@
 //! distance, joint U/D distance), the bound before the F/B view) of the candidates of random
 //! cubes' phase-1 endpoints, searched with `dfs_joint` as the solver does. Prints, per slack,
 //! the solutions, nodes and thread CPU time per solution, and a hash of all solutions in order
-//! (equal hashes: the same solutions in the same order). Single-threaded.
-//! Usage: p2cost [cubes] [endpoints per cube] [max slack] [seed] (tables in $EGGG_TABLES or
-//! ./tables).
+//! (equal hashes: the same solutions in the same order). `threads` threads take the
+//! candidates one at a time (CPU times are per thread; the wall time shows the throughput).
+//! Usage: p2cost [cubes] [endpoints per cube] [max slack] [seed] [threads] (tables in
+//! $EGGG_TABLES or ./tables).
 use eggg_solver::cube::Cube;
 use eggg_solver::moves::{ALLOWED_AFTER, MOVE_PERMS, N_MOVES};
 use eggg_solver::phase1::{P1State, Search1};
@@ -28,11 +29,12 @@ fn main() {
             .map(|s| s.parse().unwrap())
             .unwrap_or(d)
     };
-    let (ncubes, per_cube, max_slack, seed) = (
+    let (ncubes, per_cube, max_slack, seed, threads) = (
         arg(1, 8) as usize,
         arg(2, 60) as usize,
         arg(3, 3) as u8,
         arg(4, 7),
+        arg(5, 1).max(1) as usize,
     );
     let dir = std::env::var_os("EGGG_TABLES")
         .map(std::path::PathBuf::from)
@@ -75,20 +77,18 @@ fn main() {
         }
     }
     let n = max_slack as usize + 1;
-    let (mut sols, mut nodes, mut cpu, mut searched) =
-        (vec![0u64; n], vec![0u64; n], vec![0f64; n], vec![0u64; n]);
-    let (mut sum_hu, mut sum_h2) = (0usize, 0usize);
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    let t_all = cpu_now();
-    for &(cc, tau) in &cands {
+    // Per candidate: (U/D bound, bound, per slack (searched, solutions, nodes, CPU s), the
+    // solutions' moves in order, 0xff after each).
+    type Res = (u8, u8, Vec<(u64, u64, u64, f64)>, Vec<u8>);
+    let run = |&(cc, tau): &(u32, [u8; 16])| -> Res {
         let hc = p2.centre_dist[cc as usize];
         let dj = j.distance(cc / 1680, &tau, cc & 1);
         let df = j.distance_fb(cc, &tau); // fb-only
         let hu = hc.max(dj);
         let h2 = hu;
         let h2 = h2.max(df); // fb-only
-        sum_hu += hu as usize;
-        sum_h2 += h2 as usize;
+        let mut per = vec![(0, 0, 0, 0.0); n];
+        let mut moves = vec![];
         for s in 0..=max_slack {
             let l2 = hu + s;
             if l2 < h2 {
@@ -107,23 +107,68 @@ fn main() {
                 ALLOWED_AFTER[N_MOVES],
                 &mut |p| {
                     found += 1;
-                    for &m in p {
-                        hash = (hash ^ m as u64).wrapping_mul(0x100_0000_01b3);
-                    }
-                    hash = (hash ^ 0xff).wrapping_mul(0x100_0000_01b3);
+                    moves.extend_from_slice(p);
+                    moves.push(0xff);
                     true
                 },
             );
-            cpu[s as usize] += cpu_now() - t0;
-            nodes[s as usize] += srch.nodes;
-            sols[s as usize] += found;
-            searched[s as usize] += 1;
+            per[s as usize] = (1, found, srch.nodes, cpu_now() - t0);
+        }
+        (hu, h2, per, moves)
+    };
+    // Candidates taken by the threads one at a time.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let t_wall = std::time::Instant::now();
+    let mut res: Vec<Option<Res>> = (0..cands.len()).map(|_| None).collect();
+    let (total, wall) = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..threads)
+            .map(|_| {
+                let (cands, run, next) = (&cands, &run, &next);
+                sc.spawn(move || {
+                    let t0 = cpu_now();
+                    let mut out: Vec<(usize, Res)> = vec![];
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= cands.len() {
+                            break;
+                        }
+                        out.push((i, run(&cands[i])));
+                    }
+                    (out, cpu_now() - t0)
+                })
+            })
+            .collect();
+        let mut total = 0.0;
+        for h in hs {
+            let (out, t) = h.join().unwrap();
+            total += t;
+            for (i, r) in out {
+                res[i] = Some(r);
+            }
+        }
+        (total, t_wall.elapsed().as_secs_f64())
+    });
+    let (mut sols, mut nodes, mut cpu, mut searched) =
+        (vec![0u64; n], vec![0u64; n], vec![0f64; n], vec![0u64; n]);
+    let (mut sum_hu, mut sum_h2) = (0usize, 0usize);
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for (hu, h2, per, moves) in res.into_iter().map(Option::unwrap) {
+        sum_hu += hu as usize;
+        sum_h2 += h2 as usize;
+        for (s, &(a, b, c, d)) in per.iter().enumerate() {
+            searched[s] += a;
+            sols[s] += b;
+            nodes[s] += c;
+            cpu[s] += d;
+        }
+        for m in moves {
+            hash = (hash ^ m as u64).wrapping_mul(0x100_0000_01b3);
         }
     }
-    let total = cpu_now() - t_all;
     let c = cands.len() as f64;
     println!(
-        "{} candidates: mean bound hu {:.3}, h2 {:.3}; total CPU {total:.2} s; solution hash {hash:016x}",
+        "{} candidates: mean bound hu {:.3}, h2 {:.3}; {threads} threads: total CPU {total:.2} s, \
+         wall {wall:.2} s; solution hash {hash:016x}",
         cands.len(),
         sum_hu as f64 / c,
         sum_h2 as f64 / c
