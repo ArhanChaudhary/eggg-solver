@@ -414,6 +414,10 @@ struct Run<'a, 'r> {
     cands: Vec<Candidate>,
     reds: Vec<Reduction>,
     red_index: HashMap<(usize, Cube3), usize>,
+    /// Per 3-move job prefix: (kept candidates, phase-1 nodes) at the current length, and at
+    /// the previous one (see [`Run::order_jobs`]).
+    yield_cur: HashMap<[u8; 3], (u64, u64)>,
+    yield_prev: HashMap<[u8; 3], (u64, u64)>,
 }
 
 impl<'a> Solver<'a> {
@@ -483,6 +487,8 @@ impl<'a> Solver<'a> {
             cands: vec![],
             reds: vec![],
             red_index: HashMap::new(),
+            yield_cur: HashMap::new(),
+            yield_prev: HashMap::new(),
         };
         run.level.jobs = run.level_jobs(len0);
         std::thread::scope(|scope| {
@@ -673,11 +679,10 @@ impl<'a, 'r> Run<'a, 'r> {
         {
             if self.level.next >= self.level.jobs.len() {
                 let len = self.level.len + 1;
-                self.level = Level1 {
-                    len,
-                    jobs: self.level_jobs(len),
-                    next: 0,
-                };
+                self.yield_prev = std::mem::take(&mut self.yield_cur);
+                let mut jobs = self.level_jobs(len);
+                self.order_jobs(&mut jobs);
+                self.level = Level1 { len, jobs, next: 0 };
                 continue;
             }
             let need = want - self.made_cands;
@@ -726,12 +731,14 @@ impl<'a, 'r> Run<'a, 'r> {
                             let last = prefix.last().map(|&m| m as usize).unwrap_or(N_MOVES);
                             let left = len - prefix.len() as u8;
                             p1_run(&mut srch, &st, d, left, last, 2, &close, &mut spill);
-                            n += srch.nodes;
+                            let job_nodes = srch.nodes;
+                            drop(srch);
+                            n += job_nodes;
                             let k: usize = eps.iter().map(|e| e.1.count_ones() as usize).sum();
                             if found.fetch_add(k, Ordering::Relaxed) + k >= need {
                                 close.raise();
                             }
-                            local.push((j, eps, spill));
+                            local.push((j, eps, spill, job_nodes));
                         }
                         nodes.fetch_add(n, Ordering::Relaxed);
                         out.lock().unwrap().extend(local);
@@ -749,6 +756,11 @@ impl<'a, 'r> Run<'a, 'r> {
             results.sort_by_key(|r| r.0);
             // Subtrees handed back go first, then the jobs not yet claimed.
             let mut rest: Vec<(u8, Vec<u8>)> = vec![];
+            for r in &results {
+                if let Ok(k) = <[u8; 3]>::try_from(jobs[r.0].1.get(..3).unwrap_or(&[])) {
+                    self.yield_cur.entry(k).or_default().1 += r.3;
+                }
+            }
             for r in &mut results {
                 let pair = jobs[r.0].0;
                 rest.extend(r.2.drain(..).map(|p| (pair, p)));
@@ -778,10 +790,48 @@ impl<'a, 'r> Run<'a, 'r> {
             made.sort_unstable_by_key(|m| m.0);
             self.made_cands += eps.iter().map(|e| e.1.count_ones() as usize).sum::<usize>();
             self.stats.kept += made.iter().map(|m| m.1.len()).sum::<usize>();
+            for c in made.iter().flat_map(|m| &m.1) {
+                if let Ok(k) = <[u8; 3]>::try_from(c.moves1.get(..3).unwrap_or(&[])) {
+                    self.yield_cur.entry(k).or_default().0 += 1;
+                }
+            }
             self.cands.extend(made.into_iter().flat_map(|m| m.1));
             self.cand_time += tc.elapsed();
         }
         self.stats.endpoints = self.made_cands;
+    }
+
+    /// Order a new level's jobs by the yield of their 3-move prefix at the previous length
+    /// (kept candidates per phase-1 node, smoothed towards the mean), best first: a level
+    /// that the time limit cuts short then searches the subtrees most likely to give kept
+    /// candidates (`EGGG_P1_ORDER=0`: the plain order).
+    fn order_jobs(&self, jobs: &mut [(u8, Vec<u8>)]) {
+        if self.yield_prev.is_empty() || std::env::var("EGGG_P1_ORDER").is_ok_and(|v| v == "0") {
+            return;
+        }
+        let (k, n) = self
+            .yield_prev
+            .values()
+            .fold((0u64, 0u64), |a, v| (a.0 + v.0, a.1 + v.1));
+        let mean_n = n as f64 / self.yield_prev.len() as f64;
+        let rate = k as f64 / (n as f64).max(1.0);
+        let score = |p: &[u8]| -> f64 {
+            let (k, n) = <[u8; 3]>::try_from(p.get(..3).unwrap_or(&[]))
+                .ok()
+                .and_then(|key| self.yield_prev.get(&key).copied())
+                .unwrap_or((0, 0));
+            (k as f64 + rate * mean_n) / (n as f64 + mean_n)
+        };
+        let mut scored: Vec<(f64, usize)> = jobs
+            .iter()
+            .enumerate()
+            .map(|(i, j)| (score(&j.1), i))
+            .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let old = jobs.to_vec();
+        for (slot, (_, i)) in jobs.iter_mut().zip(scored) {
+            *slot = old[i].clone();
+        }
     }
 
     /// The longest reduction that could still lead to a shorter solution at the deepest
