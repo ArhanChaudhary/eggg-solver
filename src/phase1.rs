@@ -806,6 +806,8 @@ pub struct P1Tables {
     pub pat: Option<crate::p1pat::PatTable>,
     /// The move-mask table (with the large staging table, see [`crate::p1mask`]).
     pub mask: Option<crate::p1mask::MaskTable>,
+    /// The wing lookahead of the batched nodes two moves from the end (see [`crate::wing2`]).
+    pub wing2: Box<crate::wing2::Wing2>,
 }
 
 /// [`Search1::pair`] for the search over all pairs, pruned by the staging table only.
@@ -844,6 +846,7 @@ impl P1Tables {
             }
             v
         });
+        let wing2 = Box::new(crate::wing2::Wing2::new(&frames, &wing_dst));
         P1Tables {
             staging,
             table,
@@ -856,6 +859,7 @@ impl P1Tables {
             stage_rep,
             pat: None,
             mask: None,
+            wing2,
         }
     }
 
@@ -1102,9 +1106,21 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
 
     /// Queue a node with `left` moves left (>= 2) at distance `d` (= `left`, or less with the
     /// reduced table) for a batch: the state `s` after the search's path and `m` (if any),
-    /// its mask table's first index `idx`.
+    /// its mask table's first index `idx()` (computed only for a node that is queued).
     #[inline(always)]
-    fn push_batch(&mut self, s: P1State, idx: u64, left: u8, last: usize, m: Option<u8>, d: u8) {
+    fn push_batch(
+        &mut self,
+        s: P1State,
+        idx: impl FnOnce() -> u64,
+        left: u8,
+        last: usize,
+        m: Option<u8>,
+        d: u8,
+    ) {
+        if !self.wings_possible(&s, left, d) {
+            return;
+        }
+        let idx = idx();
         let off = self.batch_roots.len();
         self.batch_roots.push(0);
         self.batch_roots.extend_from_slice(&self.path);
@@ -1131,10 +1147,14 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         });
     }
 
-    /// Queue the child `c` (after move `m`, first index `idx`, distance `d`) of batch node
-    /// `nd`.
+    /// Queue the child `c` (after move `m`, first index `idx()`, computed only if it is
+    /// queued, distance `d`) of batch node `nd`.
     #[inline(always)]
-    fn push_child(&mut self, nd: &BNode, c: &P1State, idx: u64, m: usize, d: u8) {
+    fn push_child(&mut self, nd: &BNode, c: &P1State, idx: impl FnOnce() -> u64, m: usize, d: u8) {
+        if !self.wings_possible(c, nd.left - 1, d) {
+            return;
+        }
+        let idx = idx();
         let id = self.batch_tree.len() as u32;
         self.batch_tree.push((nd.id, m as u8));
         self.t.mask.as_ref().unwrap().prefetch(self.t, idx);
@@ -1150,6 +1170,15 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             last: m as u8,
             d,
         });
+    }
+
+    /// Can a node queued for a batch (state `s`, `left` moves left, staging distance `d`)
+    /// still reach an endpoint as far as its wings tell (see [`crate::wing2`])? Only nodes two
+    /// moves from the end are tested, in the search over all pairs (where `d` is the staging
+    /// distance); a node that fails has no endpoint below it and is not queued.
+    #[inline(always)]
+    fn wings_possible(&self, s: &P1State, left: u8, d: u8) -> bool {
+        left != 2 || self.pair != ALL_PAIRS || self.t.wing2.possible(&s.pos, s.parity, d == 2)
     }
 
     /// Set `self.path` to the path of batch node `id` (see [`Search1::batch_tree`]).
@@ -1237,9 +1266,11 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                                 return;
                             }
                         } else {
-                            let g = unsafe { child_flags(&flags, m, t) };
-                            let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
-                            let i = t.staging.rank24(!nud & MASK24) as u64;
+                            let i = || {
+                                let g = unsafe { child_flags(&flags, m, t) };
+                                let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
+                                t.staging.rank24(!nud & MASK24) as u64
+                            };
                             self.push_child(nd, &c, i, m, dc);
                         }
                     }
@@ -1304,8 +1335,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     while a != 0 {
                         let m = a.trailing_zeros() as usize;
                         a &= a - 1;
-                        let g = unsafe { child_flags(&flags, m, t) };
-                        let i = t.staging.rank24(crate::simd::movemask(&g)) as u64;
+                        let i = || {
+                            let g = unsafe { child_flags(&flags, m, t) };
+                            t.staging.rank24(crate::simd::movemask(&g)) as u64
+                        };
                         let c = s.apply(m, t);
                         self.push_child(nd, &c, i, m, nd.left - 1);
                     }
@@ -1314,13 +1347,15 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     while a != 0 {
                         let m = a.trailing_zeros() as usize;
                         a &= a - 1;
-                        let g = unsafe { child_flags(&flags, m, t) };
-                        // The reduced table needs only the rank of the U/D positions.
-                        let i = if reduced {
-                            let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
-                            t.staging.rank24(!nud & MASK24) as u64
-                        } else {
-                            t.staging.big_index_flags(&g)
+                        let i = || {
+                            let g = unsafe { child_flags(&flags, m, t) };
+                            // The reduced table needs only the rank of the U/D positions.
+                            if reduced {
+                                let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
+                                t.staging.rank24(!nud & MASK24) as u64
+                            } else {
+                                t.staging.big_index_flags(&g)
+                            }
                         };
                         let c = s.apply(m, t);
                         self.push_child(nd, &c, i, m, nd.left - 1);
@@ -1416,7 +1451,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         let mt = t.mask.as_ref().unwrap();
         if d >= left {
             if d == left {
-                self.push_batch(*s, st.rank24(s.masks().0) as u64, left, last, None, d);
+                self.push_batch(*s, || st.rank24(s.masks().0) as u64, left, last, None, d);
             }
             return;
         }
@@ -1495,7 +1530,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             let dc = d + 1 - 2 * (dec >> m & 1) as u8 - (eq >> m & 1) as u8;
             let c = s.apply(m, t);
             if batched >> m & 1 == 1 {
-                let i = st.rank24(c.masks().0) as u64;
+                let i = || st.rank24(c.masks().0) as u64;
                 self.push_batch(c, i, left - 1, m, Some(m as u8), dc);
                 if self.batch.len() >= mt.batch {
                     self.run_batch();
@@ -1642,7 +1677,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 .as_ref()
                 .unwrap()
                 .pre_index(self.t, s, self.pair);
-            self.push_batch(*s, i, left, last, None, left);
+            self.push_batch(*s, || i, left, last, None, left);
             return;
         }
         let mut allowed = ALLOWED_AFTER[last];
@@ -1756,10 +1791,13 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             if dc < left {
                 let c = s.apply(m, t);
                 if batched && dc == left - 1 && dc >= self.batch_min_left() {
-                    let i = if K == K_MASK {
-                        t.mask.as_ref().unwrap().pre_index_of_big(idx[k])
-                    } else {
-                        t.mask.as_ref().unwrap().pre_index(t, &c, self.pair)
+                    let pair = self.pair;
+                    let i = || {
+                        if K == K_MASK {
+                            t.mask.as_ref().unwrap().pre_index_of_big(idx[k])
+                        } else {
+                            t.mask.as_ref().unwrap().pre_index(t, &c, pair)
+                        }
                     };
                     self.push_batch(c, i, dc, m, Some(m as u8), dc);
                     if self.batch.len() >= t.mask.as_ref().unwrap().batch {

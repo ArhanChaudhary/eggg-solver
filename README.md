@@ -64,7 +64,12 @@ keep the distance: a node with slack gets all its children's distances from its 
 so the search needs no large staging table. A per-node pass
 over the masked search (parent-pointer paths, cheaper leaf tests, byte-lookup pext on ARM)
 made it another 3x faster with the same endpoints, and the parity and equal-distance bits
-2x more. On the M2 (8 threads), 20 random positions (seed 6060), current version: 39.45
+2x more. A node two moves from the end is only searched if its wings can still be made
+pairable by the last two moves (the last one a wide quarter turn, or with staged centres an
+outer quarter turn of the special axis): a test of its wing positions against the 12 to 51
+slot sets per frame that those move pairs take to the low slots, bit-sliced into one word
+per frame (`src/wing2.rs`, no table). About 90% of these nodes, and of the last-move tests
+below them, go (same endpoints; p1check 1.25x faster on the M2, 1 thread). On the M2 (8 threads), 20 random positions (seed 6060), current version: 39.45
 moves on average after 10 s, 39.10 after 30 s, 38.80 after 60 s (before the parity and
 equal-distance bits, the round cut and the cheaper candidates: 39.65 / 39.30 / 39.15, and
 38.80 only after 2 minutes, 38.60 after 10 minutes). `--p1-mask big` is the same without the symmetry reduction (18.9 GB).
