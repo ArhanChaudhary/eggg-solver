@@ -120,7 +120,10 @@ struct Candidate {
     cube: Cube,
     centre: u32,
     tau: [u8; 16],
+    /// Exact tau distance, or with the joint table, the exact joint distance.
     dt: u8,
+    /// With the joint table, the exact joint distance of the F/B view (else 0).
+    df: u8,
     h2: u8,
     /// Phase-2 depths below this have been searched.
     done2: u8,
@@ -291,7 +294,8 @@ fn p1_run<F: FnMut(&[u8], u8) -> bool>(
 /// (by endpoint, then frame), except the frames whose centres cannot be solved and those whose
 /// phase-2 bound h2 puts L1 + h2 past `limit`. The bound is exact for the candidates kept; for
 /// the others, walking down the joint table stops once it is out of reach. The joint-table
-/// walks are interleaved (each is a chain of dependent table reads).
+/// walks are interleaved (each is a chain of dependent table reads); the F/B views are walked
+/// only for the frames within reach after the U/D walk.
 fn make_candidates(
     p2: &P2Tables,
     cube: &Cube,
@@ -332,15 +336,37 @@ fn make_candidates(
         }
     }
     let mut dts = Vec::with_capacity(walks.len());
+    let mut dfs = vec![Some(0); walks.len()];
     match &p2.joint {
-        Some(j) => j.distances_at_most(&walks, &mut dts),
+        Some(j) => {
+            j.distances_at_most(&walks, &mut dts);
+            // The F/B views of the frames still within reach.
+            let (mut keep, mut views) = (vec![], vec![]);
+            for (k, (w, dt)) in walks.iter().zip(&dts).enumerate() {
+                if dt.is_some() {
+                    keep.push(k);
+                    let centre = part[k].3;
+                    views.push((j.fb.ud(centre), j.fb.tau(&w.1), w.2, w.3));
+                }
+            }
+            let mut got = Vec::with_capacity(views.len());
+            j.distances_at_most(&views, &mut got);
+            dfs.fill(None);
+            for (k, d) in keep.into_iter().zip(got) {
+                dfs[k] = d;
+            }
+        }
         None => dts.extend(walks.iter().map(|w| Some(p2.tau_distance(&w.1)))),
     }
-    for ((&(e, frame, x, centre, cd), w), dt) in part.iter().zip(&walks).zip(dts) {
+    for (((&(e, frame, x, centre, cd), w), dt), df) in part.iter().zip(&walks).zip(dts).zip(dfs) {
         let moves1 = &eps[e].0;
-        let Some(dt) = dt.filter(|&dt| moves1.len() + dt as usize <= limit) else {
+        let (Some(dt), Some(df)) = (dt, df) else {
             continue;
         };
+        let h2 = cd.max(dt).max(df);
+        if moves1.len() + h2 as usize > limit {
+            continue;
+        }
         out.push(Candidate {
             moves1: moves1.clone(),
             frame,
@@ -348,7 +374,8 @@ fn make_candidates(
             centre,
             tau: w.1,
             dt,
-            h2: cd.max(dt),
+            df,
+            h2,
             done2: 0,
         });
     }
@@ -938,7 +965,7 @@ impl<'a, 'r> Run<'a, 'r> {
             match task {
                 Some(task) => srch.run_task(task, &mut keep),
                 None if t.p2.joint.is_some() => {
-                    srch.dfs_joint(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep)
+                    srch.dfs_joint(c.centre, &c.tau, c.dt, c.df, l2, last1, first, &mut keep)
                 }
                 None => srch.dfs(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep),
             };
@@ -988,7 +1015,7 @@ impl<'a, 'r> Run<'a, 'r> {
                         let (_, last1, first) = phase2_root(c);
                         let depth = if slack > split { 2 } else { 1 };
                         let tasks = Search2::new(&t.p2)
-                            .tasks(c.centre, &c.tau, c.dt, l2, last1, first, depth);
+                            .tasks(c.centre, &c.tau, c.dt, c.df, l2, last1, first, depth);
                         parts[k].store(tasks.len(), Ordering::Relaxed);
                         pending
                             .lock()
@@ -1205,7 +1232,7 @@ pub fn load_mask(p1: &mut P1Tables, dir: &std::path::Path, big: bool, verbose: b
 }
 
 /// Load or build the phase-2 tables in `dir`; `joint`: also the joint table (1.05 GB).
-fn load_p2(dir: &std::path::Path, joint: bool, threads: usize, verbose: bool) -> P2Tables {
+pub fn load_p2(dir: &std::path::Path, joint: bool, threads: usize, verbose: bool) -> P2Tables {
     let p2_path = dir.join("p2-tau.tab");
     let mut p2 = {
         let n = crate::phase2::N_TAU;
@@ -1357,9 +1384,15 @@ mod tests {
             return None;
         }
         let tau = t.p2.tau_of(&x);
-        let dt = match &t.p2.joint {
-            Some(j) => j.distance_ref(&t.p2, centre / 1680, &tau, centre & 1),
-            None => t.p2.tau_distance(&tau),
+        let (dt, df) = match &t.p2.joint {
+            Some(j) => {
+                let (ud, tf, pll) = fb_view_ref(&t.p2, &x);
+                (
+                    j.distance_ref(&t.p2, centre / 1680, &tau, centre & 1),
+                    j.distance_ref(&t.p2, ud, &tf, pll),
+                )
+            }
+            None => (t.p2.tau_distance(&tau), 0),
         };
         let c = Candidate {
             moves1: moves1.to_vec(),
@@ -1368,10 +1401,29 @@ mod tests {
             centre,
             tau,
             dt,
-            h2: cd.max(dt),
+            df,
+            h2: cd.max(dt).max(df),
             done2: 0,
         };
         (c.moves1.len() + c.h2 as usize <= limit).then_some(c)
+    }
+
+    /// The joint-table state (U/D pattern, tau, PLL bit) of the cube rotated by x (about the
+    /// R/L axis): the F/B view of a phase-2 state, from the rotated cube itself.
+    fn fb_view_ref(p2: &P2Tables, x: &Cube) -> (u32, [u8; 16], u32) {
+        let m = *crate::cube::ROTATIONS
+            .iter()
+            .find(|m| m[0][0] == 1 && m[1][1] == 0)
+            .unwrap();
+        let y = crate::moves::Conj::new(m).apply(x);
+        let mut mask = 0u8;
+        for (k, p) in [0usize, 1, 2, 3, 12, 13, 14, 15].into_iter().enumerate() {
+            if y.ct[p] / 4 == crate::cube::U as u8 {
+                mask |= 1 << k;
+            }
+        }
+        let pll = crate::phase2::pll_parity(&y, &p2.low);
+        (p2.rank70(mask) as u32, p2.tau_of(&y), pll)
     }
 
     /// Tables with the joint phase-2 table, from $EGGG_TABLES (default ./tables) with the H48
@@ -1421,9 +1473,9 @@ mod tests {
 
     fn same(a: &Candidate, b: &Candidate) -> bool {
         (
-            &a.moves1, a.frame, a.cube, a.centre, a.tau, a.dt, a.h2, a.done2,
+            &a.moves1, a.frame, a.cube, a.centre, a.tau, a.dt, a.df, a.h2, a.done2,
         ) == (
-            &b.moves1, b.frame, b.cube, b.centre, b.tau, b.dt, b.h2, b.done2,
+            &b.moves1, b.frame, b.cube, b.centre, b.tau, b.dt, b.df, b.h2, b.done2,
         )
     }
 
@@ -1494,6 +1546,136 @@ mod tests {
         let mut got = vec![];
         j.distances_at_most(&states, &mut got);
         assert_eq!(got, want);
+    }
+
+    /// The F/B view of the joint table: its state is the rotated cube's, its distance is the
+    /// same whether walked in the rotated frame or over our own moves (the rotated move set
+    /// is the phase-2 move set up to symmetries of the table), it is admissible (at most the
+    /// length of the move sequence that made the state), and the view's tau follows the moves.
+    #[test]
+    fn fb_view_distances() {
+        use crate::phase2::P2_MOVES;
+        use rand::Rng;
+        let t = joint_tables();
+        let (p2, j) = (&t.p2, t.p2.joint.as_ref().unwrap());
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(4);
+        // The former walk over our own moves, reading the view of each child.
+        let walk_ours = |cc: u32, tau: &[u8; 16]| {
+            let get = |cc: u32, tau: &[u8; 16]| {
+                let (ud, tf) = j.fb.map(cc, tau);
+                j.get(j.index(ud, &tf, cc & 1))
+            };
+            let (mut cc, mut tau, mut d) = (cc, *tau, 0u8);
+            loop {
+                let v = get(cc, &tau);
+                let next = (0..17)
+                    .map(|i| (p2.centre_move[cc as usize][i], p2.tau_move(&tau, i)))
+                    .find(|(c2, t2)| get(*c2, t2) == (v + 2) % 3);
+                match next {
+                    Some((c2, t2)) if d < 40 => (cc, tau, d) = (c2, t2, d + 1),
+                    _ => return d,
+                }
+            }
+        };
+        let (mut sum_ud, mut sum_fb, mut sum_max, mut n) = (0usize, 0usize, 0usize, 0usize);
+        for _ in 0..3000 {
+            let k = rng.gen_range(0..30);
+            let mut c = Cube::SOLVED;
+            let (mut cc, mut tau) = (p2.centre_coord_of(&c), p2.tau_of(&c));
+            let mut tf = j.fb.tau(&tau);
+            for _ in 0..k {
+                let i = rng.gen_range(0..17);
+                c = c.apply_perm(&MOVE_PERMS[P2_MOVES[i] as usize]);
+                (cc, tau) = (p2.centre_move[cc as usize][i], p2.tau_move(&tau, i));
+                tf = j.fb.tau_move(&tf, i);
+                assert_eq!(tf[..12], j.fb.tau(&tau)[..12]);
+            }
+            assert_eq!(cc, p2.centre_coord_of(&c));
+            let (ud, tr, pll) = fb_view_ref(p2, &c);
+            assert_eq!((ud, &tr[..12], pll), (j.fb.ud(cc), &tf[..12], cc & 1));
+            let df = j.distance_fb(cc, &tau);
+            assert_eq!(df, j.distance_ref(p2, ud, &tr, pll));
+            assert_eq!(df, walk_ours(cc, &tau));
+            assert!(df as usize <= k, "F/B view distance {df} after {k} moves");
+            let dj = j.distance(cc / 1680, &tau, cc & 1);
+            assert!(dj as usize <= k);
+            if k >= 20 {
+                (sum_ud, sum_fb, sum_max, n) = (
+                    sum_ud + dj as usize,
+                    sum_fb + df as usize,
+                    sum_max + dj.max(df) as usize,
+                    n + 1,
+                );
+            }
+        }
+        // Each view alone is about as tight; their maximum is tighter.
+        let m = |x: usize| x as f64 / n as f64;
+        eprintln!(
+            "{n} states: U/D {:.2}, F/B {:.2}, max {:.2}",
+            m(sum_ud),
+            m(sum_fb),
+            m(sum_max)
+        );
+        assert!(sum_max > sum_ud && sum_max > sum_fb);
+    }
+
+    /// The joint-table search (both views) finds exactly the solutions of the search with the
+    /// pairing table alone, in the same order, at every depth from the pairing bound up:
+    /// candidates of random cubes' phase-1 endpoints, all depths up to two past the bound.
+    #[test]
+    fn joint_search_finds_the_pairing_search_solutions() {
+        let t = joint_tables();
+        let p2 = &t.p2;
+        let (mut sols, mut searches, mut nodes_j, mut nodes_p) = (0usize, 0usize, 0u64, 0u64);
+        let mut tighter = 0;
+        for (cube, eps) in random_endpoints(&t, 6, 40, 17) {
+            let mut cands = vec![];
+            make_candidates(p2, &cube, &eps, usize::MAX, &mut cands);
+            for c in cands.iter().step_by(3) {
+                let (_, last1, first) = phase2_root(c);
+                let cd = p2.centre_dist[c.centre as usize];
+                let dt = p2.tau_distance(&c.tau);
+                let hp = cd.max(dt);
+                assert!(hp <= c.h2);
+                tighter += (hp < c.h2) as usize;
+                // Every depth from the pairing bound to two past the joint one, while the
+                // pairing-table searches stay small.
+                let mut budget = 3_000_000u64;
+                for left in hp..=c.h2 + 2 {
+                    let mut want = vec![];
+                    let mut s = Search2::new(p2);
+                    s.dfs(c.centre, &c.tau, dt, left, last1, first, &mut |p| {
+                        want.push(p.to_vec());
+                        true
+                    });
+                    nodes_p += s.nodes;
+                    budget = budget.saturating_sub(s.nodes);
+                    let mut got = vec![];
+                    if left >= c.h2 {
+                        let mut s = Search2::new(p2);
+                        s.dfs_joint(c.centre, &c.tau, c.dt, c.df, left, last1, first, &mut |p| {
+                            got.push(p.to_vec());
+                            true
+                        });
+                        nodes_j += s.nodes;
+                    }
+                    assert_eq!(got, want, "{:?} frame {}, depth {left}", c.moves1, c.frame);
+                    sols += want.len();
+                    searches += 1;
+                    if budget == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{searches} searches, {sols} solutions; nodes: pairing table {nodes_p}, joint {nodes_j}; \
+             {tighter} candidates with a tighter bound"
+        );
+        assert!(
+            sols > 500 && tighter > 0,
+            "{sols} solutions, {tighter} tighter"
+        );
     }
 
     /// Candidate construction timings (single thread), former and current, on phase-1
@@ -1828,12 +2010,15 @@ mod tests {
                         true
                     };
                     if t.p2.joint.is_some() {
-                        srch.dfs_joint(c.centre, &c.tau, c.dt, left, last1, first, &mut found);
+                        srch.dfs_joint(
+                            c.centre, &c.tau, c.dt, c.df, left, last1, first, &mut found,
+                        );
                     } else {
                         srch.dfs(c.centre, &c.tau, c.dt, left, last1, first, &mut found);
                     }
                     for depth in 1..=2 {
-                        let tasks = srch.tasks(c.centre, &c.tau, c.dt, left, last1, first, depth);
+                        let tasks =
+                            srch.tasks(c.centre, &c.tau, c.dt, c.df, left, last1, first, depth);
                         let mut got = vec![];
                         for task in &tasks {
                             srch.run_task(task, &mut |p| {
