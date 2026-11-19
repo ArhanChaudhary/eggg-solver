@@ -110,6 +110,9 @@ struct Walk<'a, 'c> {
     /// This job's candidates by h2.
     job_h: [u32; NH],
     visits: u64,
+    /// Raised at the hard time budget: the search unwinds and the item is discarded.
+    abort: &'c std::sync::atomic::AtomicBool,
+    aborted: bool,
 }
 
 impl Walk<'_, '_> {
@@ -179,6 +182,10 @@ impl Walk<'_, '_> {
             return self.endpoint(frames);
         }
         self.visits += 1;
+        if self.aborted || self.visits.is_multiple_of(4096) && self.abort.load(Ordering::Relaxed) {
+            self.aborted = true;
+            return NONE;
+        }
         let k = (left as usize).min(KM - 1);
         let mt = t.mask.as_ref().unwrap();
         let (fp, fb) = self.features(s);
@@ -378,10 +385,25 @@ fn main() {
     let total = Mutex::new(Acc::new(lens.len()));
     let jobs = Mutex::new(vec![]);
     let t0 = std::time::Instant::now();
+    let abort = std::sync::atomic::AtomicBool::new(false);
+    let dropped = AtomicUsize::new(0);
+    let hard: f64 = env("HARD", 1e9);
+    let workers_done = AtomicUsize::new(0);
     std::thread::scope(|sc| {
+        let (wd, ab) = (&workers_done, &abort);
+        sc.spawn(move || {
+            while wd.load(Ordering::Relaxed) < threads {
+                if t0.elapsed().as_secs_f64() > hard {
+                    ab.store(true, Ordering::Relaxed);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        });
         for _ in 0..threads {
             sc.spawn(|| {
                 let mut acc = Acc::new(lens.len());
+                let mut item_acc = Acc::new(lens.len());
                 let mut myjobs = vec![];
                 loop {
                     if t0.elapsed().as_secs_f64() > budget {
@@ -422,13 +444,22 @@ fn main() {
                         cube,
                         path: prefix.to_vec(),
                         li,
-                        acc: &mut acc,
+                        acc: &mut item_acc,
                         job_h: [0; NH],
                         visits: 0,
+                        abort: &abort,
+                        aborted: false,
                     };
                     let left = len - 3;
                     w.dfs(&st, d, left, prefix[2] as usize, r);
-                    let (job_h, visits) = (w.job_h, w.visits);
+                    let (job_h, visits, aborted) = (w.job_h, w.visits, w.aborted);
+                    if aborted {
+                        item_acc = Acc::new(lens.len());
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    acc.add(&item_acc);
+                    item_acc = Acc::new(lens.len());
                     if i < check {
                         let mut n = 0usize;
                         let mut s = Search1::new(&p1, |_p: &[u8], f| {
@@ -445,14 +476,16 @@ fn main() {
                 }
                 total.lock().unwrap().add(&acc);
                 jobs.lock().unwrap().extend(myjobs);
+                workers_done.fetch_add(1, Ordering::Relaxed);
             });
         }
     });
     eprintln!(
-        "done in {:.1} s ({} of {} items started)",
+        "done in {:.1} s ({} of {} items started, {} aborted)",
         t0.elapsed().as_secs_f64(),
         next.load(Ordering::Relaxed).min(items.len()),
-        items.len()
+        items.len(),
+        dropped.load(Ordering::Relaxed)
     );
     let acc = total.into_inner().unwrap();
     let jobs = jobs.into_inner().unwrap();
