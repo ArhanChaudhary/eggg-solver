@@ -1178,6 +1178,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         let t = self.t;
         let mt = t.mask.as_ref().unwrap();
         let reduced = mt.kind == crate::p1mask::MaskKind::Reduced;
+        // The reduced table's viability bits are for the staging distance (all pairs).
+        let viable = reduced && self.pair == ALL_PAIRS;
         while !self.batch.is_empty() {
             let mut cur = std::mem::take(&mut self.batch);
             std::mem::swap(&mut self.batch, &mut self.batch_next);
@@ -1202,6 +1204,12 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 }
             }
             for nd in &cur {
+                // A node whose wing parity cannot reach an endpoint in moves left = distance
+                // moves (its entry's viability bit, see `MaskTable::add_viable`) is dropped.
+                if viable && !mt.viable(nd.idx, nd.parity) {
+                    self.reads += 1;
+                    continue;
+                }
                 let s = nd.state();
                 let mut a =
                     mt.get(t, nd.idx, nd.sym, &s, self.pair) & ALLOWED_AFTER[nd.last as usize];
@@ -1690,9 +1698,11 @@ mod tests {
         found
     }
 
-    /// The batched search with move masks, and the per-pair searches with the pattern table,
-    /// find exactly the plain search's (endpoint, frame) pairs (needs the large staging table,
-    /// and for the pairs the reduced pattern table, in ./tables; skipped without them).
+    /// The batched search with move masks (computed, and the reduced table with its
+    /// viability bits), and the per-pair searches with the pattern table, find exactly the
+    /// plain search's (endpoint, frame) pairs (needs the large staging table, and for the
+    /// pairs the reduced pattern table, in ./tables; skipped without them; the reduced mask
+    /// table is loaded, or made and saved).
     #[test]
     fn masked_and_pair_searches_find_the_same_endpoints() {
         let dir = std::path::Path::new("tables");
@@ -1700,6 +1710,7 @@ mod tests {
             return;
         }
         let mut t = crate::solver::load_p1(dir, true, 8, false);
+        let mut reduced = Some(crate::p1mask::load(dir, &t, false, false));
         let with_pat = dir.join("p1-pat.tab").exists();
         if with_pat {
             crate::solver::load_pat(&mut t, dir, false, 8, false);
@@ -1708,12 +1719,14 @@ mod tests {
         for _ in 0..3 {
             let root = P1State::from_cube(&Cube::random(&mut rng));
             let d0 = t.distance(&root);
-            for len in d0..d0 + 2 {
+            for len in d0..d0 + 3 {
                 t.mask = None;
                 let want = endpoint_set(&t, &root, len, false);
                 t.mask = Some(crate::p1mask::MaskTable::virtual_table());
                 assert_eq!(endpoint_set(&t, &root, len, false), want);
-                t.mask = None;
+                t.mask = reduced.take();
+                assert_eq!(endpoint_set(&t, &root, len, false), want);
+                reduced = t.mask.take();
                 if with_pat {
                     assert_eq!(endpoint_set(&t, &root, len, true), want);
                 }
