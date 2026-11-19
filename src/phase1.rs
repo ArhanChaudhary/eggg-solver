@@ -1569,8 +1569,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         // The staging test first, for all the moves (its outcome is close to a coin flip:
         // without branches on it, no mispredictions), then the wing tests in move order.
         if check_staged {
-            let mut a = test;
-            let mut ok = 0u32;
+            // From staged centres (d = 0) every move but a wide quarter turn keeps them staged.
+            let mut a = if d == 0 { test & WIDE_QUARTER } else { test };
+            let mut ok = test & !a;
             while a != 0 {
                 let m = a.trailing_zeros() as usize;
                 a &= a - 1;
