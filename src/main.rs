@@ -87,29 +87,29 @@ enum Tier {
     Small,
     /// ~2.3 GB: h48 h5 and the joint phase-2 table.
     Medium,
-    /// ~5.0 GB: h48 h6, the joint phase-2 table and the large phase-1 table.
+    /// ~4.7 GB: h48 h6, the joint phase-2 table and the phase-1 move masks.
     Large,
-    /// ~6.9 GB: h48 h7, the joint phase-2 table and the large phase-1 table.
+    /// ~6.6 GB: h48 h7, the joint phase-2 table and the phase-1 move masks.
     Huge,
-    /// ~18.3 GB: h48 h9, the joint phase-2 table and the large phase-1 table (phase 3 3.6x
+    /// ~18.0 GB: h48 h9, the joint phase-2 table and the phase-1 move masks (phase 3 3.6x
     /// faster than huge; single-threaded first solutions ~4x sooner).
     Xl,
-    /// ~64 GB: h48 h11 (the largest), the joint phase-2 table and the large phase-1 table
+    /// ~63.6 GB: h48 h11 (the largest), the joint phase-2 table and the phase-1 move masks
     /// (phase 3 11x faster than huge; single-threaded first solutions ~12x sooner).
     Xxl,
 }
 
 impl Tier {
-    /// (h48 K, joint phase-2 table, large phase-1 table, measured peak memory in bytes).
+    /// (h48 K, joint phase-2 table, phase-1 move masks, measured peak memory in bytes).
     fn tables(self) -> (u32, bool, bool, f64) {
         match self {
             Tier::Tiny => (0, false, false, 0.16e9),
             Tier::Small => (3, false, false, 0.35e9),
             Tier::Medium => (5, true, false, 2.3e9),
-            Tier::Large => (6, true, true, 5.0e9),
-            Tier::Huge | Tier::Auto => (7, true, true, 6.9e9),
-            Tier::Xl => (9, true, true, 18.3e9),
-            Tier::Xxl => (11, true, true, 63.9e9),
+            Tier::Large => (6, true, true, 4.7e9),
+            Tier::Huge | Tier::Auto => (7, true, true, 6.6e9),
+            Tier::Xl => (9, true, true, 18.0e9),
+            Tier::Xxl => (11, true, true, 63.6e9),
         }
     }
 
@@ -167,11 +167,11 @@ struct TableArgs {
     /// (0.9 GB) or the large one (41 GB).
     #[arg(long, value_enum)]
     p1_pat: Option<PatArg>,
-    /// Phase-1 move-mask table (the distance-decreasing moves of each staging state; nodes
-    /// at distance = moves left read one mask instead of ~20 child entries): none, the
-    /// symmetry-reduced one (0.8 GB; the default in the tiers with the large phase-1 table)
-    /// or the large one (18.9 GB). Implies --p1-big. With --p1-pat: the pair table instead
-    /// (pattern-distance-decreasing moves, 17.5 GB).
+    /// Phase-1 move-mask table (per staging state, the moves that decrease and that keep its
+    /// distance: a node reads one entry instead of ~20 child entries): none, the
+    /// symmetry-reduced one (1.6 GB; the default in the large and larger tiers) or the large
+    /// one (18.9 GB, the decreasing moves only; implies --p1-big). With --p1-pat: the pair
+    /// table instead (pattern-distance-decreasing moves, 17.5 GB).
     #[arg(long, value_enum)]
     p1_mask: Option<PatArg>,
 }
@@ -184,22 +184,25 @@ enum PatArg {
 }
 
 impl TableArgs {
-    /// (h48 K, joint phase-2 table, large phase-1 table) from the tier and the overrides.
-    fn config(&self) -> (u32, bool, bool) {
-        let (k, joint, big, _) = self.tier.resolve(&self.dir()).tables();
+    /// (h48 K, joint phase-2 table, phase-1 move masks, large phase-1 staging table) from the
+    /// tier and the overrides.
+    fn config(&self) -> (u32, bool, bool, bool) {
+        let (k, joint, masks, _) = self.tier.resolve(&self.dir()).tables();
         (
             self.h48.unwrap_or(k),
             joint || self.p2_joint,
-            big || self.p1_big,
+            masks,
+            self.p1_big,
         )
     }
 
     fn load(&self, threads: usize, verbose: bool) -> Tables {
-        let (k, joint, big) = self.config();
+        let (k, joint, masks, big) = self.config();
         if verbose {
             eprintln!(
-                "tables: h48 h{k}{}{} ({:?} tier)",
+                "tables: h48 h{k}{}{}{} ({:?} tier)",
                 if joint { ", joint phase 2" } else { "" },
+                if masks { ", phase-1 move masks" } else { "" },
                 if big { ", large phase 1" } else { "" },
                 self.tier.resolve(&self.dir())
             );
@@ -223,10 +226,10 @@ impl TableArgs {
             Some(PatArg::None) => None,
             Some(PatArg::Small) => Some(false),
             Some(PatArg::Big) => Some(true),
-            // The tiers with the large phase-1 table also use the reduced move-mask table
-            // (0.8 GB; phase 1 ~5x faster with the same endpoints), unless a pattern table
-            // is asked for (that combination selects the 17.5 GB pair-mask table).
-            None if pat.is_none() && self.config().2 => Some(false),
+            // The tiers with masks use the reduced move-mask table (1.6 GB; phase 1 ~10x
+            // faster with the same endpoints), unless a pattern table is asked for (that
+            // combination selects the 17.5 GB pair-mask table).
+            None if pat.is_none() && masks => Some(false),
             None => None,
         };
         if verbose && let Some(b) = mask {
@@ -235,15 +238,17 @@ impl TableArgs {
                 if b {
                     "large (18.9 GB)"
                 } else {
-                    "reduced (0.8 GB)"
+                    "reduced (1.6 GB)"
                 }
             );
         }
+        // (The reduced masks need only the symmetry-reduced staging table, 25 MB; the large
+        // ones the large one.)
         load_tables_with(
             &self.dir(),
             k,
             joint,
-            big || mask.is_some(),
+            big || (pat.is_none() && mask == Some(true)),
             (pat, mask),
             threads,
             verbose,

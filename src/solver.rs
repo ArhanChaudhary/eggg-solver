@@ -1021,8 +1021,8 @@ pub fn load_pat(
     p1.pat = Some(crate::p1pat::load(dir, &p1.staging, big, threads, verbose));
 }
 
-/// Load (or build from the large staging table) the phase-1 move-mask table into `p1`: the
-/// large one (`big`, 18.9 GB) or the reduced one (0.8 GB).
+/// Load (or build from the staging table) the phase-1 move-mask table into `p1`: the large
+/// one (`big`, 18.9 GB; needs the large staging table) or the reduced one (1.6 GB).
 pub fn load_mask(p1: &mut P1Tables, dir: &std::path::Path, big: bool, verbose: bool) {
     p1.mask = Some(crate::p1mask::load(dir, p1, big, verbose));
 }
@@ -1071,7 +1071,7 @@ fn load_p2(dir: &std::path::Path, joint: bool, threads: usize, verbose: bool) ->
 
 /// Load or build all tables in `dir`; `joint`: also the joint phase-2 table (1.05 GB);
 /// `p1_big`: the large phase-1 staging table (1.2 GB); `p1_extra`: the phase-1 pattern table
-/// and move-mask table (each `Some(big)`: reduced or large; the masks need `p1_big`).
+/// and move-mask table (each `Some(big)`: reduced or large; the large masks need `p1_big`).
 pub fn load_tables_with(
     dir: &std::path::Path,
     h48_k: u32,
@@ -1104,7 +1104,10 @@ pub fn load_tables_with(
         load_pat(&mut p1, dir, big, threads, verbose);
     }
     if let Some(big) = p1_extra.1 {
-        assert!(p1_big, "the move-mask table needs the large staging table");
+        assert!(
+            p1_big || !big || p1.pat.is_some(),
+            "the large move-mask table needs the large staging table"
+        );
         load_mask(&mut p1, dir, big, verbose);
     }
     drop(g);

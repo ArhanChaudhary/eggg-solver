@@ -1,6 +1,7 @@
 //! Deterministic phase-1 check: endpoint-set hash and node counts on fixed cubes.
-//! EGGG_P1_BIG: the large staging table; EGGG_P1_MASK=small|big: the move-mask table (with
-//! the large staging table). CUBES, EXTRA: the workload (default 5 cubes, lengths d0..=d0+3).
+//! EGGG_P1_BIG: the large staging table; EGGG_P1_MASK=small|big: the move-mask table (the
+//! large one with the large staging table). CUBES, EXTRA: the workload (default 5 cubes,
+//! lengths d0..=d0+3).
 //! The hash covers the endpoints in the order the search reports them.
 use eggg_solver::cube::Cube;
 use eggg_solver::moves::N_MOVES;
@@ -12,7 +13,7 @@ use std::time::Instant;
 
 fn main() {
     let mask = std::env::var("EGGG_P1_MASK").ok();
-    let big = std::env::var_os("EGGG_P1_BIG").is_some() || mask.is_some();
+    let big = std::env::var_os("EGGG_P1_BIG").is_some() || mask.as_deref() == Some("big");
     let env = |k: &str, d: u8| std::env::var(k).ok().map_or(d, |v| v.parse().unwrap());
     let (cubes, extra) = (env("CUBES", 5), env("EXTRA", 3));
     let dir = std::path::Path::new("tables");

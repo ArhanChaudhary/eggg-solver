@@ -1014,6 +1014,9 @@ struct BNode {
     sym: u8,
     left: u8,
     last: u8,
+    /// The exact distance: `left`, or less for a node with slack (reduced table, see
+    /// `MaskTable::slack_batch`).
+    d: u8,
 }
 
 impl BNode {
@@ -1097,10 +1100,11 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         }
     }
 
-    /// Queue a node at staging distance `left` = moves left (>= 2) for a batch: the state `s`
-    /// after the search's path and `m` (if any), its mask table's first index `idx`.
+    /// Queue a node with `left` moves left (>= 2) at distance `d` (= `left`, or less with the
+    /// reduced table) for a batch: the state `s` after the search's path and `m` (if any),
+    /// its mask table's first index `idx`.
     #[inline(always)]
-    fn push_batch(&mut self, s: P1State, idx: u64, left: u8, last: usize, m: Option<u8>) {
+    fn push_batch(&mut self, s: P1State, idx: u64, left: u8, last: usize, m: Option<u8>, d: u8) {
         let off = self.batch_roots.len();
         self.batch_roots.push(0);
         self.batch_roots.extend_from_slice(&self.path);
@@ -1123,12 +1127,14 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             sym: 0,
             left,
             last: last as u8,
+            d,
         });
     }
 
-    /// Queue the child `c` (after move `m`, first index `idx`) of batch node `nd`.
+    /// Queue the child `c` (after move `m`, first index `idx`, distance `d`) of batch node
+    /// `nd`.
     #[inline(always)]
-    fn push_child(&mut self, nd: &BNode, c: &P1State, idx: u64, m: usize) {
+    fn push_child(&mut self, nd: &BNode, c: &P1State, idx: u64, m: usize, d: u8) {
         let id = self.batch_tree.len() as u32;
         self.batch_tree.push((nd.id, m as u8));
         self.t.mask.as_ref().unwrap().prefetch(self.t, idx);
@@ -1142,6 +1148,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             sym: 0,
             left: nd.left - 1,
             last: m as u8,
+            d,
         });
     }
 
@@ -1178,6 +1185,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         let t = self.t;
         let mt = t.mask.as_ref().unwrap();
         let reduced = mt.kind == crate::p1mask::MaskKind::Reduced;
+        // The reduced table's viability bits are for the staging distance (all pairs).
+        let viable = reduced && self.pair == ALL_PAIRS;
         while !self.batch.is_empty() {
             let mut cur = std::mem::take(&mut self.batch);
             std::mem::swap(&mut self.batch, &mut self.batch_next);
@@ -1203,6 +1212,45 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             }
             for nd in &cur {
                 let s = nd.state();
+                if nd.d < nd.left {
+                    // A node with slack (reduced table): its children's distances from its
+                    // own entry, as in `dfs_eq`; they are all queued, or with one move left
+                    // tested.
+                    let (d, left) = (nd.d, nd.left);
+                    let allowed = ALLOWED_AFTER[nd.last as usize];
+                    let (dec, eq) = mt.get_dec_eq(nd.idx, nd.sym);
+                    let (dec, eq) = (dec & allowed, eq & allowed);
+                    self.nodes += allowed.count_ones() as u64;
+                    self.reads += 1;
+                    let mut a = if d + 1 < left { allowed } else { dec | eq };
+                    let flags = s.centre_flags();
+                    while a != 0 {
+                        let m = a.trailing_zeros() as usize;
+                        a &= a - 1;
+                        let dc = d + 1 - 2 * (dec >> m & 1) as u8 - (eq >> m & 1) as u8;
+                        let c = s.apply(m, t);
+                        if left == 2 {
+                            let run = run_after(nd.run, nd.last as usize, m);
+                            self.leaf(&c, dc, m, None, run, Some((nd.id, Some(m as u8))));
+                            if self.stop {
+                                self.batch.clear();
+                                return;
+                            }
+                        } else {
+                            let g = unsafe { child_flags(&flags, m, t) };
+                            let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
+                            let i = t.staging.rank24(!nud & MASK24) as u64;
+                            self.push_child(nd, &c, i, m, dc);
+                        }
+                    }
+                    continue;
+                }
+                // A node whose wing parity cannot reach an endpoint in moves left = distance
+                // moves (its entry's viability bit, see `MaskTable::add_viable`) is dropped.
+                if viable && !mt.viable(nd.idx, nd.parity) {
+                    self.reads += 1;
+                    continue;
+                }
                 let mut a =
                     mt.get(t, nd.idx, nd.sym, &s, self.pair) & ALLOWED_AFTER[nd.last as usize];
                 self.nodes += a.count_ones() as u64;
@@ -1259,7 +1307,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         let g = unsafe { child_flags(&flags, m, t) };
                         let i = t.staging.rank24(crate::simd::movemask(&g)) as u64;
                         let c = s.apply(m, t);
-                        self.push_child(nd, &c, i, m);
+                        self.push_child(nd, &c, i, m, nd.left - 1);
                     }
                 } else {
                     let flags = s.centre_flags();
@@ -1275,7 +1323,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                             t.staging.big_index_flags(&g)
                         };
                         let c = s.apply(m, t);
-                        self.push_child(nd, &c, i, m);
+                        self.push_child(nd, &c, i, m, nd.left - 1);
                     }
                 }
             }
@@ -1313,6 +1361,17 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             if self.t.mask.is_some() && !self.stop {
                 self.run_batch();
             }
+        } else if let Some(mt) = self
+            .t
+            .mask
+            .as_ref()
+            .filter(|m| m.kind == crate::p1mask::MaskKind::Reduced)
+        {
+            let r = mt.resolve(self.t, mt.pre_index(self.t, s, ALL_PAIRS), s, ALL_PAIRS);
+            self.dfs_eq(s, d, left, last, r);
+            if !self.stop {
+                self.run_batch();
+            }
         } else if self.t.big
             && self
                 .t
@@ -1328,6 +1387,131 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             self.dfs_t::<K_BIG>(s, d, left, last)
         } else {
             self.dfs_t::<K_SMALL>(s, d, left, last)
+        }
+    }
+
+    /// [`Search1::dfs`] over all pairs with the reduced move-mask table. A node with slack
+    /// (distance `d` < moves left `left`) has its children's exact distances from its own
+    /// entry (`r`: its reduced index and symmetry, the entry prefetched): the moves that
+    /// decrease and that keep the distance, and the others increase it. So it reads one entry
+    /// where [`Search1::dfs_t`] reads one per child. The children are searched as there, in
+    /// move order: those at distance = moves left (>= 2) are queued for a batch, the others
+    /// searched depth-first, their entries resolved and prefetched first.
+    fn dfs_eq(&mut self, s: &P1State, d: u8, left: u8, last: usize, r: (u64, u8)) {
+        if left == 0 {
+            if d == 0 {
+                let frames = self.t.endpoint_frames(s, trailing_run(&self.path));
+                if frames != 0 && !(self.on_endpoint)(&self.path, frames) {
+                    self.stop = true;
+                }
+            }
+            return;
+        }
+        if left == 1 {
+            self.leaf(s, d, last, None, trailing_run(&self.path), None);
+            return;
+        }
+        let t = self.t;
+        let st = &t.staging;
+        let mt = t.mask.as_ref().unwrap();
+        if d >= left {
+            if d == left {
+                self.push_batch(*s, st.rank24(s.masks().0) as u64, left, last, None, d);
+            }
+            return;
+        }
+        let allowed = ALLOWED_AFTER[last];
+        let (dec, eq) = mt.get_dec_eq(r.0, r.1);
+        let (dec, eq) = (dec & allowed, eq & allowed);
+        self.nodes += allowed.count_ones() as u64;
+        self.reads += 1;
+        if self
+            .abort
+            .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            self.stop = true;
+            return;
+        }
+        // The children that can still reach the goal: at distance d - 1 or d, and at d + 1
+        // if that is less than the moves left after the move.
+        let visit = if d + 1 < left { allowed } else { dec | eq };
+        // Those at distance = moves left after the move (batched if >= the batch minimum).
+        let tight = if d + 1 == left {
+            eq
+        } else if d + 2 == left {
+            visit & !(dec | eq)
+        } else {
+            0
+        };
+        let mut batched = if left > self.batch_min_left() {
+            tight
+        } else {
+            0
+        };
+        // With few moves left, the children with slack are batched too: their entries are
+        // then read a round after their prefetch (and the batches see their subtrees' nodes
+        // at distance = moves left sooner).
+        if left >= 3 && left - 1 <= mt.slack_batch {
+            batched = visit;
+        }
+        // The children searched depth-first with at least 2 moves left: their entries'
+        // indices (class info, prefetched, then the entry, prefetched), by move.
+        let mut rs = [(0u64, 0u8); N_MOVES];
+        if left >= 3 {
+            let flags = s.centre_flags();
+            let mut infos: [*const u32; N_MOVES] = [std::ptr::null(); N_MOVES];
+            let mut gs = [V32::ZERO; N_MOVES];
+            let mut a = visit & !batched;
+            while a != 0 {
+                let m = a.trailing_zeros() as usize;
+                a &= a - 1;
+                // SAFETY: m < N_MOVES.
+                let g = unsafe { child_flags(&flags, m, t) };
+                let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
+                let p = st.info(!nud & MASK24);
+                crate::table::prefetch(p);
+                unsafe {
+                    *infos.get_unchecked_mut(m) = p;
+                    *gs.get_unchecked_mut(m) = g;
+                }
+            }
+            let mut a = visit & !batched;
+            while a != 0 {
+                let m = a.trailing_zeros() as usize;
+                a &= a - 1;
+                unsafe {
+                    let info = **infos.get_unchecked(m);
+                    let j = st.fast_index_flags(info, gs.get_unchecked(m));
+                    mt.prefetch_entry(j);
+                    *rs.get_unchecked_mut(m) = (j, info as u8);
+                }
+            }
+        }
+        let mut a = visit;
+        while a != 0 {
+            let m = a.trailing_zeros() as usize;
+            a &= a - 1;
+            // d - 1, d or d + 1 (the masks are disjoint).
+            let dc = d + 1 - 2 * (dec >> m & 1) as u8 - (eq >> m & 1) as u8;
+            let c = s.apply(m, t);
+            if batched >> m & 1 == 1 {
+                let i = st.rank24(c.masks().0) as u64;
+                self.push_batch(c, i, left - 1, m, Some(m as u8), dc);
+                if self.batch.len() >= mt.batch {
+                    self.run_batch();
+                }
+            } else {
+                self.path.push(m as u8);
+                if left == 2 {
+                    self.leaf(&c, dc, m, None, trailing_run(&self.path), None);
+                } else {
+                    self.dfs_eq(&c, dc, left - 1, m, rs[m]);
+                }
+                self.path.pop();
+            }
+            if self.stop {
+                return;
+            }
         }
     }
 
@@ -1458,7 +1642,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 .as_ref()
                 .unwrap()
                 .pre_index(self.t, s, self.pair);
-            self.push_batch(*s, i, left, last, None);
+            self.push_batch(*s, i, left, last, None, left);
             return;
         }
         let mut allowed = ALLOWED_AFTER[last];
@@ -1577,7 +1761,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     } else {
                         t.mask.as_ref().unwrap().pre_index(t, &c, self.pair)
                     };
-                    self.push_batch(c, i, dc, m, Some(m as u8));
+                    self.push_batch(c, i, dc, m, Some(m as u8), dc);
                     if self.batch.len() >= t.mask.as_ref().unwrap().batch {
                         self.run_batch();
                     }
@@ -1690,9 +1874,12 @@ mod tests {
         found
     }
 
-    /// The batched search with move masks, and the per-pair searches with the pattern table,
-    /// find exactly the plain search's (endpoint, frame) pairs (needs the large staging table,
-    /// and for the pairs the reduced pattern table, in ./tables; skipped without them).
+    /// The batched search with move masks (computed, and the reduced table with its
+    /// viability bits and equal masks, slack nodes batched or not), and the per-pair searches
+    /// with the pattern table, find exactly the
+    /// plain search's (endpoint, frame) pairs (needs the large staging table, and for the
+    /// pairs the reduced pattern table, in ./tables; skipped without them; the reduced mask
+    /// table is loaded, or made and saved).
     #[test]
     fn masked_and_pair_searches_find_the_same_endpoints() {
         let dir = std::path::Path::new("tables");
@@ -1700,6 +1887,7 @@ mod tests {
             return;
         }
         let mut t = crate::solver::load_p1(dir, true, 8, false);
+        let mut reduced = Some(crate::p1mask::load(dir, &t, false, false));
         let with_pat = dir.join("p1-pat.tab").exists();
         if with_pat {
             crate::solver::load_pat(&mut t, dir, false, 8, false);
@@ -1708,12 +1896,18 @@ mod tests {
         for _ in 0..3 {
             let root = P1State::from_cube(&Cube::random(&mut rng));
             let d0 = t.distance(&root);
-            for len in d0..d0 + 2 {
+            for len in d0..d0 + 3 {
                 t.mask = None;
                 let want = endpoint_set(&t, &root, len, false);
                 t.mask = Some(crate::p1mask::MaskTable::virtual_table());
                 assert_eq!(endpoint_set(&t, &root, len, false), want);
-                t.mask = None;
+                // Slack nodes batched with at most k moves left (none, the default, more).
+                for k in [0, crate::p1mask::SLACK_BATCH, 10] {
+                    t.mask = reduced.take();
+                    t.mask.as_mut().unwrap().slack_batch = k;
+                    assert_eq!(endpoint_set(&t, &root, len, false), want);
+                    reduced = t.mask.take();
+                }
                 if with_pat {
                     assert_eq!(endpoint_set(&t, &root, len, true), want);
                 }
