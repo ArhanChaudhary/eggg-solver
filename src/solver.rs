@@ -184,6 +184,15 @@ fn transpose(m: &Mat) -> Mat {
     t
 }
 
+fn p2_mult() -> Option<f64> {
+    static M: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("EGGG_P2_MULT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
+
 fn debug(start: Instant, msg: &str) {
     if std::env::var_os("EGGG_DEBUG").is_some() {
         eprintln!("[{:8.3}] {msg}", start.elapsed().as_secs_f64());
@@ -577,6 +586,13 @@ impl<'a, 'r> Run<'a, 'r> {
                 ((self.made_cands as f64 * ratio) as usize).clamp(1, want2)
             } else {
                 want2
+            };
+            // Experiment (prof/rebal): once a solution exists, phase 2 asks for EGGG_P2_MULT
+            // times the reductions (EGGG_P2_MULT=0: no target at all, levels run to the cut).
+            let want2_now = match (self.best.is_some(), p2_mult()) {
+                (true, Some(m)) if m == 0.0 => usize::MAX,
+                (true, Some(m)) => (want2_now as f64 * m) as usize,
+                _ => want2_now,
             };
             let tp = Instant::now();
             self.phase2(want2_now);
