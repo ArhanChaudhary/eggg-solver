@@ -59,8 +59,9 @@ expanded in batches with the masks prefetched a round ahead (10x fewer reads in 
 5x faster on the M2; in 60 s runs on the M2, 8 threads, 20 positions: 39.70 -> 39.30 moves,
 and the masked solver reaches at 10 s what it reached at 60 s without them). A per-node pass
 over the masked search (parent-pointer paths, cheaper leaf tests, byte-lookup pext on ARM)
-made it another 3x faster with the same endpoints: 20 positions x 60 s 39.15 moves, and
-38.95 after 300 s, on the M2 (8 threads). `--p1-mask big` is the same without the symmetry reduction (18.9 GB).
+made it another 3x faster with the same endpoints. On the M2 (8 threads), 20 random
+positions: 39.60 moves on average after 10 s, 39.15 after 60 s, 38.80 after 2 minutes,
+38.60 after 10 minutes. `--p1-mask big` is the same without the symmetry reduction (18.9 GB).
 Experimental (see `src/p1pat.rs`): `--p1-pat small|big` (0.9 / 41 GB) runs one phase-1 search
 per colour pair, pruned by the distance to staged centres with that pair in a pattern phase
 2 can solve (0.53x reads, 1.4x faster on the M2); with `--p1-mask` too, the pair searches use
