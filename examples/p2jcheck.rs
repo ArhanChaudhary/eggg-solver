@@ -30,7 +30,7 @@ fn main() {
         }
         let cc = p2.centre_coord_of(&c);
         let tau = p2.tau_of(&c);
-        let dj = j.distance(p2, cc / 1680, &tau, cc & 1);
+        let dj = j.distance(cc / 1680, &tau, cc & 1);
         let dt = p2.tau_distance(&tau);
         if dj as usize > k || dj < dt {
             bad += 1;
@@ -65,7 +65,7 @@ fn main() {
             let cc = p2.centre_coord_of(&x);
             let tau = p2.tau_of(&x);
             let dt = p2.tau_distance(&tau);
-            let dj = j.distance(p2, cc / 1680, &tau, cc & 1);
+            let dj = j.distance(cc / 1680, &tau, cc & 1);
             let hc = p2.centre_dist[cc as usize];
             let mut l2 = 0;
             let mut s_old = Search2::new(p2);

@@ -238,33 +238,71 @@ fn p1_run<F: FnMut(&[u8], u8) -> bool>(
     }
 }
 
-/// A phase-2 candidate from a phase-1 endpoint (None if its centres cannot be solved).
-fn make_candidate(t: &Tables, cube: &Cube, moves1: &[u8], frame: usize) -> Option<Candidate> {
-    let mut c = *cube;
-    for &m in moves1 {
-        c = c.apply_perm(&MOVE_PERMS[m as usize]);
+/// Phase-2 candidates from phase-1 endpoints `(moves, frame bits)`, appended to `out` in order
+/// (by endpoint, then frame), except the frames whose centres cannot be solved and those whose
+/// phase-2 bound h2 puts L1 + h2 past `limit`. The bound is exact for the candidates kept; for
+/// the others, walking down the joint table stops once it is out of reach. The joint-table
+/// walks are interleaved (each is a chain of dependent table reads).
+fn make_candidates(
+    p2: &P2Tables,
+    cube: &Cube,
+    eps: &[(Vec<u8>, u8)],
+    limit: usize,
+    out: &mut Vec<Candidate>,
+) {
+    // (endpoint, frame, standardised cube, centre coordinate, centre distance) of the frames
+    // within the centre bound, and their joint-table walks (U/D pattern, tau, PLL bit, bound).
+    let mut part = Vec::with_capacity(eps.len());
+    let mut walks = Vec::with_capacity(eps.len());
+    // The cube after each prefix of the last endpoint (consecutive endpoints of a search share
+    // most of their moves).
+    let mut path = vec![*cube];
+    let mut prev: &[u8] = &[];
+    for (e, (moves1, frames)) in eps.iter().enumerate() {
+        let common = prev.iter().zip(moves1).take_while(|(a, b)| a == b).count();
+        path.truncate(common + 1);
+        for &m in &moves1[common..] {
+            let c = path[path.len() - 1].apply_perm(&MOVE_PERMS[m as usize]);
+            path.push(c);
+        }
+        prev = moves1;
+        let c = path[moves1.len()];
+        for frame in 0..3 {
+            if frames >> frame & 1 == 0 {
+                continue;
+            }
+            let x = standardise(&c, frame);
+            let centre = p2.centre_coord_of(&x);
+            let cd = p2.centre_dist[centre as usize];
+            if cd == crate::table::UNSEEN || moves1.len() + cd as usize > limit {
+                continue;
+            }
+            let room = (limit - moves1.len()).min(u8::MAX as usize) as u8;
+            part.push((e, frame, x, centre, cd));
+            walks.push((centre / 1680, p2.tau_of(&x), centre & 1, room));
+        }
     }
-    let x = standardise(&c, frame);
-    let centre = t.p2.centre_coord_of(&x);
-    let cd = t.p2.centre_dist[centre as usize];
-    if cd == crate::table::UNSEEN {
-        return None;
+    let mut dts = Vec::with_capacity(walks.len());
+    match &p2.joint {
+        Some(j) => j.distances_at_most(&walks, &mut dts),
+        None => dts.extend(walks.iter().map(|w| Some(p2.tau_distance(&w.1)))),
     }
-    let tau = t.p2.tau_of(&x);
-    let dt = match &t.p2.joint {
-        Some(j) => j.distance(&t.p2, centre / 1680, &tau, centre & 1),
-        None => t.p2.tau_distance(&tau),
-    };
-    Some(Candidate {
-        moves1: moves1.to_vec(),
-        frame,
-        cube: x,
-        centre,
-        tau,
-        dt,
-        h2: cd.max(dt),
-        done2: 0,
-    })
+    for ((&(e, frame, x, centre, cd), w), dt) in part.iter().zip(&walks).zip(dts) {
+        let moves1 = &eps[e].0;
+        let Some(dt) = dt.filter(|&dt| moves1.len() + dt as usize <= limit) else {
+            continue;
+        };
+        out.push(Candidate {
+            moves1: moves1.clone(),
+            frame,
+            cube: x,
+            centre,
+            tau: w.1,
+            dt,
+            h2: cd.max(dt),
+            done2: 0,
+        });
+    }
 }
 
 pub struct Solver<'a> {
@@ -294,6 +332,8 @@ struct Run<'a, 'r> {
     level: Level1,
     /// Candidates made so far (including those dropped as hopeless).
     made_cands: usize,
+    /// Wall time spent making candidates (see [`make_candidates`]).
+    cand_time: Duration,
     /// Reductions stored so far (including those dropped since).
     made_reds: usize,
     cands: Vec<Candidate>,
@@ -359,6 +399,7 @@ impl<'a> Solver<'a> {
                 next: 0,
             },
             made_cands: 0,
+            cand_time: Duration::ZERO,
             made_reds: 0,
             cands: vec![],
             reds: vec![],
@@ -427,8 +468,12 @@ impl<'a, 'r> Run<'a, 'r> {
             debug(
                 self.start,
                 &format!(
-                    "phase 1: {} endpoints (length {}), nodes {}",
-                    self.made_cands, self.level.len, self.stats.nodes1
+                    "phase 1: {} endpoints (length {}), nodes {}, {:.3} s, candidates made in {:.3} s",
+                    self.made_cands,
+                    self.level.len,
+                    self.stats.nodes1,
+                    self.stats.time[0].as_secs_f64(),
+                    self.cand_time.as_secs_f64()
                 ),
             );
             let tp = Instant::now();
@@ -601,37 +646,25 @@ impl<'a, 'r> Run<'a, 'r> {
                 self.level.jobs = rest;
                 self.level.next = 0;
             }
-            // New (endpoint, frame) pairs, in job order; their candidates are made in
-            // parallel (standardising and the phase-2 bounds cost ~30 us each).
-            let mut todo: Vec<(Vec<u8>, usize)> = vec![];
-            for (_, eps, _) in results {
-                for (moves, frames) in eps {
-                    for f in 0..3 {
-                        // (Levels, jobs and handed-back subtrees are disjoint: no endpoint
-                        // comes twice.)
-                        if frames >> f & 1 == 1 {
-                            todo.push((moves.clone(), f));
-                        }
-                    }
-                }
-            }
-            let made: Vec<Mutex<Option<Candidate>>> =
-                (0..todo.len()).map(|_| Mutex::new(None)).collect();
-            let (t, cube) = (self.t, &self.cube);
-            crate::par::for_chunks(todo.len(), 64, |r| {
-                for i in r {
-                    *made[i].lock().unwrap() = make_candidate(t, cube, &todo[i].0, todo[i].1);
-                }
-            });
-            self.made_cands += todo.len();
-            // Once a solution exists, a candidate whose phase-2 bound already puts its
-            // reductions past the deepest level phase 2 will ever search is never needed.
+            // New endpoints, in job order; their candidates are made in parallel. Once a
+            // solution exists, a candidate whose phase-2 bound already puts its reductions past
+            // the deepest level phase 2 will ever search is never needed (and not made).
+            // (Levels, jobs and handed-back subtrees are disjoint: no endpoint comes twice.)
+            let tc = Instant::now();
+            let eps: Vec<(Vec<u8>, u8)> = results.into_iter().flat_map(|r| r.1).collect();
             let limit = self.useful_l12();
-            self.cands.extend(
-                made.into_iter()
-                    .filter_map(|m| m.into_inner().unwrap())
-                    .filter(|c| c.moves1.len() + c.h2 as usize <= limit),
-            );
+            let made = Mutex::new(vec![]);
+            let (p2, cube) = (&self.t.p2, &self.cube);
+            crate::par::for_chunks(eps.len(), 32, |r| {
+                let mut out = vec![];
+                make_candidates(p2, cube, &eps[r.clone()], limit, &mut out);
+                made.lock().unwrap().push((r.start, out));
+            });
+            let mut made = made.into_inner().unwrap();
+            made.sort_unstable_by_key(|m| m.0);
+            self.made_cands += eps.iter().map(|e| e.1.count_ones() as usize).sum::<usize>();
+            self.cands.extend(made.into_iter().flat_map(|m| m.1));
+            self.cand_time += tc.elapsed();
         }
         self.stats.endpoints = self.made_cands;
     }
@@ -1078,8 +1111,264 @@ pub fn load_tables_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::p2joint::ORDER;
     use rand::SeedableRng;
     use std::collections::HashSet;
+
+    /// The candidate of one endpoint frame (see [`make_candidates`]).
+    fn candidate(
+        t: &Tables,
+        cube: &Cube,
+        moves1: &[u8],
+        frame: usize,
+        limit: usize,
+    ) -> Option<Candidate> {
+        let mut out = vec![];
+        make_candidates(
+            &t.p2,
+            cube,
+            &[(moves1.to_vec(), 1 << frame)],
+            limit,
+            &mut out,
+        );
+        out.pop()
+    }
+
+    /// The former candidate construction: a rotation search per standardisation, the full
+    /// joint-table walk, and the limit applied afterwards.
+    fn candidate_ref(
+        t: &Tables,
+        cube: &Cube,
+        moves1: &[u8],
+        frame: usize,
+        limit: usize,
+    ) -> Option<Candidate> {
+        let mut c = *cube;
+        for &m in moves1 {
+            c = c.apply_perm(&MOVE_PERMS[m as usize]);
+        }
+        let x = crate::phase2::tests::standardise_ref(&c, frame);
+        let centre = t.p2.centre_coord_of(&x);
+        let cd = t.p2.centre_dist[centre as usize];
+        if cd == crate::table::UNSEEN {
+            return None;
+        }
+        let tau = t.p2.tau_of(&x);
+        let dt = match &t.p2.joint {
+            Some(j) => j.distance_ref(&t.p2, centre / 1680, &tau, centre & 1),
+            None => t.p2.tau_distance(&tau),
+        };
+        let c = Candidate {
+            moves1: moves1.to_vec(),
+            frame,
+            cube: x,
+            centre,
+            tau,
+            dt,
+            h2: cd.max(dt),
+            done2: 0,
+        };
+        (c.moves1.len() + c.h2 as usize <= limit).then_some(c)
+    }
+
+    /// Tables with the joint phase-2 table, from $EGGG_TABLES (default ./tables) with the H48
+    /// table h$EGGG_TEST_H48 (default h3).
+    fn joint_tables() -> Tables {
+        let dir = std::env::var_os("EGGG_TABLES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "tables".into());
+        let k = std::env::var("EGGG_TEST_H48")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        load_tables_with(&dir, k, true, false, (None, None), 8, false)
+    }
+
+    type Endpoints = Vec<(Vec<u8>, u8)>;
+
+    /// Phase-1 endpoints (with frames) of random cubes: per cube, its endpoints of the
+    /// shortest few lengths, up to `per_cube`.
+    fn random_endpoints(
+        t: &Tables,
+        cubes: usize,
+        per_cube: usize,
+        seed: u64,
+    ) -> Vec<(Cube, Endpoints)> {
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(seed);
+        (0..cubes)
+            .map(|_| {
+                let cube = Cube::random(&mut rng);
+                let root = P1State::from_cube(&cube);
+                let d0 = t.p1.distance(&root);
+                let mut eps = vec![];
+                for len in d0..d0 + 4 {
+                    let mut s = Search1::new(&t.p1, |p: &[u8], f| {
+                        eps.push((p.to_vec(), f));
+                        eps.len() < per_cube
+                    });
+                    s.dfs(&root, d0, len, N_MOVES);
+                    if eps.len() >= per_cube {
+                        break;
+                    }
+                }
+                (cube, eps)
+            })
+            .collect()
+    }
+
+    fn same(a: &Candidate, b: &Candidate) -> bool {
+        (
+            &a.moves1, a.frame, a.cube, a.centre, a.tau, a.dt, a.h2, a.done2,
+        ) == (
+            &b.moves1, b.frame, b.cube, b.centre, b.tau, b.dt, b.h2, b.done2,
+        )
+    }
+
+    /// The candidates made (cached standardisation, bounded and interleaved joint-table walks)
+    /// are exactly the former construction's, at every limit.
+    #[test]
+    fn candidates_match_the_former_construction() {
+        let t = joint_tables();
+        let (mut kept, mut total) = (0usize, 0usize);
+        for (cube, eps) in random_endpoints(&t, 12, 400, 11) {
+            let Some(l1) = eps.iter().map(|e| e.0.len()).min() else {
+                continue;
+            };
+            for limit in (l1 + 6..l1 + 22).chain([usize::MAX]) {
+                let mut new = vec![];
+                // Uneven batches, as the parallel chunks give.
+                for chunk in eps.chunks(37) {
+                    make_candidates(&t.p2, &cube, chunk, limit, &mut new);
+                }
+                let mut old = vec![];
+                for (moves1, frames) in &eps {
+                    for frame in 0..3 {
+                        if frames >> frame & 1 == 1 {
+                            total += 1;
+                            old.extend(candidate_ref(&t, &cube, moves1, frame, limit));
+                        }
+                    }
+                }
+                kept += old.len();
+                assert_eq!(new.len(), old.len(), "limit {limit}");
+                for (a, b) in new.iter().zip(&old) {
+                    assert!(
+                        same(a, b),
+                        "limit {limit}: {:?} frame {}",
+                        b.moves1,
+                        b.frame
+                    );
+                }
+            }
+        }
+        assert!(kept > 1000 && kept < total, "kept {kept} of {total}");
+    }
+
+    /// Joint-table walks of random phase-2 states (deeper than endpoints) match the former
+    /// walk, with and without bounds.
+    #[test]
+    fn joint_walks_match_the_former_walk() {
+        use crate::phase2::P2_MOVES;
+        use rand::Rng;
+        let t = joint_tables();
+        let (p2, j) = (&t.p2, t.p2.joint.as_ref().unwrap());
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(3);
+        let mut states = vec![];
+        let mut want = vec![];
+        for _ in 0..3000 {
+            let mut c = Cube::SOLVED;
+            for _ in 0..rng.gen_range(0..40) {
+                c = c.apply_perm(&MOVE_PERMS[P2_MOVES[rng.gen_range(0..17)] as usize]);
+            }
+            let cc = p2.centre_coord_of(&c);
+            let tau = p2.tau_of(&c);
+            let d = j.distance_ref(p2, cc / 1680, &tau, cc & 1);
+            assert_eq!(j.distance(cc / 1680, &tau, cc & 1), d);
+            let max = rng.gen_range(0..=d + 2);
+            states.push((cc / 1680, tau, cc & 1, max));
+            want.push((d <= max).then_some(d));
+        }
+        let mut got = vec![];
+        j.distances_at_most(&states, &mut got);
+        assert_eq!(got, want);
+    }
+
+    /// Candidate construction timings (single thread), former and current, on phase-1
+    /// endpoints of random cubes at a few limits (L1 of the shortest endpoint + `extra`):
+    /// `cargo test --release candidate_timings -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn candidate_timings() {
+        let t = joint_tables();
+        let (p2, j) = (&t.p2, t.p2.joint.as_ref().unwrap());
+        let sets = random_endpoints(&t, 40, 1000, 21);
+        let n: usize = sets
+            .iter()
+            .flat_map(|s| &s.1)
+            .map(|e| e.1.count_ones() as usize)
+            .sum();
+        // Table reads per joint-table walk: all 17 children in index order, the current
+        // state re-read at each step (former), and the walk's.
+        let (mut walks, mut steps, mut former, mut now) = (0, 0, 0, 0);
+        for (cube, eps) in &sets {
+            for (moves1, frames) in eps {
+                for frame in 0..3 {
+                    if frames >> frame & 1 == 1 {
+                        let mut c = *cube;
+                        for &m in moves1 {
+                            c = c.apply_perm(&MOVE_PERMS[m as usize]);
+                        }
+                        let x = standardise(&c, frame);
+                        let cc = p2.centre_coord_of(&x);
+                        if p2.centre_dist[cc as usize] != crate::table::UNSEEN {
+                            let tau = p2.tau_of(&x);
+                            let (s, all) = j.walk_reads(p2, cc / 1680, &tau, cc & 1, None);
+                            let (_, w) = j.walk_reads(p2, cc / 1680, &tau, cc & 1, Some(&ORDER));
+                            (walks, steps, former, now) =
+                                (walks + 1, steps + s, former + all + s + 1, now + w + 1);
+                        }
+                    }
+                }
+            }
+        }
+        let w = walks as f64;
+        eprintln!(
+            "{n} candidates, {walks} walks: {:.2} steps, table reads {:.1} (former) / {:.1}",
+            steps as f64 / w,
+            former as f64 / w,
+            now as f64 / w
+        );
+        for extra in [usize::MAX, 14, 12, 11] {
+            let lim = |eps: &[(Vec<u8>, u8)]| {
+                let l1 = eps.iter().map(|e| e.0.len()).min().unwrap_or(0);
+                l1.saturating_add(extra)
+            };
+            let t0 = Instant::now();
+            let mut kept = 0;
+            for (cube, eps) in &sets {
+                for (moves1, frames) in eps {
+                    for f in 0..3 {
+                        if frames >> f & 1 == 1 {
+                            kept += candidate_ref(&t, cube, moves1, f, lim(eps)).is_some() as usize;
+                        }
+                    }
+                }
+            }
+            let old = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
+            let t0 = Instant::now();
+            let mut out = vec![];
+            for (cube, eps) in &sets {
+                for chunk in eps.chunks(32) {
+                    make_candidates(p2, cube, chunk, lim(eps), &mut out);
+                }
+            }
+            let new = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
+            assert_eq!(out.len(), kept);
+            eprintln!(
+                "L1 + {extra:>2}: {kept:5} of {n} kept; us per candidate: former {old:.2}, now {new:.2}"
+            );
+        }
+    }
 
     /// Opening phase 2 with moves of phase 1's trailing axis, and phase 1 not reporting the
     /// endpoints that this covers, gives exactly the old phase 1+2 sequences, each once.
@@ -1179,7 +1468,7 @@ mod tests {
                             if frames >> frame & 1 == 0 {
                                 continue;
                             }
-                            let Some(c) = make_candidate(&t, &cube, &moves1, frame) else {
+                            let Some(c) = candidate(&t, &cube, &moves1, frame, usize::MAX) else {
                                 continue;
                             };
                             let rot = frame_rotation(frame);
