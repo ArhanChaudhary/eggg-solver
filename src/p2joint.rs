@@ -11,7 +11,7 @@
 //! entries of tau, conjugated into the class representative, are ranked (8!/2). Distances
 //! are stored mod 3 in 2 bits (1.05 GB).
 
-use crate::comb::{FACT, perm_rank};
+use crate::comb::FACT;
 use crate::cube::{EDGE_POS, GEO, ROTATIONS, centre_slot, mat_apply};
 use crate::moves::MOVE_PERMS;
 use crate::phase2::{P2_MOVES, P2Tables};
@@ -49,6 +49,8 @@ pub struct Joint {
     /// excluded. Symmetry 2k + c is rotation k of V, with the colour complement if c = 1.
     stab: Vec<u8>,
     pub ud_move: [[u8; 17]; 70],
+    /// [`P2Tables::tau_move`] as two byte shuffles per move: (pl_inv, ph).
+    tau_moves: [(V32, V32); 17],
     pub table: HugeBuf<u64>,
     pub n: usize,
 }
@@ -80,19 +82,20 @@ fn prefix_unrank(mut r: usize) -> [u8; 4] {
 }
 
 /// Rank of the eight non-M entries of tau (relative to the values the prefix leaves), /2 for
-/// the fixed parity.
+/// the fixed parity: their Lehmer code over the values not used by the prefix.
 #[inline(always)]
 fn rest_rank(tau: &[u8; 16]) -> usize {
-    let mut pm = 0u32;
+    let mut avail = !0u32;
     for &e in &M_EDGES {
-        pm |= 1 << tau[e];
+        avail &= !(1 << tau[e]);
     }
-    let mut p = [0u8; 8];
+    let mut r = 0u64;
     for (i, &e) in REST.iter().enumerate() {
         let v = tau[e] as u32;
-        p[i] = (v - (pm & ((1 << v) - 1)).count_ones()) as u8;
+        r += (avail & ((1 << v) - 1)).count_ones() as u64 * FACT[7 - i];
+        avail &= !(1 << v);
     }
-    (perm_rank(&p) / 2) as usize
+    (r / 2) as usize
 }
 
 fn perm8_unrank(mut r: usize) -> [u8; 8] {
@@ -231,12 +234,19 @@ impl Joint {
             }
         }
         let n = rep.len() * N_REST * 2;
+        let tau_moves = std::array::from_fn(|i| {
+            let (mut pl, mut ph) = (V32::ZERO, V32::ZERO);
+            pl.0[..16].copy_from_slice(&p2.pl_inv[i]);
+            ph.0[..16].copy_from_slice(&p2.ph[i]);
+            (pl, ph)
+        });
         Joint {
             syms,
             cls,
             rep,
             stab,
             ud_move,
+            tau_moves,
             table: HugeBuf::zeroed(1),
             n,
         }
@@ -261,6 +271,29 @@ impl Joint {
             rest_rank(&conj_edges(tau, &self.syms[s]))
         };
         ((c >> 3) as usize * N_REST + r) * 2 + pll as usize
+    }
+
+    /// [`Joint::index`] of a tau held in the low half of a vector.
+    #[inline(always)]
+    fn index_v(&self, ud: u32, tau: &V32, pll: u32) -> usize {
+        let t: &[u8; 16] = tau.0[..16].try_into().unwrap();
+        let c = self.cls[ud as usize * N_PREFIX + prefix_rank(t)];
+        let s = (c & 7) as usize;
+        let r = if s == 0 {
+            rest_rank(t)
+        } else {
+            let sy = &self.syms[s];
+            let u = crate::simd::shuf(&sy.e_map, &crate::simd::shuf(tau, &sy.e_inv));
+            rest_rank(u.0[..16].try_into().unwrap())
+        };
+        ((c >> 3) as usize * N_REST + r) * 2 + pll as usize
+    }
+
+    /// [`P2Tables::tau_move`] of a tau held in the low half of a vector.
+    #[inline(always)]
+    fn tau_move_v(&self, tau: &V32, i: usize) -> V32 {
+        let (pl, ph) = &self.tau_moves[i];
+        crate::simd::shuf(ph, &crate::simd::shuf(tau, pl))
     }
 
     /// The canonical index (minimum over the stabiliser), used by the generator.
@@ -334,18 +367,85 @@ impl Joint {
         crate::table::prefetch(unsafe { self.table.as_ptr().add(i >> 5) });
     }
 
-    /// Exact distance of a state, by walking down the mod-3 table.
-    pub fn distance(&self, p2: &P2Tables, ud: u32, tau: &[u8; 16], pll: u32) -> u8 {
+    /// Exact distance of a state, by walking down the mod-3 table (four children read at a
+    /// time).
+    pub fn distance(&self, ud: u32, tau: &[u8; 16], pll: u32) -> u8 {
+        let mut w = Walk::new(self, ud, tau, pll, u8::MAX);
+        loop {
+            if let Some(d) = w.step::<4>(self) {
+                return d.expect("no bound");
+            }
+        }
+    }
+
+    /// (steps, children read) of a walk from a state trying the children in `order` (with the
+    /// restriction of [`AFTER`]), or all 17 in index order (`order` None).
+    #[cfg(test)]
+    pub(crate) fn walk_reads(
+        &self,
+        p2: &P2Tables,
+        ud: u32,
+        tau: &[u8; 16],
+        pll: u32,
+        order: Option<&[u8; 17]>,
+    ) -> (usize, usize) {
+        let ident: [u8; 17] = std::array::from_fn(|i| i as u8);
+        let after = order.map(after_table).unwrap_or([(1 << 17) - 1; 18]);
+        let order = order.unwrap_or(&ident);
+        let (mut ud, mut tau, mut pll) = (ud, *tau, pll);
+        let (mut steps, mut reads) = (0, 0);
+        let mut last = 17;
+        loop {
+            let v = self.get(self.index(ud, &tau, pll));
+            let mut next = None;
+            for k in 0..17 {
+                if after[last] >> k & 1 == 0 {
+                    continue;
+                }
+                let i = order[k] as usize;
+                let t2 = p2.tau_move(&tau, i);
+                let u2 = self.ud_move[ud as usize][i] as u32;
+                let p = pll ^ (WIDE >> i & 1);
+                reads += 1;
+                if self.get(self.index(u2, &t2, p)) == (v + 2) % 3 {
+                    next = Some((u2, t2, p, i));
+                    break;
+                }
+            }
+            match next {
+                Some((u2, t2, p, i)) => {
+                    (ud, tau, pll, last) = (u2, t2, p, i);
+                    steps += 1;
+                }
+                None => return (steps, reads),
+            }
+        }
+    }
+
+    /// The former [`Joint::distance`] (all 17 children tried at each step, one by one, and the
+    /// former index computation).
+    #[cfg(test)]
+    pub(crate) fn distance_ref(&self, p2: &P2Tables, ud: u32, tau: &[u8; 16], pll: u32) -> u8 {
+        let index = |ud: u32, tau: &[u8; 16], pll: u32| {
+            let c = self.cls[ud as usize * N_PREFIX + prefix_rank(tau)];
+            let s = (c & 7) as usize;
+            let r = if s == 0 {
+                tests::rest_rank_ref(tau)
+            } else {
+                tests::rest_rank_ref(&conj_edges(tau, &self.syms[s]))
+            };
+            ((c >> 3) as usize * N_REST + r) * 2 + pll as usize
+        };
         let (mut ud, mut tau, mut pll) = (ud, *tau, pll);
         let mut d = 0;
         loop {
-            let v = self.get(self.index(ud, &tau, pll));
+            let v = self.get(index(ud, &tau, pll));
             let mut next = None;
             for i in 0..17 {
                 let t2 = p2.tau_move(&tau, i);
                 let u2 = self.ud_move[ud as usize][i] as u32;
                 let p = pll ^ (WIDE >> i & 1);
-                if self.get(self.index(u2, &t2, p)) == (v + 2) % 3 {
+                if self.get(index(u2, &t2, p)) == (v + 2) % 3 {
                     next = Some((u2, t2, p));
                     break;
                 }
@@ -358,6 +458,42 @@ impl Joint {
                     d += 1;
                 }
                 _ => return d,
+            }
+        }
+    }
+
+    /// Exact distances of states (U/D pattern, tau, PLL bit, bound), or None for those whose
+    /// distance exceeds their bound (found out before walking all the way down). The walks are
+    /// interleaved, one child at a time each, so that each one's table read is in flight while
+    /// the others compute (a walk is a chain of dependent reads, and computing a child's index
+    /// costs about as much as a read).
+    pub fn distances_at_most(
+        &self,
+        states: &[(u32, [u8; 16], u32, u8)],
+        out: &mut Vec<Option<u8>>,
+    ) {
+        const LANES: usize = 16;
+        out.clear();
+        out.resize(states.len(), None);
+        let mut lanes: Vec<(usize, Walk)> = Vec::with_capacity(LANES);
+        let mut next = 0;
+        loop {
+            while lanes.len() < LANES && next < states.len() {
+                let (ud, tau, pll, max) = states[next];
+                lanes.push((next, Walk::new(self, ud, &tau, pll, max)));
+                next += 1;
+            }
+            if lanes.is_empty() {
+                return;
+            }
+            let mut k = 0;
+            while k < lanes.len() {
+                if let Some(d) = lanes[k].1.step::<1>(self) {
+                    out[lanes[k].0] = d;
+                    lanes.swap_remove(k);
+                } else {
+                    k += 1;
+                }
             }
         }
     }
@@ -479,9 +615,193 @@ impl Joint {
     }
 }
 
+/// The order in which a walk tries the children (phase-2 move indices): the wide half turns
+/// (each one move closer at ~20% of the steps of a walk from a phase-1 endpoint, against 3-8%
+/// for the others), the quarter turns, then the half turns. Walks from phase-1 endpoints then
+/// read ~73 children instead of ~106 in index order (~146 without the restriction).
+pub(crate) const ORDER: [u8; 17] = [15, 16, 14, 0, 2, 4, 6, 7, 9, 11, 13, 3, 10, 1, 5, 8, 12];
+
+/// The children a walk tries after phase-2 move `last` (17: none), as bits of positions in
+/// [`ORDER`]: not the same face as `last`, nor of its axis and before it in the order.
+const AFTER: [u32; 18] = after_table(&ORDER);
+
+const fn after_table(order: &[u8; 17]) -> [u32; 18] {
+    let mut pos = [0usize; 17];
+    let mut k = 0;
+    while k < 17 {
+        pos[order[k] as usize] = k;
+        k += 1;
+    }
+    let mut t = [0u32; 18];
+    let mut last = 0;
+    while last <= 17 {
+        let mut k = 0;
+        while k < 17 {
+            let m = order[k] as usize;
+            let ok = last == 17 || {
+                let (fl, fm) = (P2_MOVES[last] / 3, P2_MOVES[m] / 3);
+                fl != fm && (fl % 3 != fm % 3 || k > pos[last])
+            };
+            if ok {
+                t[last] |= 1 << k;
+            }
+            k += 1;
+        }
+        last += 1;
+    }
+    t
+}
+
+/// A walk down the joint table from a state to the goal, one child one move closer per step
+/// (the first in [`ORDER`]). Such a child is never a move of the same face as the step that
+/// led to the state, nor of its axis and before it in the order (the moves of an axis commute,
+/// so that move would have been one move closer from the parent, and tried first): those are
+/// skipped, and the walk takes the same path as one trying all 17 children.
+struct Walk {
+    ud: u32,
+    /// tau in the low 16 bytes.
+    tau: V32,
+    pll: u32,
+    /// The current state's stored value (its distance mod 3; 3 = never reached; `UNREAD`
+    /// before the first step).
+    v: u8,
+    /// Steps taken.
+    d: u8,
+    /// The distance bound: the walk ends without a distance once it must exceed it.
+    max: u8,
+    /// Children of the current state not tried yet (move index bits).
+    left: u32,
+    /// Children whose entries are being fetched: (index, U/D pattern, tau, PLL bit, move).
+    pend: [(usize, u32, V32, u32, u8); 4],
+    npend: usize,
+}
+
+const UNREAD: u8 = 0xff;
+
+impl Walk {
+    /// A walk from a state, whose own entry is fetched (and read by the first step).
+    fn new(j: &Joint, ud: u32, tau: &[u8; 16], pll: u32, max: u8) -> Walk {
+        let mut t = V32::ZERO;
+        t.0[..16].copy_from_slice(tau);
+        let idx = j.index(ud, tau, pll);
+        j.prefetch(idx);
+        let mut pend = [(0, 0, V32::ZERO, 0, 0); 4];
+        pend[0].0 = idx;
+        Walk {
+            ud,
+            tau: t,
+            pll,
+            v: UNREAD,
+            d: 0,
+            max,
+            left: AFTER[17],
+            pend,
+            npend: 0,
+        }
+    }
+
+    /// Read the pending children (fetched by the last call), then fetch the next `G`: Some once
+    /// the walk is over (Some(None): the distance exceeds the bound).
+    #[inline(always)]
+    fn step<const G: usize>(&mut self, j: &Joint) -> Option<Option<u8>> {
+        if self.v == UNREAD {
+            self.v = j.get(self.pend[0].0);
+            return self.fetch::<G>(j);
+        }
+        let want = (self.v + 2) % 3;
+        for k in 0..self.npend {
+            let (idx, ud, tau, pll, i) = self.pend[k];
+            if j.get(idx) == want {
+                if self.d >= 40 {
+                    return Some(Some(self.d));
+                }
+                (self.ud, self.tau, self.pll, self.v) = (ud, tau, pll, want);
+                self.d += 1;
+                self.left = AFTER[i as usize];
+                self.npend = 0;
+                return self.fetch::<G>(j);
+            }
+        }
+        self.npend = 0;
+        self.fetch::<G>(j)
+    }
+
+    #[inline(always)]
+    fn fetch<const G: usize>(&mut self, j: &Joint) -> Option<Option<u8>> {
+        // The rest of the walk takes at least v moves (its length is v mod 3).
+        if self.v < 3 && self.d + self.v > self.max {
+            return Some(None);
+        }
+        if self.left == 0 {
+            return Some(Some(self.d));
+        }
+        while self.left != 0 && self.npend < G {
+            let i = ORDER[self.left.trailing_zeros() as usize] as usize;
+            self.left &= self.left - 1;
+            let tau = j.tau_move_v(&self.tau, i);
+            let ud = j.ud_move[self.ud as usize][i] as u32;
+            let pll = self.pll ^ (WIDE >> i & 1);
+            let idx = j.index_v(ud, &tau, pll);
+            j.prefetch(idx);
+            self.pend[self.npend] = (idx, ud, tau, pll, i as u8);
+            self.npend += 1;
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn walk_order_restriction() {
+        // Each move's own face is excluded, other axes are allowed, and of two moves of one
+        // axis (different faces) exactly one may follow the other.
+        for a in 0..17 {
+            assert_eq!(ORDER.iter().filter(|&&m| m as usize == a).count(), 1);
+            for k in 0..17 {
+                let b = ORDER[k] as usize;
+                let (fa, fb) = (P2_MOVES[a] / 3, P2_MOVES[b] / 3);
+                let ab = AFTER[a] >> k & 1 == 1;
+                let kb = ORDER.iter().position(|&m| m as usize == a).unwrap();
+                let ba = AFTER[b] >> kb & 1 == 1;
+                if fa == fb {
+                    assert!(!ab && !ba);
+                } else if fa % 3 != fb % 3 {
+                    assert!(ab && ba);
+                } else {
+                    assert!(ab != ba);
+                }
+            }
+        }
+        assert_eq!(AFTER[17], (1 << 17) - 1);
+    }
+
+    /// The former [`rest_rank`]: relabel the eight values to 0..8, then rank.
+    pub(super) fn rest_rank_ref(tau: &[u8; 16]) -> usize {
+        let mut pm = 0u32;
+        for &e in &M_EDGES {
+            pm |= 1 << tau[e];
+        }
+        let mut p = [0u8; 8];
+        for (i, &e) in REST.iter().enumerate() {
+            let v = tau[e] as u32;
+            p[i] = (v - (pm & ((1 << v) - 1)).count_ones()) as u8;
+        }
+        (crate::comb::perm_rank(&p) / 2) as usize
+    }
+
+    #[test]
+    fn rest_rank_matches_relabelled_lehmer_rank() {
+        use rand::seq::SliceRandom;
+        let mut rng = rand::thread_rng();
+        for _ in 0..20000 {
+            let mut tau: [u8; 16] = std::array::from_fn(|i| i as u8);
+            tau[..12].shuffle(&mut rng);
+            assert_eq!(rest_rank(&tau), rest_rank_ref(&tau));
+        }
+    }
 
     #[test]
     fn conj_edges_matches_conj() {

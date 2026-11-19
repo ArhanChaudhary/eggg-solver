@@ -327,34 +327,64 @@ pub fn pll_parity(c: &Cube, low: &[u8; 12]) -> u32 {
 /// Bring a phase-1 endpoint into the standard frame and colour assignment: conjugate by the
 /// frame rotation, then recolour so that the colour pair on each axis is that axis's own.
 pub fn standardise(c: &Cube, frame: usize) -> Cube {
-    let rot = frame_rotation(frame);
-    let x = Conj::new(rot).apply(c);
-    // Colour pair (0: U/D, 1: R/L, 2: F/B) on each axis.
-    let pair = |colour: u8| -> usize {
-        match colour as usize {
-            U | D => 0,
-            R | L => 1,
-            _ => 2,
-        }
-    };
-    let on_ud = pair(x.ct[0] / 4);
-    let on_rl = pair(x.ct[4] / 4);
-    let on_fb = pair(x.ct[8] / 4);
+    let s = &*STANDARDISE;
+    let x = s.frames[frame].apply(c);
+    let k = s.pick[colour_pair(x.ct[0] / 4)][colour_pair(x.ct[4] / 4)][colour_pair(x.ct[8] / 4)];
+    s.rots[k as usize].recolour(&x)
+}
+
+/// Colour pair (0: U/D, 1: R/L, 2: F/B) of a colour.
+fn colour_pair(colour: u8) -> usize {
+    match colour as usize {
+        U | D => 0,
+        R | L => 1,
+        _ => 2,
+    }
+}
+
+/// [`standardise`]'s conjugations, built once (each `Conj::new` searches the slots).
+struct Standardise {
+    /// Conjugation by each frame rotation.
+    frames: [Conj; 3],
+    /// Recolouring by each of the 24 rotations (`ROTATIONS` order).
+    rots: Vec<Conj>,
+    /// For the colour pairs on the U/D, R/L and F/B axes, the first rotation that maps them to
+    /// the axes' own pairs.
+    pick: [[[u8; 3]; 3]; 3],
+}
+
+static STANDARDISE: std::sync::LazyLock<Standardise> = std::sync::LazyLock::new(|| {
+    let rots: Vec<Conj> = crate::cube::ROTATIONS
+        .iter()
+        .map(|m| Conj::new(*m))
+        .collect();
     let face_pair = [0usize, 1, 2, 0, 1, 2]; // pair of each face U R F D L B
-    for m in crate::cube::ROTATIONS.iter() {
-        let cj = Conj::new(*m);
-        let map = cj.colour_map();
-        let ok = |p: usize, target: usize| {
-            (0..6)
-                .filter(|&f| face_pair[f] == p)
-                .all(|f| face_pair[map[f] as usize] == target)
-        };
-        if ok(on_ud, 0) && ok(on_rl, 1) && ok(on_fb, 2) {
-            return cj.recolour(&x);
+    let mut pick = [[[u8::MAX; 3]; 3]; 3];
+    for (on_ud, row) in pick.iter_mut().enumerate() {
+        for (on_rl, row) in row.iter_mut().enumerate() {
+            for (on_fb, k) in row.iter_mut().enumerate() {
+                if on_ud == on_rl || on_rl == on_fb || on_ud == on_fb {
+                    continue;
+                }
+                let r = rots.iter().position(|cj| {
+                    let map = cj.colour_map();
+                    let ok = |p: usize, target: usize| {
+                        (0..6)
+                            .filter(|&f| face_pair[f] == p)
+                            .all(|f| face_pair[map[f] as usize] == target)
+                    };
+                    ok(on_ud, 0) && ok(on_rl, 1) && ok(on_fb, 2)
+                });
+                *k = r.expect("no rotation standardises the colour pairs") as u8;
+            }
         }
     }
-    unreachable!("no rotation standardises the colour pairs")
-}
+    Standardise {
+        frames: std::array::from_fn(|f| Conj::new(frame_rotation(f))),
+        rots,
+        pick,
+    }
+});
 
 /// Moves allowed to open phase 2 after the phase-1 moves `moves1` (already in the phase-2
 /// frame): any move on a face not used by phase 1's trailing run of same-axis moves. Moves of
@@ -554,8 +584,63 @@ fn cc_is_goal(t: &P2Tables, cc: u32) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// The former [`standardise`] (a rotation search per call).
+    pub(crate) fn standardise_ref(c: &Cube, frame: usize) -> Cube {
+        let x = Conj::new(frame_rotation(frame)).apply(c);
+        let pair = |colour: u8| -> usize {
+            match colour as usize {
+                U | D => 0,
+                R | L => 1,
+                _ => 2,
+            }
+        };
+        let on_ud = pair(x.ct[0] / 4);
+        let on_rl = pair(x.ct[4] / 4);
+        let on_fb = pair(x.ct[8] / 4);
+        let face_pair = [0usize, 1, 2, 0, 1, 2];
+        for m in crate::cube::ROTATIONS.iter() {
+            let cj = Conj::new(*m);
+            let map = cj.colour_map();
+            let ok = |p: usize, target: usize| {
+                (0..6)
+                    .filter(|&f| face_pair[f] == p)
+                    .all(|f| face_pair[map[f] as usize] == target)
+            };
+            if ok(on_ud, 0) && ok(on_rl, 1) && ok(on_fb, 2) {
+                return cj.recolour(&x);
+            }
+        }
+        unreachable!()
+    }
+
+    #[test]
+    fn standardise_matches_rotation_search() {
+        use rand::seq::SliceRandom;
+        let mut rng = rand::thread_rng();
+        for _ in 0..2000 {
+            // A random cube with staged centres: each axis (faces a, a + 3) holds the centres of
+            // one colour pair, the pairs assigned to the axes at random.
+            let mut c = Cube::random(&mut rng);
+            let mut pairs = [0usize, 1, 2];
+            pairs.shuffle(&mut rng);
+            for (axis, &p) in pairs.iter().enumerate() {
+                let mut pieces: Vec<u8> = (0..4)
+                    .flat_map(|i| [(p * 4 + i) as u8, ((p + 3) * 4 + i) as u8])
+                    .collect();
+                pieces.shuffle(&mut rng);
+                for (i, &x) in pieces.iter().enumerate() {
+                    let face = axis + 3 * (i / 4);
+                    c.ct[face * 4 + i % 4] = x;
+                }
+            }
+            for f in 0..3 {
+                assert_eq!(standardise(&c, f), standardise_ref(&c, f));
+            }
+        }
+    }
 
     #[test]
     fn tau_rank_roundtrip() {
