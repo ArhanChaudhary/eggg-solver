@@ -105,6 +105,70 @@ fn rest_rank(tau: &[u8; 16]) -> usize {
     (r / 2) as usize
 }
 
+/// The eight non-M entries of tau gathered into bytes 0..8 of each lane, byte 15 (which holds
+/// 15, above every entry) in the others.
+const REST_G: V32 = {
+    let mut v = [15u8; 32];
+    let mut i = 0;
+    while i < 8 {
+        v[i] = REST[i] as u8;
+        v[16 + i] = REST[i] as u8;
+        i += 1;
+    }
+    V32(v)
+};
+
+/// Shuffles moving each lane's byte i + k to byte i (k = 1..7; byte 15 past the end).
+const SHIFTS: [V32; 7] = {
+    let mut t = [V32([0; 32]); 7];
+    let mut k = 0;
+    while k < 7 {
+        let mut i = 0;
+        while i < 16 {
+            let j = if i + k + 1 < 16 { i + k + 1 } else { 15 };
+            t[k].0[i] = j as u8;
+            t[k].0[16 + i] = j as u8;
+            i += 1;
+        }
+        k += 1;
+    }
+    t
+};
+
+/// Sum of (7 - i)! over the set bits i of a byte.
+static LEHMER_W: [u16; 256] = {
+    let mut t = [0u16; 256];
+    let mut m = 0;
+    while m < 256 {
+        let mut i = 0;
+        let mut w = 0;
+        while i < 8 {
+            if m >> i & 1 == 1 {
+                w += FACT[7 - i] as u16;
+            }
+            i += 1;
+        }
+        t[m] = w;
+        m += 1;
+    }
+    t
+};
+
+/// [`rest_rank`] of both lanes of a vector: the Lehmer digit of entry i counts the later
+/// entries below it, so the rank is the sum over k = 1..7 of the weights (7 - i)! of the
+/// entries i whose entry i + k is below them (one subtraction and mask per k).
+#[inline(always)]
+fn rest_rank2(u: &V32) -> (usize, usize) {
+    let g = crate::simd::shuf(u, &REST_G);
+    let (mut r0, mut r1) = (0usize, 0usize);
+    for sh in &SHIFTS {
+        let m = crate::simd::movemask(&crate::simd::sub(&crate::simd::shuf(&g, sh), &g));
+        r0 += LEHMER_W[(m & 0xff) as usize] as usize;
+        r1 += LEHMER_W[(m >> 16 & 0xff) as usize] as usize;
+    }
+    (r0 / 2, r1 / 2)
+}
+
 fn perm8_unrank(mut r: usize) -> [u8; 8] {
     let mut avail = [0u8, 1, 2, 3, 4, 5, 6, 7];
     let mut n = 8;
@@ -519,6 +583,24 @@ impl Joint {
             rest_rank(u.0[16 * L..16 * L + 16].try_into().unwrap())
         };
         ((c >> 3) as usize * N_REST + r) * 2 + pll as usize
+    }
+
+    /// [`Joint::index_lane`] of both lanes at once (class-table positions `ru` and `rf`): the
+    /// two conjugations in one pair of shuffles, and the two rest ranks with vector compares.
+    #[inline(always)]
+    pub fn index_dual(&self, ru: usize, rf: usize, tt: &V32, pll: u32) -> (usize, usize) {
+        let (cu, cf) = (self.cls[ru], self.cls[rf]);
+        let (su, sf) = ((cu & 7) as usize, (cf & 7) as usize);
+        let (mut inv, mut map) = self.conj2[su];
+        inv.0[16..].copy_from_slice(&self.conj2[sf].0.0[16..]);
+        map.0[16..].copy_from_slice(&self.conj2[sf].1.0[16..]);
+        let u = crate::simd::shuf(&map, &crate::simd::shuf(tt, &inv));
+        let (r0, r1) = rest_rank2(&u);
+        let pll = pll as usize;
+        (
+            ((cu >> 3) as usize * N_REST + r0) * 2 + pll,
+            ((cf >> 3) as usize * N_REST + r1) * 2 + pll,
+        )
     }
 
     /// [`P2Tables::tau_move`] of a tau held in the low half of a vector.
@@ -1081,6 +1163,12 @@ mod tests {
                 assert_eq!(a, j.index(ud, &tau, pll));
                 let b = j.index_lane::<1>(j.raw_lane::<1>(ud, &tt), &tt, pll);
                 assert_eq!(b, j.index(ud, &tf, pll));
+                let ud2 = rng.gen_range(0..70);
+                let (ru, rf) = (j.raw_lane::<0>(ud2, &tt), j.raw_lane::<1>(ud, &tt));
+                assert_eq!(
+                    j.index_dual(ru, rf, &tt, pll),
+                    (j.index(ud2, &tau, pll), j.index(ud, &tf, pll))
+                );
             }
         }
     }

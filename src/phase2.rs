@@ -607,9 +607,8 @@ impl<'a> Search2<'a> {
         let mut idx = [(0usize, 0usize); 17];
         for k in 0..nk {
             let (c2, t2, ru, rf, _) = &kids[k];
-            let a = j.index_lane::<0>(*ru, t2, c2 & 1);
+            let (a, b) = j.index_dual(*ru, *rf, t2, c2 & 1);
             j.prefetch(a);
-            let b = j.index_lane::<1>(*rf, t2, c2 & 1);
             j.prefetch(b);
             idx[k] = (a, b);
         }
