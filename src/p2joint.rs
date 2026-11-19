@@ -62,13 +62,26 @@ pub struct Joint {
     pub n: usize,
 }
 
+/// Bit counts of 12-bit numbers: the ranks count values below an entry's among 12 (a load is
+/// cheaper than a bit count on some targets, e.g. aarch64 without CSSC, where it goes through
+/// a vector register).
+static POP12: [u8; 4096] = {
+    let mut t = [0u8; 4096];
+    let mut i = 0;
+    while i < 4096 {
+        t[i] = (i as u32).count_ones() as u8;
+        i += 1;
+    }
+    t
+};
+
 #[inline(always)]
 fn prefix_rank(tau: &[u8; 16]) -> usize {
     let mut used = 0u32;
     let mut r = 0usize;
     for (i, &e) in M_EDGES.iter().enumerate() {
         let v = tau[e] as u32;
-        r = r * (12 - i) + (!used & ((1 << v) - 1)).count_ones() as usize;
+        r = r * (12 - i) + POP12[(!used & ((1 << v) - 1) & 0xfff) as usize] as usize;
         used |= 1 << v;
     }
     r
@@ -99,7 +112,7 @@ fn rest_rank(tau: &[u8; 16]) -> usize {
     let mut r = 0u64;
     for (i, &e) in REST.iter().enumerate() {
         let v = tau[e] as u32;
-        r += (avail & ((1 << v) - 1)).count_ones() as u64 * FACT[7 - i];
+        r += POP12[(avail & ((1 << v) - 1) & 0xfff) as usize] as u64 * FACT[7 - i];
         avail &= !(1 << v);
     }
     (r / 2) as usize
