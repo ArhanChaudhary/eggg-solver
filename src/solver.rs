@@ -184,6 +184,34 @@ fn transpose(m: &Mat) -> Mat {
     t
 }
 
+fn prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("EGGG_PROF").is_some())
+}
+
+fn prof(start: Instant, msg: &str) {
+    if prof_on() {
+        eprintln!("P|{:.4}|{msg}", start.elapsed().as_secs_f64());
+    }
+}
+
+/// Candidate-making counters: frames offered, dropped (centres unsolvable, L1 + cd > limit,
+/// L1 + dt > limit), kept; per L1.
+#[derive(Default, Clone, Copy)]
+struct MkStat {
+    frames: u64,
+    unseen: u64,
+    cd_drop: u64,
+    dt_drop: u64,
+    kept: u64,
+    /// Kept by L1 + h2 - L1min... (h2 histogram of kept)
+    h2: [u64; 24],
+    /// Dropped by dt: histogram of cd (centre distance) for those.
+    cd_of_dt_drop: [u64; 24],
+    /// Dropped by cd: histogram of L1 + cd - limit.
+    cd_over: [u64; 24],
+}
+
 fn debug(start: Instant, msg: &str) {
     if std::env::var_os("EGGG_DEBUG").is_some() {
         eprintln!("[{:8.3}] {msg}", start.elapsed().as_secs_f64());
@@ -299,6 +327,18 @@ fn make_candidates(
     limit: usize,
     out: &mut Vec<Candidate>,
 ) {
+    let mut st = [MkStat::default(); 32];
+    make_candidates_st(p2, cube, eps, limit, out, &mut st);
+}
+
+fn make_candidates_st(
+    p2: &P2Tables,
+    cube: &Cube,
+    eps: &[(Vec<u8>, u8)],
+    limit: usize,
+    out: &mut Vec<Candidate>,
+    st: &mut [MkStat; 32],
+) {
     // (endpoint, frame, standardised cube, centre coordinate, centre distance) of the frames
     // within the centre bound, and their joint-table walks (U/D pattern, tau, PLL bit, bound).
     let mut part = Vec::with_capacity(eps.len());
@@ -323,7 +363,15 @@ fn make_candidates(
             let x = standardise(&c, frame);
             let centre = p2.centre_coord_of(&x);
             let cd = p2.centre_dist[centre as usize];
-            if cd == crate::table::UNSEEN || moves1.len() + cd as usize > limit {
+            let l1 = moves1.len().min(31);
+            st[l1].frames += 1;
+            if cd == crate::table::UNSEEN {
+                st[l1].unseen += 1;
+                continue;
+            }
+            if moves1.len() + cd as usize > limit {
+                st[l1].cd_drop += 1;
+                st[l1].cd_over[(moves1.len() + cd as usize - limit).min(23)] += 1;
                 continue;
             }
             let room = (limit - moves1.len()).min(u8::MAX as usize) as u8;
@@ -338,9 +386,14 @@ fn make_candidates(
     }
     for ((&(e, frame, x, centre, cd), w), dt) in part.iter().zip(&walks).zip(dts) {
         let moves1 = &eps[e].0;
+        let l1 = moves1.len().min(31);
         let Some(dt) = dt.filter(|&dt| moves1.len() + dt as usize <= limit) else {
+            st[l1].dt_drop += 1;
+            st[l1].cd_of_dt_drop[(cd as usize).min(23)] += 1;
             continue;
         };
+        st[l1].kept += 1;
+        st[l1].h2[(cd.max(dt) as usize).min(23)] += 1;
         out.push(Candidate {
             moves1: moves1.clone(),
             frame,
@@ -412,6 +465,37 @@ struct Run<'a, 'r> {
     cands: Vec<Candidate>,
     reds: Vec<Reduction>,
     red_index: HashMap<(usize, Cube3), usize>,
+    /// Profiling.
+    pf: Pf,
+}
+
+#[derive(Default)]
+struct Pf {
+    p1prof: [u64; 24],
+    mk: Vec<MkStat>,
+    round: usize,
+    phase: u8,
+    /// Phase-1 thread busy seconds, wall seconds * threads.
+    p1_busy: f64,
+    p1_cap: f64,
+    p2_busy: f64,
+    p2_cap: f64,
+    p3_busy: f64,
+    p3_cap: f64,
+    mk_wall: f64,
+    /// Phase-3 per depth (total - L12): busy seconds, nodes, searches.
+    p3_depth: Vec<(f64, u64, u64)>,
+    /// Phase-2 per margin (best - t12): wall, busy, nodes, kept reductions, levels run.
+    p2_margin: Vec<(f64, f64, u64, u64, u64)>,
+    /// Phase-1 per length: wall, busy, nodes, endpoint frames.
+    p1_len: Vec<(f64, f64, u64, u64)>,
+    /// Phase-3 per (best - total): wall, busy, nodes, levels, found.
+    p3_margin: Vec<(f64, f64, u64, u64, u64)>,
+    /// Last phase-2 level: busy, seen solutions, kept, todo, started, split, tasks,
+    /// finished, nodes.
+    last2: (f64, u64, u64, usize, usize, usize, usize, usize, u64),
+    /// Last phase-3 level: busy, jobs, jobs run, reds, nodes.
+    last3: (f64, usize, usize, usize, u64),
 }
 
 impl<'a> Solver<'a> {
@@ -481,6 +565,14 @@ impl<'a> Solver<'a> {
             cands: vec![],
             reds: vec![],
             red_index: HashMap::new(),
+            pf: Pf {
+                mk: vec![MkStat::default(); 32],
+                p3_depth: vec![(0.0, 0, 0); 32],
+                p2_margin: vec![(0.0, 0.0, 0, 0, 0); 32],
+                p1_len: vec![(0.0, 0.0, 0, 0); 41],
+                p3_margin: vec![(0.0, 0.0, 0, 0, 0); 32],
+                ..Default::default()
+            },
         };
         run.level.jobs = run.level_jobs(len0);
         std::thread::scope(|scope| {
@@ -500,6 +592,7 @@ impl<'a> Solver<'a> {
                 }
             });
             run.rounds(self.opts.endpoints, self.opts.reductions);
+            run.prof_end();
             if std::env::var_os("EGGG_DEBUG").is_some() {
                 let mut h1 = std::collections::BTreeMap::new();
                 for c in &run.cands {
@@ -527,6 +620,107 @@ impl<'a, 'r> Run<'a, 'r> {
 
     fn best_len(&self) -> usize {
         self.best.as_ref().map(|b| b.len()).unwrap_or(usize::MAX)
+    }
+
+    fn prof_end(&self) {
+        if !prof_on() {
+            return;
+        }
+        let best = self.best_len();
+        let lim = self.useful_l12();
+        let never2 = self.cands.iter().filter(|c| c.done2 == 0).count();
+        let never2_useful = self
+            .cands
+            .iter()
+            .filter(|c| c.done2 == 0 && c.moves1.len() + c.h2 as usize <= lim)
+            .count();
+        let never3 = self.reds.iter().filter(|r| r.done3 == 0).count();
+        let open3 = self
+            .reds
+            .iter()
+            .filter(|r| r.moves12.len() + (r.h3.max(r.done3) as usize) < best)
+            .count();
+        let pf = &self.pf;
+        let mk: Vec<String> = pf
+            .mk
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.frames > 0)
+            .map(|(l, m)| {
+                format!(
+                    "{l}:{}/{}/{}/{}/{}/h2{:?}/cdOfDt{:?}/cdOver{:?}",
+                    m.frames,
+                    m.unseen,
+                    m.cd_drop,
+                    m.dt_drop,
+                    m.kept,
+                    &m.h2[8..20],
+                    &m.cd_of_dt_drop[4..16],
+                    &m.cd_over[1..8]
+                )
+            })
+            .collect();
+        let p3d: Vec<String> = pf
+            .p3_depth
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.2 > 0)
+            .map(|(d, x)| format!("{d}:{:.3}/{}/{}", x.0, x.1, x.2))
+            .collect();
+        let p2m: Vec<String> = pf
+            .p2_margin
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.4 > 0)
+            .map(|(d, x)| format!("{d}:{:.3}/{:.3}/{}/{}/{}", x.0, x.1, x.2, x.3, x.4))
+            .collect();
+        let p1l: Vec<String> = pf
+            .p1_len
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.2 > 0)
+            .map(|(d, x)| format!("{d}:{:.3}/{:.3}/{}/{}", x.0, x.1, x.2, x.3))
+            .collect();
+        let p3m: Vec<String> = pf
+            .p3_margin
+            .iter()
+            .enumerate()
+            .filter(|(_, x)| x.3 > 0)
+            .map(|(d, x)| format!("{d}:{:.3}/{:.3}/{}/{}/{}", x.0, x.1, x.2, x.3, x.4))
+            .collect();
+        prof(
+            self.start,
+            &format!(
+                "END best={} rounds={} phase={} made_cands={} cands={} never2={} never2_useful={} made_reds={} reds={} never3={} open3={} p1busy={:.3} p1cap={:.3} p2busy={:.3} p2cap={:.3} p3busy={:.3} p3cap={:.3} mkwall={:.3} t1={:.3} t2={:.3} t3={:.3} p1prof={:?} MK=[{}] P3D=[{}] P2M=[{}] P1L=[{}] P3M=[{}]",
+                best,
+                pf.round,
+                pf.phase,
+                self.made_cands,
+                self.cands.len(),
+                never2,
+                never2_useful,
+                self.made_reds,
+                self.reds.len(),
+                never3,
+                open3,
+                pf.p1_busy,
+                pf.p1_cap,
+                pf.p2_busy,
+                pf.p2_cap,
+                pf.p3_busy,
+                pf.p3_cap,
+                pf.mk_wall,
+                self.stats.time[0].as_secs_f64(),
+                self.stats.time[1].as_secs_f64(),
+                self.stats.time[2].as_secs_f64(),
+                pf.p1prof,
+                mk.join(" "),
+                p3d.join(" "),
+                p2m.join(" "),
+                p1l.join(" "),
+                p3m.join(" "),
+            ),
+        );
     }
 
     fn rounds(&mut self, endpoints: usize, reductions: usize) {
@@ -557,8 +751,16 @@ impl<'a, 'r> Run<'a, 'r> {
                 (None, None)
             };
             let tp = Instant::now();
+            self.pf.round += 1;
+            self.pf.phase = 1;
+            let cands0 = self.made_cands;
+            let kept0 = self.cands.len();
+            let reds0 = self.made_reds;
+            let lvl0 = self.level.len;
             self.phase1(want1);
             self.stats.time[0] += tp.elapsed();
+            let d1 = tp.elapsed().as_secs_f64();
+            let kept_after1 = self.cands.len();
             debug(
                 self.start,
                 &format!(
@@ -579,8 +781,10 @@ impl<'a, 'r> Run<'a, 'r> {
                 want2
             };
             let tp = Instant::now();
+            self.pf.phase = 2;
             self.phase2(want2_now);
             self.stats.time[1] += tp.elapsed();
+            let d2 = tp.elapsed().as_secs_f64();
             debug(
                 self.start,
                 &format!(
@@ -599,9 +803,42 @@ impl<'a, 'r> Run<'a, 'r> {
             let factor = if self.best.is_some() { 1.5 } else { 4.5 };
             let budget =
                 (produce.mul_f64(factor).saturating_sub(check)).max(Duration::from_millis(10));
+            self.pf.phase = 3;
+            let best0 = self.best_len();
             self.phase3_levels(t1 + budget);
             self.stats.time[2] += t1.elapsed();
             check += t1.elapsed();
+            let rel = |c: Option<Instant>| {
+                c.map_or(-1.0, |c| c.saturating_duration_since(self.start).as_secs_f64())
+            };
+            prof(
+                self.start,
+                &format!(
+                    "R round={} start={:.4} p1={:.4} p2={:.4} p3={:.4} budget3={:.4} p1cut={:.4} p2cut={:.4} limit={:.4} want1={} want2={} made_cands={} new_cands={} kept_new={} kept_after2={} new_reds={} level={}->{} best={}->{} stopped={}",
+                    self.pf.round,
+                    (t0 - self.start).as_secs_f64(),
+                    d1,
+                    d2,
+                    t1.elapsed().as_secs_f64(),
+                    budget.as_secs_f64(),
+                    rel(self.p1_cut),
+                    rel(self.p2_cut),
+                    (self.limit - self.start).as_secs_f64(),
+                    want1,
+                    want2_now,
+                    self.made_cands,
+                    self.made_cands - cands0,
+                    kept_after1 as i64 - kept0 as i64,
+                    self.cands.len(),
+                    self.made_reds - reds0,
+                    lvl0,
+                    self.level.len,
+                    best0,
+                    self.best_len(),
+                    self.stopped()
+                ),
+            );
+            self.pf.phase = 0;
             if self.stopped() || self.level.len > 40 {
                 return;
             }
@@ -693,11 +930,17 @@ impl<'a, 'r> Run<'a, 'r> {
             let close = Close::new(self.p1_cut);
             let idle = AtomicUsize::new(0);
             let out = Mutex::new(vec![]);
+            let tstats = Mutex::new(vec![]);
+            let reason = AtomicUsize::new(0);
+            let scope_t0 = Instant::now();
             std::thread::scope(|s| {
                 for _ in 0..threads {
                     s.spawn(|| {
                         let mut local = vec![];
                         let mut n = 0;
+                        let mut busy = 0f64;
+                        let mut nj = 0usize;
+                        let mut pp = [0u64; 24];
                         loop {
                             if stop.load(Ordering::Relaxed) || close.is_raised() {
                                 break;
@@ -705,10 +948,17 @@ impl<'a, 'r> Run<'a, 'r> {
                             let j = claimed.fetch_add(1, Ordering::Relaxed);
                             if j >= jobs.len() {
                                 if (idle.fetch_add(1, Ordering::Relaxed) + 1) * 4 >= threads {
+                                    let _ = reason.compare_exchange(
+                                        0,
+                                        2,
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed,
+                                    );
                                     close.raise();
                                 }
                                 break;
                             }
+                            let tj = Instant::now();
                             let (pair, ref prefix) = jobs[j];
                             let pair = pair as usize;
                             let (st, d) = root.after_pair(prefix, d0[pair], t, pair);
@@ -725,18 +975,87 @@ impl<'a, 'r> Run<'a, 'r> {
                             let left = len - prefix.len() as u8;
                             p1_run(&mut srch, &st, d, left, last, 2, &close, &mut spill);
                             n += srch.nodes;
+                            for (a, b) in pp.iter_mut().zip(srch.prof) {
+                                *a += b;
+                            }
+                            drop(srch);
+                            busy += tj.elapsed().as_secs_f64();
+                            nj += 1;
                             let k: usize = eps.iter().map(|e| e.1.count_ones() as usize).sum();
                             if found.fetch_add(k, Ordering::Relaxed) + k >= need {
+                                let _ = reason.compare_exchange(
+                                    0,
+                                    1,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                );
                                 close.raise();
                             }
                             local.push((j, eps, spill));
                         }
+                        tstats.lock().unwrap().push((
+                            busy,
+                            scope_t0.elapsed().as_secs_f64(),
+                            nj,
+                            pp,
+                        ));
                         nodes.fetch_add(n, Ordering::Relaxed);
                         out.lock().unwrap().extend(local);
                     });
                 }
             });
             self.stats.nodes1 += nodes.load(Ordering::Relaxed);
+            let p1_wall = scope_t0.elapsed().as_secs_f64();
+            let mut p1_busy_b = 0.0;
+            {
+                let ts = tstats.into_inner().unwrap();
+                let busy: f64 = ts.iter().map(|x| x.0).sum();
+                p1_busy_b = busy;
+                let first = ts.iter().map(|x| x.1).fold(f64::MAX, f64::min);
+                let lastx = ts.iter().map(|x| x.1).fold(0.0, f64::max);
+                let jobs_run: usize = ts.iter().map(|x| x.2).sum();
+                let mut pp = [0u64; 24];
+                for x in &ts {
+                    for k in 0..24 {
+                        pp[k] += x.3[k];
+                    }
+                }
+                for k in 0..24 {
+                    self.pf.p1prof[k] += pp[k];
+                }
+                self.pf.p1_busy += busy;
+                self.pf.p1_cap += p1_wall * threads as f64;
+                let e = &mut self.pf.p1_len[len as usize];
+                e.0 += p1_wall;
+                e.1 += busy;
+                e.2 += nodes.load(Ordering::Relaxed);
+                e.3 += pp[12];
+                if self.best.is_some() || len >= 14 {
+                    let cutr = if self.p1_cut.is_some_and(|c| Instant::now() >= c) {
+                        3
+                    } else {
+                        0
+                    };
+                    prof(
+                        self.start,
+                        &format!(
+                            "P1 len={} wall={:.4} busy={:.4} util={:.3} first_exit={:.4} tail={:.4} reason={} cut={} jobs_run={} nodes={} eps={}",
+                            len,
+                            p1_wall,
+                            busy,
+                            busy / (p1_wall * threads as f64),
+                            first,
+                            lastx - first,
+                            reason.load(Ordering::Relaxed),
+                            cutr,
+                            jobs_run,
+                            nodes.load(Ordering::Relaxed),
+                            pp[12],
+                        ),
+                    );
+                }
+            }
+            let _ = p1_busy_b;
             if self.stopped() {
                 // The run is over: these endpoints would never be searched (making their
                 // candidates took up to seconds past the time limit in long runs).
@@ -767,16 +1086,44 @@ impl<'a, 'r> Run<'a, 'r> {
             let limit = self.useful_l12();
             let made = Mutex::new(vec![]);
             let (p2, cube) = (&self.t.p2, &self.cube);
+            let mkst = Mutex::new([MkStat::default(); 32]);
             crate::par::for_chunks(eps.len(), 32, |r| {
                 let mut out = vec![];
-                make_candidates(p2, cube, &eps[r.clone()], limit, &mut out);
+                let mut st = [MkStat::default(); 32];
+                make_candidates_st(p2, cube, &eps[r.clone()], limit, &mut out, &mut st);
                 made.lock().unwrap().push((r.start, out));
+                let mut g = mkst.lock().unwrap();
+                for (a, b) in g.iter_mut().zip(st.iter()) {
+                    a.frames += b.frames;
+                    a.unseen += b.unseen;
+                    a.cd_drop += b.cd_drop;
+                    a.dt_drop += b.dt_drop;
+                    a.kept += b.kept;
+                    for k in 0..24 {
+                        a.h2[k] += b.h2[k];
+                        a.cd_of_dt_drop[k] += b.cd_of_dt_drop[k];
+                        a.cd_over[k] += b.cd_over[k];
+                    }
+                }
             });
+            for (a, b) in self.pf.mk.iter_mut().zip(mkst.into_inner().unwrap().iter()) {
+                a.frames += b.frames;
+                a.unseen += b.unseen;
+                a.cd_drop += b.cd_drop;
+                a.dt_drop += b.dt_drop;
+                a.kept += b.kept;
+                for k in 0..24 {
+                    a.h2[k] += b.h2[k];
+                    a.cd_of_dt_drop[k] += b.cd_of_dt_drop[k];
+                    a.cd_over[k] += b.cd_over[k];
+                }
+            }
             let mut made = made.into_inner().unwrap();
             made.sort_unstable_by_key(|m| m.0);
             self.made_cands += eps.iter().map(|e| e.1.count_ones() as usize).sum::<usize>();
             self.cands.extend(made.into_iter().flat_map(|m| m.1));
             self.cand_time += tc.elapsed();
+            self.pf.mk_wall += tc.elapsed().as_secs_f64();
         }
         self.stats.endpoints = self.made_cands;
     }
@@ -829,12 +1176,17 @@ impl<'a, 'r> Run<'a, 'r> {
             .map(|c| c.moves1.len() + c.h2.max(c.done2) as usize)
             .min()
             .unwrap_or(99);
+        let best_known = self.best.is_some();
         while self.made_reds < want
             && !self.stopped()
             && t12 <= cap
             && !self.p2_cut.is_some_and(|c| Instant::now() >= c)
         {
-            for r in self.phase2_level(t12, want - self.made_reds) {
+            let tl = Instant::now();
+            let made0 = self.made_reds;
+            let lvl = self.phase2_level(t12, want - self.made_reds);
+            let kept_n = lvl.len();
+            for r in lvl {
                 let key = (r.frame, r.c3);
                 match self.red_index.get(&key) {
                     Some(&i) if self.reds[i].moves12.len() <= r.moves12.len() => {}
@@ -844,6 +1196,44 @@ impl<'a, 'r> Run<'a, 'r> {
                         self.reds.push(r);
                         self.made_reds += 1;
                     }
+                }
+            }
+            {
+                let wall = tl.elapsed().as_secs_f64();
+                let l = self.pf.last2;
+                let mi = if best_known { (self.best_len() - t12).min(31) } else { 31 };
+                let e = &mut self.pf.p2_margin[mi];
+                e.0 += wall;
+                e.1 += l.0;
+                e.2 += l.8;
+                e.3 += (self.made_reds - made0) as u64;
+                e.4 += 1;
+                self.pf.p2_busy += l.0;
+                self.pf.p2_cap += wall * self.threads as f64;
+                if best_known {
+                    prof(
+                        self.start,
+                        &format!(
+                            "P2 t12={} margin={} want={} wall={:.4} busy={:.4} util={:.3} todo={} started={} split={} tasks={} finished={} seen={} kept={} new={} nodes={} cut={} stop={}",
+                            t12,
+                            mi,
+                            want,
+                            wall,
+                            l.0,
+                            l.0 / (wall * self.threads as f64),
+                            l.3,
+                            l.4,
+                            l.5,
+                            l.6,
+                            l.7,
+                            l.1,
+                            kept_n,
+                            self.made_reds - made0,
+                            l.8,
+                            self.p2_cut.is_some_and(|c| Instant::now() >= c),
+                            self.stopped()
+                        ),
+                    );
                 }
             }
             t12 += 1;
@@ -896,8 +1286,14 @@ impl<'a, 'r> Run<'a, 'r> {
         // Threads that may be about to add tasks.
         let splitting = AtomicUsize::new(0);
         let next = AtomicUsize::new(0);
+        let busy_ns = AtomicU64::new(0);
+        let seen_all = AtomicU64::new(0);
+        let started = AtomicUsize::new(0);
+        let nsplit = AtomicUsize::new(0);
+        let ntasks = AtomicUsize::new(0);
         // Search `todo[k]` whole, or one task of it (number `i`).
         let run = |k: usize, i: usize, task: Option<&Task2>| {
+            let tr = Instant::now();
             let c = &cands[todo[k]];
             let (rot, last1, first) = phase2_root(c);
             let rot_inv = transpose(&rot);
@@ -944,10 +1340,12 @@ impl<'a, 'r> Run<'a, 'r> {
             };
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
             made.fetch_add(local.len(), Ordering::Relaxed);
+            seen_all.fetch_add(seen as u64, Ordering::Relaxed);
             if !srch.aborted {
                 finished[k].fetch_add(1, Ordering::Relaxed);
             }
             out.lock().unwrap().push(((k, i), local));
+            busy_ns.fetch_add(tr.elapsed().as_nanos() as u64, Ordering::Relaxed);
         };
         std::thread::scope(|s| {
             for _ in 0..self.threads.min(todo.len()).max(1) {
@@ -977,6 +1375,7 @@ impl<'a, 'r> Run<'a, 'r> {
                             splitting.fetch_sub(1, Ordering::SeqCst);
                             continue;
                         }
+                        started.fetch_add(1, Ordering::Relaxed);
                         let c = &cands[todo[k]];
                         let l2 = (t12 - c.moves1.len()) as u8;
                         let slack = l2.saturating_sub(c.h2);
@@ -990,6 +1389,8 @@ impl<'a, 'r> Run<'a, 'r> {
                         let tasks = Search2::new(&t.p2)
                             .tasks(c.centre, &c.tau, c.dt, l2, last1, first, depth);
                         parts[k].store(tasks.len(), Ordering::Relaxed);
+                        nsplit.fetch_add(1, Ordering::Relaxed);
+                        ntasks.fetch_add(tasks.len(), Ordering::Relaxed);
                         pending
                             .lock()
                             .unwrap()
@@ -999,12 +1400,25 @@ impl<'a, 'r> Run<'a, 'r> {
                 });
             }
         });
+        let mut nfin = 0;
         for (k, &i) in todo.iter().enumerate() {
             if finished[k].load(Ordering::Relaxed) == parts[k].load(Ordering::Relaxed) {
+                nfin += 1;
                 let c = &mut self.cands[i];
                 c.done2 = c.done2.max((t12 - c.moves1.len()) as u8 + 1);
             }
         }
+        self.pf.last2 = (
+            busy_ns.load(Ordering::Relaxed) as f64 * 1e-9,
+            seen_all.load(Ordering::Relaxed),
+            made.load(Ordering::Relaxed) as u64,
+            todo.len(),
+            started.load(Ordering::Relaxed),
+            nsplit.load(Ordering::Relaxed),
+            ntasks.load(Ordering::Relaxed),
+            nfin,
+            nodes.load(Ordering::Relaxed),
+        );
         self.stats.nodes2 += nodes.load(Ordering::Relaxed);
         let mut v = out.into_inner().unwrap();
         v.sort_by_key(|x| x.0);
@@ -1055,7 +1469,57 @@ impl<'a, 'r> Run<'a, 'r> {
                 self.start,
                 &format!("phase 3: total {lo}, nodes {}", self.stats.nodes3),
             );
-            match self.phase3_level(lo, deadline) {
+            let tl = Instant::now();
+            let res = self.phase3_level(lo, deadline);
+            {
+                let wall = tl.elapsed().as_secs_f64();
+                let l = self.pf.last3;
+                let mi = if best == usize::MAX { 31 } else { (best - lo).min(31) };
+                let e = &mut self.pf.p3_margin[mi];
+                e.0 += wall;
+                e.1 += l.0;
+                e.2 += l.4;
+                e.3 += 1;
+                e.4 += res.is_some() as u64;
+                self.pf.p3_busy += l.0;
+                self.pf.p3_cap += wall * self.threads as f64;
+                if best != usize::MAX && wall > 0.002 {
+                    prof(
+                        self.start,
+                        &format!(
+                            "P3 total={} margin={} wall={:.4} busy={:.4} util={:.3} reds={} jobs={} ran={} nodes={} found={} deadline={}",
+                            lo,
+                            mi,
+                            wall,
+                            l.0,
+                            l.0 / (wall * self.threads as f64),
+                            l.3,
+                            l.1,
+                            l.2,
+                            l.4,
+                            res.is_some(),
+                            Instant::now() >= deadline
+                        ),
+                    );
+                }
+            }
+            if let Some((r, ref sol)) = res {
+                let red = &self.reds[r];
+                prof(
+                    self.start,
+                    &format!(
+                        "IMP round={} total={} l1={} l2={} l3={} h3={} best_before={}",
+                        self.pf.round,
+                        lo,
+                        red.len1,
+                        red.moves12.len() - red.len1,
+                        sol.len(),
+                        red.h3,
+                        best
+                    ),
+                );
+            }
+            match res {
                 Some((r, sol)) => self.record(r, &sol),
                 None => {
                     if Instant::now() >= deadline {
@@ -1102,6 +1566,11 @@ impl<'a, 'r> Run<'a, 'r> {
             }
         }
         let result = Mutex::new(None::<(usize, Vec<u8>)>);
+        let busy_ns = AtomicU64::new(0);
+        let ran = AtomicUsize::new(0);
+        let depth_stats: Vec<(AtomicU64, AtomicU64, AtomicU64)> = (0..32)
+            .map(|_| (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)))
+            .collect();
         let found = AtomicBool::new(false);
         let nodes = AtomicU64::new(0);
         let finished: Vec<AtomicUsize> = (0..reds.len()).map(|_| AtomicUsize::new(0)).collect();
@@ -1110,6 +1579,8 @@ impl<'a, 'r> Run<'a, 'r> {
             if found.load(Ordering::Relaxed) || Instant::now() >= deadline {
                 return;
             }
+            let tr = Instant::now();
+            ran.fetch_add(1, Ordering::Relaxed);
             let (i, task) = &jobs[j];
             let r = &reds[*i];
             let d = (total - r.moves12.len()) as u8;
@@ -1121,6 +1592,12 @@ impl<'a, 'r> Run<'a, 'r> {
                 None => srch.search_depth(&r.c3, d),
             };
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
+            let el = tr.elapsed().as_nanos() as u64;
+            busy_ns.fetch_add(el, Ordering::Relaxed);
+            let ds = &depth_stats[(d as usize).min(31)];
+            ds.0.fetch_add(el, Ordering::Relaxed);
+            ds.1.fetch_add(srch.nodes, Ordering::Relaxed);
+            ds.2.fetch_add(1, Ordering::Relaxed);
             match sol {
                 Some(sol) => {
                     found.store(true, Ordering::Relaxed);
@@ -1136,6 +1613,19 @@ impl<'a, 'r> Run<'a, 'r> {
             }
         });
         self.stats.nodes3 += nodes.load(Ordering::Relaxed);
+        for (k, ds) in depth_stats.iter().enumerate() {
+            let e = &mut self.pf.p3_depth[k];
+            e.0 += ds.0.load(Ordering::Relaxed) as f64 * 1e-9;
+            e.1 += ds.1.load(Ordering::Relaxed);
+            e.2 += ds.2.load(Ordering::Relaxed);
+        }
+        self.pf.last3 = (
+            busy_ns.load(Ordering::Relaxed) as f64 * 1e-9,
+            jobs.len(),
+            ran.load(Ordering::Relaxed),
+            order.len(),
+            nodes.load(Ordering::Relaxed),
+        );
         for i in 0..self.reds.len() {
             if (parts[i] > 0 && finished[i].load(Ordering::Relaxed) == parts[i])
                 || pruned.contains(&i)

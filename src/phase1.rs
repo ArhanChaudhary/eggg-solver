@@ -977,6 +977,8 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     pub nodes: u64,
     /// Table entries read (each a likely cache miss): children's distances, move masks.
     pub reads: u64,
+    /// Profiling counters (see `PROF_NAMES` in solver.rs).
+    pub prof: [u64; 24],
     pub on_endpoint: F,
     pub stop: bool,
     pub abort: Option<&'a std::sync::atomic::AtomicBool>,
@@ -1088,6 +1090,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             path: Vec::with_capacity(32),
             nodes: 0,
             reads: 0,
+            prof: [0; 24],
             on_endpoint,
             stop: false,
             abort: None,
@@ -1201,6 +1204,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 self.batch.clear();
                 return;
             }
+            self.prof[3] += 1;
+            self.prof[16] += cur.len() as u64;
             if matches!(
                 mt.kind,
                 crate::p1mask::MaskKind::Reduced | crate::p1mask::MaskKind::Pair
@@ -1217,6 +1222,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     // own entry, as in `dfs_eq`; they are all queued, or with one move left
                     // tested.
                     let (d, left) = (nd.d, nd.left);
+                    self.prof[4] += 1;
+                    if left == 2 {
+                        self.prof[17] += 1;
+                    }
                     let allowed = ALLOWED_AFTER[nd.last as usize];
                     let (dec, eq) = mt.get_dec_eq(nd.idx, nd.sym);
                     let (dec, eq) = (dec & allowed, eq & allowed);
@@ -1247,9 +1256,16 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 }
                 // A node whose wing parity cannot reach an endpoint in moves left = distance
                 // moves (its entry's viability bit, see `MaskTable::add_viable`) is dropped.
+                self.prof[5] += 1;
                 if viable && !mt.viable(nd.idx, nd.parity) {
                     self.reads += 1;
+                    self.prof[6] += 1;
                     continue;
+                }
+                if nd.left == 1 {
+                    self.prof[18] += 1;
+                } else if nd.left == 2 {
+                    self.prof[19] += 1;
                 }
                 let mut a =
                     mt.get(t, nd.idx, nd.sym, &s, self.pair) & ALLOWED_AFTER[nd.last as usize];
@@ -1408,6 +1424,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             return;
         }
         if left == 1 {
+            self.prof[14] += 1;
             self.leaf(s, d, last, None, trailing_run(&self.path), None);
             return;
         }
@@ -1416,11 +1433,13 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         let mt = t.mask.as_ref().unwrap();
         if d >= left {
             if d == left {
+                self.prof[1] += 1;
                 self.push_batch(*s, st.rank24(s.masks().0) as u64, left, last, None, d);
             }
             return;
         }
         let allowed = ALLOWED_AFTER[last];
+        self.prof[0] += 1;
         let (dec, eq) = mt.get_dec_eq(r.0, r.1);
         let (dec, eq) = (dec & allowed, eq & allowed);
         self.nodes += allowed.count_ones() as u64;
@@ -1495,6 +1514,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             let dc = d + 1 - 2 * (dec >> m & 1) as u8 - (eq >> m & 1) as u8;
             let c = s.apply(m, t);
             if batched >> m & 1 == 1 {
+                self.prof[2] += 1;
+                if dc < left - 1 {
+                    self.prof[20] += 1;
+                }
                 let i = st.rank24(c.masks().0) as u64;
                 self.push_batch(c, i, left - 1, m, Some(m as u8), dc);
                 if self.batch.len() >= mt.batch {
@@ -1503,6 +1526,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             } else {
                 self.path.push(m as u8);
                 if left == 2 {
+                    self.prof[15] += 1;
                     self.leaf(&c, dc, m, None, trailing_run(&self.path), None);
                 } else {
                     self.dfs_eq(&c, dc, left - 1, m, rs[m]);
@@ -1550,6 +1574,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         }
         // Every allowed move is a node (the ones not tested after a stop are taken back).
         self.nodes += allowed.count_ones() as u64;
+        self.prof[7] += 1;
+        if d == 0 {
+            self.prof[13] += 1;
+        }
         // The moves that continue the run (on the last move's axis).
         let same = SAME_AXIS[last];
         let t = self.t;
@@ -1565,6 +1593,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         if check_staged && d >= 1 {
             test &= WIDE_MOVES;
         }
+        self.prof[8] += test.count_ones() as u64;
         let centres = s.centres;
         while test != 0 {
             let m = test.trailing_zeros() as usize;
@@ -1572,6 +1601,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             if check_staged && !t.staged_after(&centres, m) {
                 continue;
             }
+            self.prof[9] += 1;
             let excl = unsafe { *t.p2_frames.get_unchecked(m) } as u32
                 | run_frames as u32 & 0u32.wrapping_sub(same >> m & 1);
             let p = unsafe { t.wing_dst.get_unchecked(m) }.gather(&pos);
@@ -1584,6 +1614,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             if frames == 0 {
                 continue;
             }
+            self.prof[10] += 1;
             let c = s.apply(m, self.t);
             if staging.is_none() && !check_staged {
                 self.reads += 1;
@@ -1598,6 +1629,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 }
             }
             if frames != 0 {
+                self.prof[11] += 1;
+                self.prof[12] += frames.count_ones() as u64;
                 if let Some((id, mv)) = batch {
                     self.set_batch_path(id);
                     self.path.extend(mv);
