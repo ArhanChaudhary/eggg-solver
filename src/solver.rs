@@ -184,6 +184,17 @@ fn transpose(m: &Mat) -> Mat {
     t
 }
 
+/// Experiment (prof/rebal): EGGG_MARGIN overrides `DEEPEST_MARGIN`.
+fn deepest_margin() -> usize {
+    static M: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("EGGG_MARGIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEEPEST_MARGIN)
+    })
+}
+
 fn p2_mult() -> Option<f64> {
     static M: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
     *M.get_or_init(|| {
@@ -800,7 +811,7 @@ impl<'a, 'r> Run<'a, 'r> {
     /// The longest reduction that could still lead to a shorter solution at the deepest
     /// phase-2 level (`DEEPEST_MARGIN`); unlimited before the first solution.
     fn useful_l12(&self) -> usize {
-        self.best_len().saturating_sub(DEEPEST_MARGIN)
+        self.best_len().saturating_sub(deepest_margin())
     }
 
     /// Drop the candidates and reductions that can no longer lead to a shorter solution
@@ -836,7 +847,7 @@ impl<'a, 'r> Run<'a, 'r> {
         } else if elapsed < 6.0 {
             14
         } else {
-            DEEPEST_MARGIN
+            deepest_margin()
         };
         let cap = self.best_len().saturating_sub(margin).min(64);
         let mut t12 = self
