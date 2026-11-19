@@ -1,4 +1,5 @@
-//! Phase-1 move masks: per staging state, the moves that decrease its staging distance.
+//! Phase-1 move masks: per staging state, the moves that decrease its staging distance (and,
+//! in the reduced table, those that keep it).
 //!
 //! Deep in the phase-1 tree almost every node is at exact staging distance = moves left, and
 //! then the children to search are exactly the distance-decreasing moves: one read of the
@@ -11,10 +12,14 @@
 //! per state (4 bytes, 18.9 GB); and the reduced one, indexed like the symmetry-reduced
 //! staging table (15582 x 6435 states, each the image of the searched state under the
 //! symmetry that takes its U/D mask to the class representative), with the masks over all 36
-//! outer block moves (8 bytes, 0.8 GB): the searched state's 27-move mask is the stored mask
-//! with each move conjugated by that symmetry (five byte lookups). Its entries also hold two
+//! outer block moves: the searched state's 27-move mask is the stored mask with each move
+//! conjugated by that symmetry (five byte lookups). Its entries (16 bytes, one cache line;
+//! 1.6 GB) hold the masks of the moves that decrease and that keep the distance, and two
 //! parity-viability bits (see [`MaskTable::add_viable`]): a node at distance = moves left
-//! whose wing parity cannot end at an endpoint is dropped as soon as its entry is read.
+//! whose wing parity cannot end at an endpoint is dropped as soon as its entry is read, and
+//! a node with slack (distance < moves left) has its children's exact distances from its own
+//! entry, one read instead of one per child. The search then needs no staging table but for
+//! the few nodes above the job prefixes (the symmetry-reduced one, 25 MB, does).
 //!
 //! For the per-pair searches (see [`crate::p1pat`]), the pair table holds the same for the
 //! pattern distance: by the reduced pattern index (3.5e9 states), the 36-move masks of the
@@ -67,7 +72,9 @@ pub struct MaskTable {
     /// Pending batch nodes that start a batch run (`EGGG_P1_BATCH`, default 32).
     pub batch: usize,
     big: HugeBuf<u32>,
-    red: HugeBuf<u64>,
+    /// The reduced table's entries: the decreasing moves' 36-bit mask with the viability bits
+    /// above it, and the equal moves' mask (16 bytes, aligned: one cache line).
+    red: HugeBuf<[u64; 2]>,
     /// The pair table: 5 bytes per entry (and 3 bytes of padding).
     pair: HugeBuf<u8>,
     /// The pair table's entries are computed when read, from the pattern table (tests).
@@ -106,29 +113,38 @@ fn flags_of(ud: u32, rl: u32) -> V32 {
     flags
 }
 
-/// The mask over `moves` of the state with U/D mask `ud` and R/L mask `rl`, from the large
-/// staging table.
-fn mask_of(t: &P1Tables, ud: u32, rl: u32, moves: &[V32]) -> u64 {
+/// The staging table's index of the state with U/D mask `ud` (complement `nud`) and R/L mask
+/// `rl`: the large table's, or the symmetry-reduced one's.
+fn staging_index(t: &P1Tables, ud: u32, nud: u32, rl: u32) -> u64 {
     let st = &t.staging;
-    let v = t.table.get(st.big_index(ud, rl));
+    if t.big {
+        st.big_index_n(ud, nud, rl)
+    } else {
+        st.fast_index(unsafe { *st.info(ud) }, rl)
+    }
+}
+
+/// The masks over `moves` of the moves that decrease and that keep the staging distance of
+/// the state with U/D mask `ud` and R/L mask `rl`, from the staging table (either).
+fn masks_of(t: &P1Tables, ud: u32, rl: u32, moves: &[V32]) -> (u64, u64) {
+    let v = t.table.get(staging_index(t, ud, !ud & MASK24, rl));
     if v == 3 {
-        return 0;
+        return (0, 0);
     }
     let flags = flags_of(ud, rl);
     let mut idx = [0u64; N36];
     for (e, mv) in idx.iter_mut().zip(moves) {
         let (a, b, c) = flag_masks(&flags.gather(mv));
-        *e = st.big_index_n(a, b, c);
+        *e = staging_index(t, a, b, c);
         t.table.prefetch(*e);
     }
-    let want = (v + 2) % 3;
-    let mut mask = 0;
+    let (mut dec, mut eq) = (0, 0);
     for (m, &e) in idx[..moves.len()].iter().enumerate() {
-        if t.table.get(e) == want {
-            mask |= 1 << m;
-        }
+        let w = t.table.get(e);
+        dec |= ((w == (v + 2) % 3) as u64) << m;
+        eq |= ((w == v) as u64) << m;
     }
-    mask
+    (dec, eq)
 }
 
 impl MaskTable {
@@ -251,8 +267,14 @@ impl MaskTable {
         }
         let info = unsafe { *st.info_of_rank(i) };
         let j = st.fast_index_flags(info, &s.centre_flags());
-        crate::table::prefetch(unsafe { self.red.as_ptr().add(j as usize) });
+        self.prefetch_entry(j);
         (j, info as u8)
+    }
+
+    /// Prefetch the reduced table's entry `j`.
+    #[inline(always)]
+    pub fn prefetch_entry(&self, j: u64) {
+        crate::table::prefetch(unsafe { self.red.as_ptr().add(j as usize) });
     }
 
     /// Whether a node at staging distance = moves left (>= 1) with reduced index `i` (as
@@ -260,7 +282,24 @@ impl MaskTable {
     /// viability bit (see [`MaskTable::add_viable`]; reduced table only).
     #[inline(always)]
     pub fn viable(&self, i: u64, odd: bool) -> bool {
-        self.red[i as usize] >> (VIABLE_SHIFT + odd as u32) & 1 == 1
+        self.red[i as usize][0] >> (VIABLE_SHIFT + odd as u32) & 1 == 1
+    }
+
+    /// The 27-move masks of the moves that decrease and that keep the staging distance, of
+    /// the state with reduced index `i` and symmetry `sym` (see [`MaskTable::resolve`];
+    /// reduced table only).
+    #[inline(always)]
+    pub fn get_dec_eq(&self, i: u64, sym: u8) -> (u32, u32) {
+        let [d, e] = self.red[i as usize];
+        let c = unsafe { self.conj.get_unchecked(sym as usize) };
+        let f = |x: u64| {
+            c[0][(x & 255) as usize]
+                | c[1][(x >> 8 & 255) as usize]
+                | c[2][(x >> 16 & 255) as usize]
+                | c[3][(x >> 24 & 255) as usize]
+                | c[4][(x >> 32 & 255) as usize]
+        };
+        (f(d), f(e))
     }
 
     /// The 27-move mask of state `s` (index `i` and symmetry `sym` as above); the virtual
@@ -280,7 +319,7 @@ impl MaskTable {
                         (self.pair.as_ptr().add(5 * i as usize) as *const u64).read_unaligned()
                     }
                 } else {
-                    self.red[i as usize]
+                    self.red[i as usize][0]
                 };
                 // (The conjugation lookups of the fifth byte read only its four mask bits,
                 // not the reduced entries' viability bits.)
@@ -315,7 +354,7 @@ impl MaskTable {
                 let ud = comb_unrank(rank as u32, 24, 8);
                 for j in 0..N_SPLIT {
                     let rl = pdep(t.staging.unl_inv[j] as u32, !ud & MASK24);
-                    let m = mask_of(t, ud, rl, &mv[..N_MOVES]) as u32;
+                    let m = masks_of(t, ud, rl, &mv[..N_MOVES]).0 as u32;
                     // SAFETY: each index is written by one thread only, within the buffer.
                     unsafe { *(ptr as *mut u32).add(rank * N_SPLIT + j) = m };
                 }
@@ -373,7 +412,7 @@ impl MaskTable {
         use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
         struct Ctx<'a> {
             st: &'a Staging,
-            red: &'a HugeBuf<u64>,
+            red: &'a HugeBuf<[u64; 2]>,
             mv: [V32; N36],
             axes: [u32; 3],
             /// Per entry, per parity (2 bits each): known, viable.
@@ -387,7 +426,7 @@ impl MaskTable {
             }
             let (ud, rl) = c.st.rep_of(i);
             let flags = flags_of(ud, rl);
-            let mut dec = c.red[i as usize] & MASK36;
+            let mut dec = c.red[i as usize][0] & MASK36;
             let mut v = false;
             while dec != 0 && !v {
                 let m = dec.trailing_zeros() as usize;
@@ -423,27 +462,28 @@ impl MaskTable {
         for (i, e) in memo.into_iter().enumerate() {
             let e = e.into_inner();
             let bits = (e >> 1 & 1) as u64 | ((e >> 3 & 1) as u64) << 1;
-            if self.red[i] & MASK36 != 0 {
+            let e = &mut self.red[i][0];
+            if *e & MASK36 != 0 {
                 dead[0] += (bits & 1 == 0) as u64;
                 dead[1] += (bits & 2 == 0) as u64;
             }
-            self.red[i] = self.red[i] & MASK36 | bits << VIABLE_SHIFT;
+            *e = *e & MASK36 | bits << VIABLE_SHIFT;
         }
         dead
     }
 
-    /// The reduced table, from the large staging table (`t.big`).
+    /// The reduced table (without the viability bits), from the staging table (either).
     pub fn generate_reduced(t: &P1Tables) -> MaskTable {
-        assert!(t.big);
         let n = N_CLASSES_A * N_SPLIT;
-        let mut red = HugeBuf::<u64>::zeroed(n);
+        let mut red = HugeBuf::<[u64; 2]>::zeroed(n);
         let ptr = red.as_mut_slice().as_mut_ptr() as usize;
         let mv = moves36();
         crate::par::for_chunks(n, 1 << 12, |r| {
             for i in r {
                 let (ud, rl) = t.staging.rep_of(i as u64);
+                let (dec, eq) = masks_of(t, ud, rl, &mv);
                 // SAFETY: each index is written by one thread only, within the buffer.
-                unsafe { *(ptr as *mut u64).add(i) = mask_of(t, ud, rl, &mv) };
+                unsafe { *(ptr as *mut [u64; 2]).add(i) = [dec, eq] };
             }
         });
         MaskTable {
@@ -454,10 +494,10 @@ impl MaskTable {
     }
 }
 
-/// Load (or generate from the large staging table, and save) a mask table in `dir`: the
-/// large one (`big`, 18.9 GB, `p1-mask-big.tab`) or the reduced one with the viability bits
-/// (0.8 GB, `p1-mask-v.tab`; made from `p1-mask.tab`, the same without them, if present).
-/// `EGGG_P1_MASK_VIRTUAL` set: no table, masks computed when needed (slow; tests).
+/// Load (or generate from the staging table, and save) a mask table in `dir`: the large one
+/// (`big`, 18.9 GB, `p1-mask-big.tab`; from the large staging table) or the reduced one
+/// (1.6 GB, `p1-mask2.tab`; from either staging table). `EGGG_P1_MASK_VIRTUAL` set: no table,
+/// masks computed when needed (slow; tests).
 pub fn load(dir: &std::path::Path, t: &P1Tables, big: bool, verbose: bool) -> MaskTable {
     if std::env::var_os("EGGG_P1_MASK_VIRTUAL").is_some() {
         return MaskTable::virtual_table();
@@ -465,9 +505,8 @@ pub fn load(dir: &std::path::Path, t: &P1Tables, big: bool, verbose: bool) -> Ma
     if t.pat.is_some() {
         return load_pair(dir, t, verbose);
     }
-    // (The reduced table with the viability bits: "p1-mask-v"; "p1-mask" is the same without
-    // them, from which it is made when present.)
-    let name = if big { "p1-mask-big" } else { "p1-mask-v" };
+    // (The reduced table of earlier versions, without the equal masks: "p1-mask".)
+    let name = if big { "p1-mask-big" } else { "p1-mask2" };
     let path = dir.join(format!("{name}.tab"));
     let mut m = MaskTable::empty(if big {
         MaskKind::Big
@@ -487,22 +526,18 @@ pub fn load(dir: &std::path::Path, t: &P1Tables, big: bool, verbose: bool) -> Ma
         }
         return m;
     }
-    if !big && crate::table::load(&dir.join("p1-mask.tab"), "p1-mask", bytes).is_ok() {
-        m.conj = MaskTable::conj_tables();
-    } else {
-        drop(m);
-        if verbose {
-            eprintln!(
-                "generating the phase-1 move-mask table ({})...",
-                if big { "18.9 GB" } else { "0.8 GB" }
-            );
-        }
-        m = if big {
-            MaskTable::generate_big(t)
-        } else {
-            MaskTable::generate_reduced(t)
-        };
+    drop(m);
+    if verbose {
+        eprintln!(
+            "generating the phase-1 move-mask table ({})...",
+            if big { "18.9 GB" } else { "1.6 GB" }
+        );
     }
+    let mut m = if big {
+        MaskTable::generate_big(t)
+    } else {
+        MaskTable::generate_reduced(t)
+    };
     if !big {
         let t0 = std::time::Instant::now();
         let dead = m.add_viable(&t.staging);
@@ -575,9 +610,9 @@ mod tests {
     use super::*;
     use crate::cube::Cube;
 
-    /// The large and reduced tables' masks (as computed by their generators, for random
-    /// states) are the distance-decreasing moves (needs the large staging table in ./tables;
-    /// skipped without it).
+    /// The large and reduced tables' masks (as computed by their generators, from either
+    /// staging table, for random states) are the moves that decrease and keep the distance
+    /// (needs the large staging table in ./tables; skipped without it).
     #[test]
     fn masks_are_decreasing_moves() {
         let dir = std::path::Path::new("tables");
@@ -585,25 +620,67 @@ mod tests {
             return;
         }
         let t = crate::solver::load_p1(dir, true, 8, false);
+        let small = crate::solver::load_p1(dir, false, 8, false);
         let v = MaskTable::virtual_table();
         let mv = moves36();
         let conj = MaskTable::conj_tables();
         let mut rng = rand::thread_rng();
         for _ in 0..200 {
             let mut s = P1State::from_cube(&Cube::random(&mut rng));
+            let mut d = t.distance(&s);
             for k in 0..12 {
                 let want = v.get(&t, 0, 0, &s, crate::phase1::ALL_PAIRS);
+                let want_eq = (0..N_MOVES)
+                    .filter(|&m| t.distance(&s.apply(m, &t)) == d)
+                    .fold(0, |a, m| a | 1 << m);
                 let (ud, rl) = s.masks();
-                assert_eq!(mask_of(&t, ud, rl, &mv[..N_MOVES]) as u32, want);
-                // The reduced table's entry: the 36-move mask of the symmetric image.
+                let (dec, eq) = masks_of(&t, ud, rl, &mv[..N_MOVES]);
+                assert_eq!((dec as u32, eq as u32), (want, want_eq));
+                // The reduced table's entry: the 36-move masks of the symmetric image (from
+                // either staging table).
                 let info = unsafe { *t.staging.info(ud) };
                 let j = t.staging.fast_index_flags(info, &s.centre_flags());
                 let (ru, rr) = t.staging.rep_of(j);
-                let e = mask_of(&t, ru, rr, &mv);
+                let e = masks_of(&t, ru, rr, &mv);
+                assert_eq!(masks_of(&small, ru, rr, &mv), e);
                 let c = &conj[(info & 255) as usize];
-                let got = (0..5).fold(0, |a, k| a | c[k][(e >> (8 * k) & 255) as usize]);
-                assert_eq!(got, want);
-                s = s.apply((k * 5 + 1) % N_MOVES, &t);
+                let f = |x: u64| (0..5).fold(0, |a, k| a | c[k][(x >> (8 * k) & 255) as usize]);
+                assert_eq!((f(e.0), f(e.1)), (want, want_eq));
+                let m = (k * 5 + 1) % N_MOVES;
+                s = s.apply(m, &t);
+                d = t.distance(&s);
+            }
+        }
+    }
+
+    /// The reduced table's entries, as the search reads them (by the searched state's index
+    /// and symmetry), give the moves that decrease and keep the staging distance, by the
+    /// symmetry-reduced staging table (needs `p1-mask2.tab` in ./tables, made by
+    /// `eggg-solver gen --tier large`; skipped without it).
+    #[test]
+    fn reduced_entries_give_child_distances() {
+        let dir = std::path::Path::new("tables");
+        if !dir.join("p1-mask2.tab").exists() {
+            return;
+        }
+        let t = crate::solver::load_p1(dir, false, 8, false);
+        let mt = load(dir, &t, false, false);
+        let mut rng = rand::thread_rng();
+        for _ in 0..300 {
+            let mut s = P1State::from_cube(&Cube::random(&mut rng));
+            for k in 0..12 {
+                let d = t.distance(&s);
+                let (mut dec, mut eq) = (0, 0);
+                for m in 0..N_MOVES {
+                    let dc = t.distance(&s.apply(m, &t));
+                    dec |= ((dc + 1 == d) as u32) << m;
+                    eq |= ((dc == d) as u32) << m;
+                }
+                let i = mt.pre_index(&t, &s, crate::phase1::ALL_PAIRS);
+                let (j, sym) = mt.resolve(&t, i, &s, crate::phase1::ALL_PAIRS);
+                assert_eq!(mt.get_dec_eq(j, sym), (dec, eq));
+                assert_eq!(mt.get(&t, j, sym, &s, crate::phase1::ALL_PAIRS), dec);
+                s = s.apply((k * 7 + 2) % N_MOVES, &t);
             }
         }
     }

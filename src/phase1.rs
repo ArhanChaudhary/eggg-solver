@@ -1321,6 +1321,17 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             if self.t.mask.is_some() && !self.stop {
                 self.run_batch();
             }
+        } else if let Some(mt) = self
+            .t
+            .mask
+            .as_ref()
+            .filter(|m| m.kind == crate::p1mask::MaskKind::Reduced)
+        {
+            let r = mt.resolve(self.t, mt.pre_index(self.t, s, ALL_PAIRS), s, ALL_PAIRS);
+            self.dfs_eq(s, d, left, last, r);
+            if !self.stop {
+                self.run_batch();
+            }
         } else if self.t.big
             && self
                 .t
@@ -1336,6 +1347,124 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             self.dfs_t::<K_BIG>(s, d, left, last)
         } else {
             self.dfs_t::<K_SMALL>(s, d, left, last)
+        }
+    }
+
+    /// [`Search1::dfs`] over all pairs with the reduced move-mask table. A node with slack
+    /// (distance `d` < moves left `left`) has its children's exact distances from its own
+    /// entry (`r`: its reduced index and symmetry, the entry prefetched): the moves that
+    /// decrease and that keep the distance, and the others increase it. So it reads one entry
+    /// where [`Search1::dfs_t`] reads one per child. The children are searched as there, in
+    /// move order: those at distance = moves left (>= 2) are queued for a batch, the others
+    /// searched depth-first, their entries resolved and prefetched first.
+    fn dfs_eq(&mut self, s: &P1State, d: u8, left: u8, last: usize, r: (u64, u8)) {
+        if left == 0 {
+            if d == 0 {
+                let frames = self.t.endpoint_frames(s, trailing_run(&self.path));
+                if frames != 0 && !(self.on_endpoint)(&self.path, frames) {
+                    self.stop = true;
+                }
+            }
+            return;
+        }
+        if left == 1 {
+            self.leaf(s, d, last, None, trailing_run(&self.path), None);
+            return;
+        }
+        let t = self.t;
+        let st = &t.staging;
+        let mt = t.mask.as_ref().unwrap();
+        if d >= left {
+            if d == left {
+                self.push_batch(*s, st.rank24(s.masks().0) as u64, left, last, None);
+            }
+            return;
+        }
+        let allowed = ALLOWED_AFTER[last];
+        let (dec, eq) = mt.get_dec_eq(r.0, r.1);
+        let (dec, eq) = (dec & allowed, eq & allowed);
+        self.nodes += allowed.count_ones() as u64;
+        self.reads += 1;
+        if self
+            .abort
+            .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            self.stop = true;
+            return;
+        }
+        // The children that can still reach the goal: at distance d - 1 or d, and at d + 1
+        // if that is less than the moves left after the move.
+        let visit = if d + 1 < left { allowed } else { dec | eq };
+        // Those at distance = moves left after the move (batched if >= the batch minimum).
+        let tight = if d + 1 == left {
+            eq
+        } else if d + 2 == left {
+            visit & !(dec | eq)
+        } else {
+            0
+        };
+        let batched = if left > self.batch_min_left() {
+            tight
+        } else {
+            0
+        };
+        // The children searched depth-first with at least 2 moves left: their entries'
+        // indices (class info, prefetched, then the entry, prefetched), by move.
+        let mut rs = [(0u64, 0u8); N_MOVES];
+        if left >= 3 {
+            let flags = s.centre_flags();
+            let mut infos: [*const u32; N_MOVES] = [std::ptr::null(); N_MOVES];
+            let mut gs = [V32::ZERO; N_MOVES];
+            let mut a = visit & !batched;
+            while a != 0 {
+                let m = a.trailing_zeros() as usize;
+                a &= a - 1;
+                // SAFETY: m < N_MOVES.
+                let g = unsafe { child_flags(&flags, m, t) };
+                let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
+                let p = st.info(!nud & MASK24);
+                crate::table::prefetch(p);
+                unsafe {
+                    *infos.get_unchecked_mut(m) = p;
+                    *gs.get_unchecked_mut(m) = g;
+                }
+            }
+            let mut a = visit & !batched;
+            while a != 0 {
+                let m = a.trailing_zeros() as usize;
+                a &= a - 1;
+                unsafe {
+                    let info = **infos.get_unchecked(m);
+                    let j = st.fast_index_flags(info, gs.get_unchecked(m));
+                    mt.prefetch_entry(j);
+                    *rs.get_unchecked_mut(m) = (j, info as u8);
+                }
+            }
+        }
+        let mut a = visit;
+        while a != 0 {
+            let m = a.trailing_zeros() as usize;
+            a &= a - 1;
+            // d - 1, d or d + 1 (the masks are disjoint).
+            let dc = d + 1 - 2 * (dec >> m & 1) as u8 - (eq >> m & 1) as u8;
+            let c = s.apply(m, t);
+            if batched >> m & 1 == 1 {
+                self.push_batch(c, st.rank24(c.masks().0) as u64, dc, m, Some(m as u8));
+                if self.batch.len() >= mt.batch {
+                    self.run_batch();
+                }
+            } else {
+                self.path.push(m as u8);
+                if left == 2 {
+                    self.leaf(&c, dc, m, None, trailing_run(&self.path), None);
+                } else {
+                    self.dfs_eq(&c, dc, left - 1, m, rs[m]);
+                }
+                self.path.pop();
+            }
+            if self.stop {
+                return;
+            }
         }
     }
 

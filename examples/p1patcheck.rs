@@ -91,13 +91,18 @@ fn main() {
     let big = std::env::var_os("EGGG_P1_BIG").is_some();
     let pat = std::env::var("EGGG_P1_PAT").unwrap_or_else(|_| "small".into());
     let mask = std::env::var_os("EGGG_P1_MASK").is_some();
+    // (The reduced move-mask table needs only the small staging table.)
+    let mask_big = matches!(
+        std::env::var("EGGG_P1_MASK").as_deref(),
+        Ok("big") | Ok("virtual")
+    );
     let check = std::env::var_os("CHECK").is_some();
     let threads: usize = std::env::var("THREADS")
         .ok()
         .map(|s| s.parse().unwrap())
         .unwrap_or(1);
     let dir = std::path::Path::new("tables");
-    let mut p1 = load_p1(dir, big || mask, 8, false);
+    let mut p1 = load_p1(dir, big || mask_big, 8, false);
     p1.table.data.collapse();
     if pat != "none" {
         let t0 = Instant::now();
