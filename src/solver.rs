@@ -562,12 +562,25 @@ impl<'a, 'r> Run<'a, 'r> {
             debug(
                 self.start,
                 &format!(
-                    "phase 1: {} endpoints (length {}), nodes {}, {:.3} s, candidates made in {:.3} s",
+                    "phase 1: {} endpoints (length {}), nodes {}, {:.3} s, candidates made in {:.3} s{}",
                     self.made_cands,
                     self.level.len,
                     self.stats.nodes1,
                     self.stats.time[0].as_secs_f64(),
-                    self.cand_time.as_secs_f64()
+                    self.cand_time.as_secs_f64(),
+                    // The round's phase-1 cut, and how long after it phase 1 ended.
+                    self.p1_cut.map_or(String::new(), |c| {
+                        let now = Instant::now();
+                        let late = if now >= c {
+                            (now - c).as_secs_f64()
+                        } else {
+                            -(c - now).as_secs_f64()
+                        };
+                        format!(
+                            ", cut at {:.3} s, ended {late:+.3} s after it",
+                            (c - self.start).as_secs_f64()
+                        )
+                    })
                 ),
             );
             // A round whose phase 1 was cut short asks phase 2 for proportionally fewer
