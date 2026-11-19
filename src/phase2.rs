@@ -12,6 +12,7 @@ use crate::comb::{comb_rank, perm_rank, perm_unrank};
 use crate::cube::{B, Cube, D, F, L, R, U};
 use crate::moves::{ALLOWED_AFTER, Conj, MOVE_PERMS, N_MOVES, PHASE2_MASK, frame_rotation};
 use crate::phase1::Frame;
+use crate::simd::V32;
 use crate::table::{Mod3Table, UNSEEN};
 
 pub const P2_MOVES: [u8; 17] = [0, 1, 2, 4, 6, 7, 8, 9, 10, 11, 13, 15, 16, 17, 19, 22, 25];
@@ -549,17 +550,17 @@ impl<'a> Search2<'a> {
         after: u32,
         found: &mut dyn FnMut(&[u8]) -> bool,
     ) -> bool {
-        let tf = self.t.joint.as_ref().unwrap().fb.tau(tau);
-        self.joint_rec(cc, tau, &tf, dj, df, left, last, after, found)
+        let tt = self.t.joint.as_ref().unwrap().dual(tau);
+        self.joint_rec(cc, &tt, dj, df, left, last, after, found)
     }
 
-    /// [`Search2::dfs_joint`] below a state whose F/B view has tau `tf`.
+    /// [`Search2::dfs_joint`] below a state whose tau and F/B view's tau are `tt` (see
+    /// [`crate::p2joint::Joint::dual`]).
     #[allow(clippy::too_many_arguments)]
     fn joint_rec(
         &mut self,
         cc: u32,
-        tau: &[u8; 16],
-        tf: &[u8; 16],
+        tt: &V32,
         dj: u8,
         df: u8,
         left: u8,
@@ -577,9 +578,10 @@ impl<'a> Search2<'a> {
         let j = t.joint.as_ref().unwrap();
         let fb = &j.fb;
         let allowed = after & PHASE2_MASK & if left == 1 { last_mask(last) } else { u32::MAX };
-        // Stage 1: children within the centre bound; the class-table entries of both views
-        // prefetched (the class table is 3.3 MB: its misses would stall every index).
-        let mut kids = [(0u32, [0u8; 16], [0u8; 16], 0usize, 0usize, 0u8); 17];
+        // Stage 1: children within the centre bound, both taus moved at once; the class-table
+        // entries of both views prefetched (the class table is 3.3 MB: its misses would stall
+        // every index).
+        let mut kids = [(0u32, V32::ZERO, 0usize, 0usize, 0u8); 17];
         let mut nk = 0;
         for (i, &m) in P2_MOVES.iter().enumerate() {
             if allowed >> m & 1 == 0 {
@@ -589,13 +591,12 @@ impl<'a> Search2<'a> {
             if t.centre_dist[c2 as usize] >= left {
                 continue;
             }
-            let t2 = t.tau_move(tau, i);
-            let f2 = fb.tau_move(tf, i);
-            let ru = j.raw(c2 / 1680, &t2);
+            let t2 = j.dual_move(tt, i);
+            let ru = j.raw_lane::<0>(c2 / 1680, &t2);
             j.prefetch_cls(ru);
-            let rf = j.raw(fb.ud(c2), &f2);
+            let rf = j.raw_lane::<1>(fb.ud(c2), &t2);
             j.prefetch_cls(rf);
-            kids[nk] = (c2, t2, f2, ru, rf, m);
+            kids[nk] = (c2, t2, ru, rf, m);
             nk += 1;
         }
         self.nodes += nk as u64;
@@ -605,16 +606,16 @@ impl<'a> Search2<'a> {
         // Stage 2: table indices of both views, entries prefetched.
         let mut idx = [(0usize, 0usize); 17];
         for k in 0..nk {
-            let (c2, t2, f2, ru, rf, _) = &kids[k];
-            let a = j.index_raw(*ru, t2, c2 & 1);
+            let (c2, t2, ru, rf, _) = &kids[k];
+            let a = j.index_lane::<0>(*ru, t2, c2 & 1);
             j.prefetch(a);
-            let b = j.index_raw(*rf, f2, c2 & 1);
+            let b = j.index_lane::<1>(*rf, t2, c2 & 1);
             j.prefetch(b);
             idx[k] = (a, b);
         }
         // Stage 3: read, decode, descend.
         for k in 0..nk {
-            let (c2, t2, f2, _, _, m) = kids[k];
+            let (c2, t2, _, _, m) = kids[k];
             let (a, b) = idx[k];
             let d2 = Mod3Table::decode(dj, j.get(a));
             if d2 >= left {
@@ -628,7 +629,6 @@ impl<'a> Search2<'a> {
             let go = self.joint_rec(
                 c2,
                 &t2,
-                &f2,
                 d2,
                 e2,
                 left - 1,

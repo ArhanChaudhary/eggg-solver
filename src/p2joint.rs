@@ -53,6 +53,11 @@ pub struct Joint {
     pub ud_move: [[u8; 17]; 70],
     /// [`P2Tables::tau_move`] as two byte shuffles per move: (pl_inv, ph).
     tau_moves: [(V32, V32); 17],
+    /// The same for both views at once (see [`Joint::dual`]): tau's move in the low lane, the
+    /// F/B view's in the high lane.
+    dual_moves: [(V32, V32); 17],
+    /// [`conj`] by each symmetry as two byte shuffles in both lanes: (e_inv, e_map).
+    conj2: [(V32, V32); 8],
     pub table: HugeBuf<u64>,
     pub n: usize,
 }
@@ -378,13 +383,34 @@ impl Joint {
             }
         }
         let n = rep.len() * N_REST * 2;
-        let tau_moves = std::array::from_fn(|i| {
+        let tau_moves: [(V32, V32); 17] = std::array::from_fn(|i| {
             let (mut pl, mut ph) = (V32::ZERO, V32::ZERO);
             pl.0[..16].copy_from_slice(&p2.pl_inv[i]);
             ph.0[..16].copy_from_slice(&p2.ph[i]);
             (pl, ph)
         });
         let fb = FbView::new(p2);
+        let dual_moves = std::array::from_fn(|i| {
+            let (mut pre, mut post) = tau_moves[i];
+            pre.0[16..].copy_from_slice(&fb.moves[i].0);
+            post.0[16..].copy_from_slice(&fb.moves[i].1);
+            (pre, post)
+        });
+        let conj2 = std::array::from_fn(|k| {
+            let s: &Sym = &syms[k];
+            let (mut inv, mut map): (V32, V32) =
+                (V32(std::array::from_fn(|x| (x & 15) as u8)), V32::ZERO);
+            for h in [0, 16] {
+                for x in 0..12 {
+                    inv.0[h + s.e[x] as usize] = x as u8;
+                    map.0[h + x] = s.e[x];
+                }
+                for x in 12..16 {
+                    map.0[h + x] = x as u8;
+                }
+            }
+            (inv, map)
+        });
         Joint {
             syms,
             fb,
@@ -393,6 +419,8 @@ impl Joint {
             stab,
             ud_move,
             tau_moves,
+            dual_moves,
+            conj2,
             table: HugeBuf::zeroed(1),
             n,
         }
@@ -450,6 +478,45 @@ impl Joint {
             let sy = &self.syms[s];
             let u = crate::simd::shuf(&sy.e_map, &crate::simd::shuf(tau, &sy.e_inv));
             rest_rank(u.0[..16].try_into().unwrap())
+        };
+        ((c >> 3) as usize * N_REST + r) * 2 + pll as usize
+    }
+
+    /// Tau (low lane) and its F/B view's tau (high lane, see [`FbView`]) in one vector, which
+    /// [`Joint::dual_move`] moves with two byte shuffles.
+    pub fn dual(&self, tau: &[u8; 16]) -> V32 {
+        let mut v = V32::ZERO;
+        v.0[..16].copy_from_slice(tau);
+        v.0[16..].copy_from_slice(&self.fb.tau(tau));
+        v
+    }
+
+    /// [`Joint::dual`] after phase-2 move `i` (index in [`P2_MOVES`]).
+    #[inline(always)]
+    pub fn dual_move(&self, tt: &V32, i: usize) -> V32 {
+        let (pre, post) = &self.dual_moves[i];
+        crate::simd::shuf(post, &crate::simd::shuf(tt, pre))
+    }
+
+    /// [`Joint::raw`] of the tau in lane `L` of a [`Joint::dual`] vector (0: the state, 1: its
+    /// F/B view; `ud` is that state's U/D pattern).
+    #[inline(always)]
+    pub fn raw_lane<const L: usize>(&self, ud: u32, tt: &V32) -> usize {
+        let t: &[u8; 16] = tt.0[16 * L..16 * L + 16].try_into().unwrap();
+        ud as usize * N_PREFIX + prefix_rank(t)
+    }
+
+    /// [`Joint::index_raw`] of the tau in lane `L` of a [`Joint::dual`] vector.
+    #[inline(always)]
+    pub fn index_lane<const L: usize>(&self, raw: usize, tt: &V32, pll: u32) -> usize {
+        let c = self.cls[raw];
+        let s = (c & 7) as usize;
+        let r = if s == 0 {
+            rest_rank(tt.0[16 * L..16 * L + 16].try_into().unwrap())
+        } else {
+            let (inv, map) = &self.conj2[s];
+            let u = crate::simd::shuf(map, &crate::simd::shuf(tt, inv));
+            rest_rank(u.0[16 * L..16 * L + 16].try_into().unwrap())
         };
         ((c >> 3) as usize * N_REST + r) * 2 + pll as usize
     }
@@ -983,6 +1050,37 @@ mod tests {
             let (_, tau, _) = j.state(rng.gen_range(0..j.n));
             for s in &j.syms {
                 assert_eq!(conj_edges(&tau, s)[..12], conj(&tau, s)[..12]);
+            }
+        }
+    }
+
+    /// Both views moved and indexed in one vector ([`Joint::dual`]) match the scalar moves
+    /// ([`P2Tables::tau_move`], [`FbView::tau_move`]) and indices ([`Joint::index`]).
+    #[test]
+    fn dual_lanes_match_scalar() {
+        let p2 = P2Tables::base_for_tests();
+        let j = Joint::new(&p2);
+        let mut rng = rand::thread_rng();
+        use rand::Rng;
+        let id: [u8; 4] = [12, 13, 14, 15];
+        for _ in 0..2000 {
+            let (_, tau, pll) = j.state(rng.gen_range(0..j.n));
+            let mut tt = j.dual(&tau);
+            let (mut tau, mut tf) = (tau, j.fb.tau(&tau));
+            for _ in 0..6 {
+                let i = rng.gen_range(0..17);
+                tt = j.dual_move(&tt, i);
+                tau = p2.tau_move(&tau, i);
+                tf = j.fb.tau_move(&tf, i);
+                assert_eq!(tf[..12], j.fb.tau(&tau)[..12]);
+                assert_eq!(tt.0[..12], tau[..12]);
+                assert_eq!(tt.0[16..28], tf[..12]);
+                assert_eq!((&tt.0[12..16], &tt.0[28..32]), (&id[..], &id[..]));
+                let ud = rng.gen_range(0..70);
+                let a = j.index_lane::<0>(j.raw_lane::<0>(ud, &tt), &tt, pll);
+                assert_eq!(a, j.index(ud, &tau, pll));
+                let b = j.index_lane::<1>(j.raw_lane::<1>(ud, &tt), &tt, pll);
+                assert_eq!(b, j.index(ud, &tf, pll));
             }
         }
     }
