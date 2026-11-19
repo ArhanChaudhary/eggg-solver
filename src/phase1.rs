@@ -980,6 +980,17 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     pub on_endpoint: F,
     pub stop: bool,
     pub abort: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Once raised, every subtree not yet started (with at least [`SPILL_MIN_LEFT`] moves
+    /// left) is pushed to `spill`, as its move prefix, instead of being searched: a job can
+    /// then be cut short at any depth and its unsearched subtrees searched later (they are
+    /// disjoint from the searched ones, so no endpoint is lost or found twice).
+    pub close: Option<&'a std::sync::atomic::AtomicBool>,
+    /// The subtrees handed back after `close` (their move prefixes).
+    pub spill: Vec<Vec<u8>>,
+    /// The length of the path to the node [`Search1::dfs`] was called on: that node itself
+    /// (queued for a batch at distance = moves left) is never handed back, so that a job
+    /// cut short has always made progress.
+    root_len: usize,
     /// The colour pair whose endpoints (those whose special axis holds it) are searched for,
     /// pruned by its pattern table; [`ALL_PAIRS`]: all endpoints, pruned by the staging table.
     pub pair: usize,
@@ -997,6 +1008,10 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
 
 /// See [`Search1::batch_tree`].
 const ROOT: u32 = 1 << 31;
+
+/// Subtrees with fewer moves left are searched even after [`Search1::close`] (handing them
+/// back costs about as much as searching them).
+pub const SPILL_MIN_LEFT: u8 = 4;
 
 /// A node of a batch (moves left = staging distance): its state, mask-table index, and its
 /// path's entry in [`Search1::batch_tree`].
@@ -1091,6 +1106,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             on_endpoint,
             stop: false,
             abort: None,
+            close: None,
+            spill: vec![],
+            root_len: 0,
             pair: ALL_PAIRS,
             batch: vec![],
             batch_next: vec![],
@@ -1173,6 +1191,24 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     /// distance-decreasing moves of its mask (read a round after its prefetch); children
     /// with one move left get the last-move tests, the others are queued for the next round.
     fn run_batch(&mut self) {
+        if self
+            .close
+            .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            // Hand back the queued nodes (all queued by the depth-first search, none started)
+            // with enough moves left.
+            let (tree, roots, spill) = (&self.batch_tree, &self.batch_roots, &mut self.spill);
+            let root_len = self.root_len;
+            self.batch.retain(|nd| {
+                let off = (tree[nd.id as usize].0 & !ROOT) as usize;
+                let n = roots[off] as usize;
+                if nd.left < SPILL_MIN_LEFT || n <= root_len {
+                    return true;
+                }
+                spill.push(roots[off + 1..off + 1 + n].to_vec());
+                false
+            });
+        }
         // The batch nodes' paths replace the search's path meanwhile.
         std::mem::swap(&mut self.path, &mut self.batch_path);
         self.run_batch_rounds();
@@ -1332,6 +1368,23 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         }
     }
 
+    /// After [`Search1::close`]: hand back the child after move `m` (with `left` moves left),
+    /// if it has enough moves left; whether it was handed back.
+    #[inline(always)]
+    fn spill_child(&mut self, m: usize, left: u8) -> bool {
+        if left < SPILL_MIN_LEFT
+            || !self
+                .close
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return false;
+        }
+        self.path.push(m as u8);
+        self.spill.push(self.path.clone());
+        self.path.pop();
+        true
+    }
+
     /// The fewest moves left of a node queued for a batch (1 if the batches also read the
     /// masks of nodes one move from the end, to test only their staging last moves).
     #[inline(always)]
@@ -1352,6 +1405,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     /// Search below `s` (exact distance `d` in the table guiding this search: staging, or
     /// the pair's pattern table) for paths of exactly `left` more moves.
     pub fn dfs(&mut self, s: &P1State, d: u8, left: u8, last: usize) {
+        self.root_len = self.path.len();
         if self.pair != ALL_PAIRS {
             if self.t.pat.as_ref().unwrap().big {
                 self.dfs_t::<K_PAT_BIG>(s, d, left, last)
@@ -1491,6 +1545,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         while a != 0 {
             let m = a.trailing_zeros() as usize;
             a &= a - 1;
+            if self.spill_child(m, left - 1) {
+                continue;
+            }
             // d - 1, d or d + 1 (the masks are disjoint).
             let dc = d + 1 - 2 * (dec >> m & 1) as u8 - (eq >> m & 1) as u8;
             let c = s.apply(m, t);
@@ -1754,6 +1811,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 dcs[k]
             };
             if dc < left {
+                if self.spill_child(m, left - 1) {
+                    continue;
+                }
                 let c = s.apply(m, t);
                 if batched && dc == left - 1 && dc >= self.batch_min_left() {
                     let i = if K == K_MASK {

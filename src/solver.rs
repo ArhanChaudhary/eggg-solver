@@ -197,47 +197,6 @@ fn par_jobs(n: usize, threads: usize, stop: &AtomicBool, work: impl Fn(usize) + 
     });
 }
 
-/// Phase-1 search below `srch.path` (state `st`, staging distance `d`, exactly `left` more
-/// moves), expanding the first `split` levels here so that the job can be cut short: once
-/// `close` is raised, each subtree not yet started at those levels is pushed to `spill` (as
-/// its move prefix) instead of being searched. The subtrees visited, and the endpoints found,
-/// are exactly those of `srch.dfs`.
-#[allow(clippy::too_many_arguments)]
-fn p1_run<F: FnMut(&[u8], u8) -> bool>(
-    srch: &mut Search1<'_, F>,
-    st: &P1State,
-    d: u8,
-    left: u8,
-    last: usize,
-    split: u8,
-    close: &AtomicBool,
-    spill: &mut Vec<Vec<u8>>,
-) {
-    if split == 0 || left <= 3 {
-        srch.dfs(st, d, left, last);
-        return;
-    }
-    let t = srch.t;
-    let mut allowed = ALLOWED_AFTER[last];
-    while allowed != 0 && !srch.stop {
-        let m = allowed.trailing_zeros() as usize;
-        allowed &= allowed - 1;
-        let c = st.apply(m, t);
-        let dc = Mod3Table::decode(d, srch.value(&c));
-        srch.nodes += 1;
-        if dc >= left {
-            continue;
-        }
-        srch.path.push(m as u8);
-        if close.load(Ordering::Relaxed) {
-            spill.push(srch.path.clone());
-        } else {
-            p1_run(srch, &c, dc, left - 1, m, split - 1, close, spill);
-        }
-        srch.path.pop();
-    }
-}
-
 /// A phase-2 candidate from a phase-1 endpoint (None if its centres cannot be solved).
 fn make_candidate(t: &Tables, cube: &Cube, moves1: &[u8], frame: usize) -> Option<Candidate> {
     let mut c = *cube;
@@ -536,8 +495,8 @@ impl<'a, 'r> Run<'a, 'r> {
             let found = AtomicUsize::new(0);
             let nodes = AtomicU64::new(0);
             // Raised when enough endpoints are found, or when a quarter of the threads have
-            // run out of jobs: running jobs then hand back their unstarted subtrees, so that no
-            // thread waits long for the slowest job.
+            // run out of jobs: running jobs then hand back their unstarted subtrees (at any
+            // depth, see `Search1::close`), so that no thread waits long for the slowest job.
             let close = AtomicBool::new(false);
             let idle = AtomicUsize::new(0);
             let out = Mutex::new(vec![]);
@@ -561,22 +520,24 @@ impl<'a, 'r> Run<'a, 'r> {
                             let pair = pair as usize;
                             let (st, d) = root.after_pair(prefix, d0[pair], t, pair);
                             let mut eps = vec![];
-                            let mut spill = vec![];
                             let mut srch = Search1::new(t, |p: &[u8], f| {
                                 eps.push((p.to_vec(), f));
+                                let k = f.count_ones() as usize;
+                                if found.fetch_add(k, Ordering::Relaxed) + k >= need {
+                                    close.store(true, Ordering::Relaxed);
+                                }
                                 true
                             });
                             srch.abort = Some(stop);
+                            srch.close = Some(&close);
                             srch.pair = pair;
                             srch.path.extend_from_slice(prefix);
                             let last = prefix.last().map(|&m| m as usize).unwrap_or(N_MOVES);
                             let left = len - prefix.len() as u8;
-                            p1_run(&mut srch, &st, d, left, last, 2, &close, &mut spill);
+                            srch.dfs(&st, d, left, last);
                             n += srch.nodes;
-                            let k: usize = eps.iter().map(|e| e.1.count_ones() as usize).sum();
-                            if found.fetch_add(k, Ordering::Relaxed) + k >= need {
-                                close.store(true, Ordering::Relaxed);
-                            }
+                            let spill = std::mem::take(&mut srch.spill);
+                            drop(srch);
                             local.push((j, eps, spill));
                         }
                         nodes.fetch_add(n, Ordering::Relaxed);
@@ -1271,10 +1232,21 @@ mod tests {
     }
 
     /// Jobs cut short at random points, with their handed-back subtrees searched later, find
-    /// exactly the endpoints of one uninterrupted search.
+    /// exactly the endpoints of one uninterrupted search: with the staging table, and with
+    /// the reduced move-mask table where ./tables has it.
     #[test]
     fn split_jobs_find_the_same_endpoints() {
-        let t = load_p1(std::path::Path::new("tables"), false, 8, false);
+        let dir = std::path::Path::new("tables");
+        let mut t = load_p1(dir, false, 8, false);
+        split_jobs_check(&t, 2);
+        if dir.join("p1-mask2.tab").exists() {
+            load_mask(&mut t, dir, false, false);
+            split_jobs_check(&t, 3);
+        }
+    }
+
+    /// [`split_jobs_find_the_same_endpoints`] for `lengths` lengths from the root distance.
+    fn split_jobs_check(t: &P1Tables, lengths: u8) {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(7);
         for scramble in 0..6 {
             let mut cube = Cube::SOLVED;
@@ -1284,9 +1256,9 @@ mod tests {
             }
             let root = P1State::from_cube(&cube);
             let d0 = t.distance(&root);
-            for len in d0.max(4)..d0.max(4) + 2 {
+            for len in d0.max(4)..d0.max(4) + lengths {
                 let mut want = vec![];
-                let mut srch = Search1::new(&t, |p: &[u8], f| {
+                let mut srch = Search1::new(t, |p: &[u8], f| {
                     want.push((p.to_vec(), f));
                     true
                 });
@@ -1298,10 +1270,11 @@ mod tests {
                 let mut queue: Vec<Vec<u8>> = vec![vec![]];
                 let mut count = 0usize;
                 while let Some(prefix) = queue.pop() {
-                    let close = AtomicBool::new(false);
-                    let (st, d) = root.after(&prefix, d0, &t);
-                    let mut spill = vec![];
-                    let mut srch = Search1::new(&t, |p: &[u8], f| {
+                    // (The last scramble's jobs are cut short from the start: each hands back
+                    // all it can, but always makes progress.)
+                    let close = AtomicBool::new(scramble == 5);
+                    let (st, d) = root.after(&prefix, d0, t);
+                    let mut srch = Search1::new(t, |p: &[u8], f| {
                         got.push((p.to_vec(), f));
                         count += 1;
                         if count % 3 == scramble % 3 {
@@ -1309,18 +1282,11 @@ mod tests {
                         }
                         true
                     });
+                    srch.close = Some(&close);
                     srch.path.extend_from_slice(&prefix);
                     let last = prefix.last().map(|&m| m as usize).unwrap_or(N_MOVES);
-                    p1_run(
-                        &mut srch,
-                        &st,
-                        d,
-                        len - prefix.len() as u8,
-                        last,
-                        2,
-                        &close,
-                        &mut spill,
-                    );
+                    srch.dfs(&st, d, len - prefix.len() as u8, last);
+                    let spill = std::mem::take(&mut srch.spill);
                     drop(srch);
                     queue.extend(spill);
                 }
