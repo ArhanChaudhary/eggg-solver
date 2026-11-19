@@ -601,6 +601,107 @@ impl<'a> Search2<'a> {
     }
 }
 
+/// A subtree of a phase-2 search, from [`Search2::tasks`].
+#[derive(Clone, Debug)]
+pub struct Task2 {
+    /// The moves from the search's root to the subtree's root.
+    pub path: Vec<u8>,
+    cc: u32,
+    tau: [u8; 16],
+    /// The subtree root's exact distance in the table the search uses (joint or pairing).
+    d: u8,
+    left: u8,
+    last: usize,
+    after: u32,
+}
+
+impl<'a> Search2<'a> {
+    /// The subtrees `depth` moves below the root of a search (the arguments of
+    /// [`Search2::dfs_joint`] if the joint table is loaded, else of [`Search2::dfs`]), in
+    /// search order: [`Search2::run_task`] on each, in turn, finds exactly the solutions of the
+    /// whole search, in the same order. Empty if the search has no subtree that deep.
+    #[allow(clippy::too_many_arguments)]
+    pub fn tasks(
+        &mut self,
+        cc: u32,
+        tau: &[u8; 16],
+        d: u8,
+        left: u8,
+        last: usize,
+        after: u32,
+        depth: u8,
+    ) -> Vec<Task2> {
+        let mut out = vec![];
+        self.path.clear();
+        self.expand(cc, tau, d, left, last, after, depth, &mut out);
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expand(
+        &mut self,
+        cc: u32,
+        tau: &[u8; 16],
+        d: u8,
+        left: u8,
+        last: usize,
+        after: u32,
+        depth: u8,
+        out: &mut Vec<Task2>,
+    ) {
+        if depth == 0 || left == 0 {
+            out.push(Task2 {
+                path: self.path.clone(),
+                cc,
+                tau: *tau,
+                d,
+                left,
+                last,
+                after,
+            });
+            return;
+        }
+        // The children (and the pruning) of `dfs` / `dfs_joint`.
+        let t = self.t;
+        let allowed = after & PHASE2_MASK & if left == 1 { last_mask(last) } else { u32::MAX };
+        for (i, &m) in P2_MOVES.iter().enumerate() {
+            if allowed >> m & 1 == 0 {
+                continue;
+            }
+            self.nodes += 1;
+            let c2 = t.centre_move[cc as usize][i];
+            if t.centre_dist[c2 as usize] >= left {
+                continue;
+            }
+            let t2 = t.tau_move(tau, i);
+            let v = match &t.joint {
+                Some(j) => j.get(j.index(c2 / 1680, &t2, c2 & 1)),
+                None => t.tau_value(&t2),
+            };
+            let d2 = Mod3Table::decode(d, v);
+            if d2 >= left {
+                continue;
+            }
+            self.path.push(m);
+            let after2 = after_child(after, m as usize);
+            self.expand(c2, &t2, d2, left - 1, m as usize, after2, depth - 1, out);
+            self.path.pop();
+        }
+    }
+
+    /// Search one subtree from [`Search2::tasks`]: `found` gets each solution's whole path.
+    /// Returns false if stopped (see [`Search2::dfs`]).
+    pub fn run_task(&mut self, task: &Task2, found: &mut dyn FnMut(&[u8]) -> bool) -> bool {
+        self.path.clone_from(&task.path);
+        let (cc, tau, d, left) = (task.cc, &task.tau, task.d, task.left);
+        if self.t.joint.is_some() {
+            self.dfs_joint(cc, tau, d, left, task.last, task.after, found)
+        } else {
+            self.dfs(cc, tau, d, left, task.last, task.after, found)
+        }
+    }
+}
+
 #[inline(always)]
 fn cc_is_goal(t: &P2Tables, cc: u32) -> bool {
     t.centre_dist[cc as usize] == 0

@@ -16,13 +16,13 @@ use crate::cube::{Cube, Facelets, Mat};
 use crate::cube3::Cube3;
 use crate::moves::{ALLOWED_AFTER, MOVE_PERMS, N_MOVES, frame_rotation, rotate_move};
 use crate::phase1::{P1State, P1Tables, Search1};
-use crate::phase2::{P2Tables, Search2, first_moves, standardise};
+use crate::phase2::{P2Tables, Search2, Task2, first_moves, standardise};
 use crate::phase3::{P3Tables, Search3, Task};
 
 /// Phase-3 checks at least this deep are split into one job per child of the root.
 const SPLIT_DEPTH: u8 = 15;
 use crate::table::Mod3Table;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -42,6 +42,11 @@ const P2_SHARE: f64 = 0.96;
 /// found are searched by phases 2 and 3 sooner.
 const ROUND_SHARE: f64 = 0.25;
 const MIN_ROUND: Duration = Duration::from_millis(20);
+
+/// Once a solution exists, a phase-2 search whose depth exceeds its bound by at least this
+/// much is split into tasks one move below its root (two moves if by more): such searches take
+/// ~5 ms to 1.5 s on the M2, the others less than a millisecond (see `Run::phase2_level`).
+const P2_SPLIT_SLACK: u8 = 3;
 
 pub struct Tables {
     pub p1: P1Tables,
@@ -349,6 +354,23 @@ fn make_candidates(
     }
 }
 
+/// The frame rotation of a candidate's phase 2, the last phase-1 move in that frame, and the
+/// moves allowed to open phase 2 (see [`first_moves`]).
+fn phase2_root(c: &Candidate) -> (Mat, usize, u32) {
+    let rot = frame_rotation(c.frame);
+    let last1 = c
+        .moves1
+        .last()
+        .map(|&m| rotate_move(m as usize, &rot))
+        .unwrap_or(N_MOVES);
+    // Phase 2 may open with moves of phase 1's trailing axis (on its unused faces).
+    let tail: Vec<u8> = c.moves1[c.moves1.len().saturating_sub(3)..]
+        .iter()
+        .map(|&m| rotate_move(m as usize, &rot) as u8)
+        .collect();
+    (rot, last1, first_moves(&tail))
+}
+
 pub struct Solver<'a> {
     pub t: &'a Tables,
     pub opts: Options,
@@ -368,6 +390,8 @@ struct Run<'a, 'r> {
     /// This round's phase 1 stops at `p1_cut`, and phase 2 at `p2_cut` (None: no cut).
     p1_cut: Option<Instant>,
     p2_cut: Option<Instant>,
+    /// Phase-2 searches with at least this slack are split (`P2_SPLIT_SLACK`).
+    split2: u8,
     best: Option<Solution>,
     report: &'r mut dyn FnMut(&Solution),
     target: Option<usize>,
@@ -437,6 +461,7 @@ impl<'a> Solver<'a> {
             limit: hard.map_or(deadline, |h| deadline.min(start + h)),
             p1_cut: None,
             p2_cut: None,
+            split2: P2_SPLIT_SLACK,
             have: &have,
             best: None,
             report,
@@ -831,14 +856,26 @@ impl<'a, 'r> Run<'a, 'r> {
     /// reductions of the one below, and finishing it would overshoot the round's target (the
     /// candidates not searched keep the level for the next round). Searches still running at
     /// the round's phase-2 cut stop there (keeping the reductions found so far, and the level).
+    ///
+    /// Once a solution exists, a search with a large slack (depth minus bound, see
+    /// `P2_SPLIT_SLACK`) is split when it is started into one task per subtree one or two moves
+    /// below its root, which all threads take before starting other searches: one search of
+    /// the deepest level can take seconds while the other threads wait. (Before that, a search
+    /// keeps only its first solutions, so it stays whole.) The reductions, and their order, are
+    /// those of the whole searches.
     fn phase2_level(&mut self, t12: usize, need: usize) -> Vec<Reduction> {
         let t = self.t;
         let best = self.best_len();
         // Before a first solution phase 2 is not capped, so each search keeps at most 64
         // solutions; after it, the cap bounds the searches and all their solutions count.
         let max_sols = if self.best.is_some() { usize::MAX } else { 64 };
+        let split = if self.best.is_some() {
+            self.split2
+        } else {
+            u8::MAX
+        };
         let cands = &self.cands;
-        let jobs: Vec<usize> = (0..cands.len())
+        let todo: Vec<usize> = (0..cands.len())
             .filter(|&i| {
                 let c = &cands[i];
                 let l1 = c.moves1.len();
@@ -849,28 +886,21 @@ impl<'a, 'r> Run<'a, 'r> {
         let nodes = AtomicU64::new(0);
         let stop = self.stop;
         let made = AtomicUsize::new(0);
-        // The searches that ran to the end.
-        let complete: Vec<AtomicBool> = (0..jobs.len()).map(|_| AtomicBool::new(false)).collect();
         let cut = self.p2_cut;
-        par_jobs(jobs.len(), self.threads, stop, |j| {
-            if made.load(Ordering::Relaxed) >= need || cut.is_some_and(|c| Instant::now() >= c) {
-                return;
-            }
-            let c = &cands[jobs[j]];
-            let l2 = (t12 - c.moves1.len()) as u8;
-            let rot = frame_rotation(c.frame);
+        let past_cut = || cut.is_some_and(|c| Instant::now() >= c);
+        // Per search: its jobs (1 if whole), and those that ran to the end.
+        let parts: Vec<AtomicUsize> = (0..todo.len()).map(|_| AtomicUsize::new(1)).collect();
+        let finished: Vec<AtomicUsize> = (0..todo.len()).map(|_| AtomicUsize::new(0)).collect();
+        // Tasks of split searches not yet taken: (search, task number, task).
+        let pending: Mutex<VecDeque<(usize, usize, Task2)>> = Mutex::new(VecDeque::new());
+        // Threads that may be about to add tasks.
+        let splitting = AtomicUsize::new(0);
+        let next = AtomicUsize::new(0);
+        // Search `todo[k]` whole, or one task of it (number `i`).
+        let run = |k: usize, i: usize, task: Option<&Task2>| {
+            let c = &cands[todo[k]];
+            let (rot, last1, first) = phase2_root(c);
             let rot_inv = transpose(&rot);
-            let last1 = c
-                .moves1
-                .last()
-                .map(|&m| rotate_move(m as usize, &rot))
-                .unwrap_or(N_MOVES);
-            // Phase 2 may open with moves of phase 1's trailing axis (on its unused faces).
-            let tail: Vec<u8> = c.moves1[c.moves1.len().saturating_sub(3)..]
-                .iter()
-                .map(|&m| rotate_move(m as usize, &rot) as u8)
-                .collect();
-            let first = first_moves(&tail);
             let mut srch = Search2::new(&t.p2);
             srch.abort = Some(stop);
             srch.deadline = cut;
@@ -904,19 +934,74 @@ impl<'a, 'r> Run<'a, 'r> {
                 }
                 seen < max_sols
             };
-            if t.p2.joint.is_some() {
-                srch.dfs_joint(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep);
-            } else {
-                srch.dfs(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep);
-            }
+            let l2 = (t12 - c.moves1.len()) as u8;
+            match task {
+                Some(task) => srch.run_task(task, &mut keep),
+                None if t.p2.joint.is_some() => {
+                    srch.dfs_joint(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep)
+                }
+                None => srch.dfs(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep),
+            };
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
             made.fetch_add(local.len(), Ordering::Relaxed);
-            complete[j].store(!srch.aborted, Ordering::Relaxed);
-            out.lock().unwrap().push((j, local));
+            if !srch.aborted {
+                finished[k].fetch_add(1, Ordering::Relaxed);
+            }
+            out.lock().unwrap().push(((k, i), local));
+        };
+        std::thread::scope(|s| {
+            for _ in 0..self.threads.min(todo.len()).max(1) {
+                s.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        // Tasks of started searches first.
+                        let job = pending.lock().unwrap().pop_front();
+                        if let Some((k, i, task)) = job {
+                            if !past_cut() {
+                                run(k, i, Some(&task));
+                            }
+                            continue;
+                        }
+                        splitting.fetch_add(1, Ordering::SeqCst);
+                        let k = next.fetch_add(1, Ordering::Relaxed);
+                        if k >= todo.len() {
+                            splitting.fetch_sub(1, Ordering::SeqCst);
+                            if splitting.load(Ordering::SeqCst) == 0
+                                && pending.lock().unwrap().is_empty()
+                            {
+                                break;
+                            }
+                            std::thread::yield_now();
+                            continue;
+                        }
+                        if made.load(Ordering::Relaxed) >= need || past_cut() {
+                            splitting.fetch_sub(1, Ordering::SeqCst);
+                            continue;
+                        }
+                        let c = &cands[todo[k]];
+                        let l2 = (t12 - c.moves1.len()) as u8;
+                        let slack = l2.saturating_sub(c.h2);
+                        if slack < split {
+                            splitting.fetch_sub(1, Ordering::SeqCst);
+                            run(k, 0, None);
+                            continue;
+                        }
+                        let (_, last1, first) = phase2_root(c);
+                        let depth = if slack > split { 2 } else { 1 };
+                        let tasks = Search2::new(&t.p2)
+                            .tasks(c.centre, &c.tau, c.dt, l2, last1, first, depth);
+                        parts[k].store(tasks.len(), Ordering::Relaxed);
+                        pending
+                            .lock()
+                            .unwrap()
+                            .extend(tasks.into_iter().enumerate().map(|(i, x)| (k, i, x)));
+                        splitting.fetch_sub(1, Ordering::SeqCst);
+                    }
+                });
+            }
         });
-        for (k, &j) in jobs.iter().enumerate() {
-            if complete[k].load(Ordering::Relaxed) {
-                let c = &mut self.cands[j];
+        for (k, &i) in todo.iter().enumerate() {
+            if finished[k].load(Ordering::Relaxed) == parts[k].load(Ordering::Relaxed) {
+                let c = &mut self.cands[i];
                 c.done2 = c.done2.max((t12 - c.moves1.len()) as u8 + 1);
             }
         }
@@ -1714,6 +1799,140 @@ mod tests {
             }
         }
         assert!(big > 0, "no search big enough to test the deadline");
+    }
+
+    /// A phase-2 search split into tasks one or two moves below the root finds exactly the
+    /// solutions of the whole search, in the same order (with and without the joint table).
+    #[test]
+    fn phase2_tasks_find_the_same_solutions() {
+        use crate::phase2::P2_MOVES;
+        let dir = std::path::Path::new("tables");
+        let small = load_tables(dir, 3, 8, false);
+        let joint = load_tables_with(dir, 3, true, false, (None, None), 8, false);
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(12);
+        let mut total = 0;
+        for t in [&small, &joint] {
+            for _ in 0..8 {
+                let mut cube = Cube::SOLVED;
+                for _ in 0..14 {
+                    let m = P2_MOVES[rand::Rng::gen_range(&mut rng, 0..P2_MOVES.len())];
+                    cube = cube.apply_perm(&MOVE_PERMS[m as usize]);
+                }
+                let c = make_candidate(t, &cube, &[], 0).unwrap();
+                let (_, last1, first) = phase2_root(&c);
+                for left in c.dt..c.h2 + 4 {
+                    let mut want = vec![];
+                    let mut srch = Search2::new(&t.p2);
+                    let mut found = |p: &[u8]| {
+                        want.push(p.to_vec());
+                        true
+                    };
+                    if t.p2.joint.is_some() {
+                        srch.dfs_joint(c.centre, &c.tau, c.dt, left, last1, first, &mut found);
+                    } else {
+                        srch.dfs(c.centre, &c.tau, c.dt, left, last1, first, &mut found);
+                    }
+                    for depth in 1..=2 {
+                        let tasks = srch.tasks(c.centre, &c.tau, c.dt, left, last1, first, depth);
+                        let mut got = vec![];
+                        for task in &tasks {
+                            srch.run_task(task, &mut |p| {
+                                got.push(p.to_vec());
+                                true
+                            });
+                        }
+                        assert_eq!(got, want, "left {left}, depth {depth}");
+                    }
+                    total += want.len();
+                }
+            }
+        }
+        assert!(total > 1000, "too few solutions to test ({total})");
+    }
+
+    /// A phase-2 level with every search split gives exactly the reductions of the unsplit
+    /// searches, in the same order.
+    #[test]
+    fn split_phase2_gives_the_same_reductions() {
+        let dir = std::path::Path::new("tables");
+        let t = load_tables_with(dir, 3, true, false, (None, None), 8, false);
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(13);
+        let mut total = 0;
+        for _ in 0..3 {
+            let cube = Cube::random(&mut rng);
+            let (stop, have) = (AtomicBool::new(false), AtomicBool::new(false));
+            let mut report = |_: &Solution| {};
+            let root = P1State::from_cube(&cube);
+            let pairs = vec![crate::phase1::ALL_PAIRS];
+            let mut d0 = [0u8; 4];
+            d0[pairs[0]] = t.p1.distance_pair(&root, pairs[0]);
+            let start = Instant::now();
+            let mut run = Run {
+                t: &t,
+                cube,
+                threads: 4,
+                stop: &stop,
+                have: &have,
+                start,
+                limit: start + Duration::from_secs(3600),
+                p1_cut: None,
+                p2_cut: None,
+                split2: u8::MAX,
+                best: None,
+                report: &mut report,
+                target: None,
+                stats: Stats::default(),
+                root,
+                d0,
+                pairs,
+                level: Level1 {
+                    len: d0[crate::phase1::ALL_PAIRS],
+                    jobs: vec![],
+                    next: 0,
+                },
+                made_cands: 0,
+                made_reds: 0,
+                cands: vec![],
+                reds: vec![],
+                red_index: HashMap::new(),
+            };
+            run.level.jobs = run.level_jobs(run.level.len);
+            run.phase1(1000);
+            // As if a 60-move solution existed: phase 2 keeps every solution of a search.
+            run.best = Some(Solution {
+                moves: vec![0; 60],
+                phases: [0; 3],
+                elapsed: Duration::ZERO,
+            });
+            let lo = run
+                .cands
+                .iter()
+                .map(|c| c.moves1.len() + c.h2 as usize)
+                .min()
+                .unwrap();
+            let mut found = 0;
+            for t12 in lo..lo + 8 {
+                if found > 2000 {
+                    break;
+                }
+                let done: Vec<u8> = run.cands.iter().map(|c| c.done2).collect();
+                let key = |r: &Reduction| (r.frame, r.moves12.clone(), r.c3, r.h3);
+                run.split2 = u8::MAX;
+                let whole: Vec<_> = run.phase2_level(t12, usize::MAX).iter().map(key).collect();
+                let done_whole: Vec<u8> = run.cands.iter().map(|c| c.done2).collect();
+                for (c, &d) in run.cands.iter_mut().zip(&done) {
+                    c.done2 = d;
+                }
+                run.split2 = 0;
+                let split: Vec<_> = run.phase2_level(t12, usize::MAX).iter().map(key).collect();
+                assert_eq!(split, whole, "level {t12}");
+                let done_split: Vec<u8> = run.cands.iter().map(|c| c.done2).collect();
+                assert_eq!(done_split, done_whole);
+                found += whole.len();
+            }
+            total += found;
+        }
+        assert!(total > 3000, "too few reductions to test ({total})");
     }
 
     /// Jobs cut short at random points, with their handed-back subtrees searched later, find
