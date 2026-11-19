@@ -1027,29 +1027,10 @@ pub fn load_mask(p1: &mut P1Tables, dir: &std::path::Path, big: bool, verbose: b
     p1.mask = Some(crate::p1mask::load(dir, p1, big, verbose));
 }
 
-/// Load or build all tables in `dir`; `joint`: also the joint phase-2 table (1.05 GB);
-/// `p1_big`: the large phase-1 staging table (1.2 GB); `p1_extra`: the phase-1 pattern table
-/// and move-mask table (each `Some(big)`: reduced or large; the masks need `p1_big`).
-pub fn load_tables_with(
-    dir: &std::path::Path,
-    h48_k: u32,
-    joint: bool,
-    p1_big: bool,
-    p1_extra: (Option<bool>, Option<bool>),
-    threads: usize,
-    verbose: bool,
-) -> Tables {
-    let t0 = Instant::now();
-    let mut p1 = load_p1(dir, p1_big, threads, verbose);
-    if let Some(big) = p1_extra.0 {
-        load_pat(&mut p1, dir, big, threads, verbose);
-    }
-    if let Some(big) = p1_extra.1 {
-        assert!(p1_big, "the move-mask table needs the large staging table");
-        load_mask(&mut p1, dir, big, verbose);
-    }
+/// Load or build the phase-2 tables in `dir`; `joint`: also the joint table (1.05 GB).
+fn load_p2(dir: &std::path::Path, joint: bool, threads: usize, verbose: bool) -> P2Tables {
     let p2_path = dir.join("p2-tau.tab");
-    let p2 = {
+    let mut p2 = {
         let n = crate::phase2::N_TAU;
         let mut table = Mod3Table {
             data: crate::table::HugeBuf::zeroed(n.div_ceil(32)),
@@ -1067,7 +1048,6 @@ pub fn load_tables_with(
             t
         }
     };
-    let mut p2 = p2;
     if joint {
         let mut j = crate::p2joint::Joint::new(&p2);
         let path = dir.join("p2-joint2.tab");
@@ -1086,7 +1066,50 @@ pub fn load_tables_with(
         }
         p2.joint = Some(j);
     }
-    let p3 = P3Tables::load_or_build(dir, h48_k, threads, verbose);
+    p2
+}
+
+/// Load or build all tables in `dir`; `joint`: also the joint phase-2 table (1.05 GB);
+/// `p1_big`: the large phase-1 staging table (1.2 GB); `p1_extra`: the phase-1 pattern table
+/// and move-mask table (each `Some(big)`: reduced or large; the masks need `p1_big`).
+pub fn load_tables_with(
+    dir: &std::path::Path,
+    h48_k: u32,
+    joint: bool,
+    p1_big: bool,
+    p1_extra: (Option<bool>, Option<bool>),
+    threads: usize,
+    verbose: bool,
+) -> Tables {
+    let t0 = Instant::now();
+    // The phase-2 and phase-3 tables load in their own threads meanwhile (loads overlap;
+    // missing tables are still generated one at a time: see `LoadGroup`).
+    let p2 = {
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || {
+            let _g = crate::table::LoadGroup::enter();
+            load_p2(&dir, joint, threads, verbose)
+        })
+    };
+    let p3 = {
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || {
+            let _g = crate::table::LoadGroup::enter();
+            P3Tables::load_or_build(&dir, h48_k, threads, verbose)
+        })
+    };
+    let g = crate::table::LoadGroup::enter();
+    let mut p1 = load_p1(dir, p1_big, threads, verbose);
+    if let Some(big) = p1_extra.0 {
+        load_pat(&mut p1, dir, big, threads, verbose);
+    }
+    if let Some(big) = p1_extra.1 {
+        assert!(p1_big, "the move-mask table needs the large staging table");
+        load_mask(&mut p1, dir, big, verbose);
+    }
+    drop(g);
+    let p2 = p2.join().expect("loading the phase-2 tables");
+    let p3 = p3.join().expect("loading the phase-3 tables");
     // Huge pages for the big tables, in parallel.
     std::thread::scope(|s| {
         s.spawn(|| p1.table.data.collapse());
