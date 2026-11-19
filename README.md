@@ -63,9 +63,11 @@ at an endpoint (over half of these nodes cannot, and are dropped), and hold the 
 keep the distance: a node with slack gets all its children's distances from its own entry,
 so the search needs no large staging table. A per-node pass
 over the masked search (parent-pointer paths, cheaper leaf tests, byte-lookup pext on ARM)
-made it another 3x faster with the same endpoints. On the M2 (8 threads), 20 random
-positions: 39.60 moves on average after 10 s, 39.15 after 60 s, 38.80 after 2 minutes,
-38.60 after 10 minutes. `--p1-mask big` is the same without the symmetry reduction (18.9 GB).
+made it another 3x faster with the same endpoints, and the parity and equal-distance bits
+2x more. On the M2 (8 threads), 20 random positions (seed 6060), current version: 39.45
+moves on average after 10 s, 39.10 after 30 s, 38.80 after 60 s (before the parity and
+equal-distance bits, the round cut and the cheaper candidates: 39.65 / 39.30 / 39.15, and
+38.80 only after 2 minutes, 38.60 after 10 minutes). `--p1-mask big` is the same without the symmetry reduction (18.9 GB).
 Experimental (see `src/p1pat.rs`): `--p1-pat small|big` (0.9 / 41 GB) runs one phase-1 search
 per colour pair, pruned by the distance to staged centres with that pair in a pattern phase
 2 can solve (0.53x reads, 1.4x faster on the M2); with `--p1-mask` too, the pair searches use
@@ -97,7 +99,11 @@ allows; the pool grows while time remains. Once a solution exists, phase 2 only 
 reductions that a short enough phase 3 could still turn into a shorter solution: phase 3 of
 at most 14 moves at first, 13 after 3 s and 12 after 6 s. Each deeper level has ~16x the
 reductions and each is ~13x less likely to have a short enough phase 3, so every level adds
-about as many chances, and long runs keep improving. 48 threads, two sets of 20 random
+about as many chances, and long runs keep improving. The rounds are timed against the
+limit: once a solution exists, each round's phase 1 stops early enough (at 1/1.3 of the time
+left) for that round's phase 2 and 3 to run before the limit, rounds last at most a quarter
+of the time elapsed so improvements arrive steadily, and deep phase-2 searches are split into
+tasks over the threads. 48 threads, two sets of 20 random
 positions: 39.7 / 39.5 moves on average after 2 s, 39.0 / 39.1 after 30 s, 38.8 / 39.1
 after 60 s.
 
