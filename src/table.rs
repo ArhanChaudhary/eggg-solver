@@ -278,17 +278,97 @@ where
 
 /// Checksum of a byte slice (fast, not cryptographic).
 pub fn checksum(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
+    let words = bytes.len() / 8 * 8;
+    checksum_tail(
+        checksum_words(CHECKSUM_INIT, &bytes[..words]),
+        &bytes[words..],
+    )
+}
+
+const CHECKSUM_INIT: u64 = 0xcbf29ce484222325;
+
+/// [`checksum`] state `h` carried over whole 8-byte words (`bytes.len()` a multiple of 8).
+fn checksum_words(mut h: u64, bytes: &[u8]) -> u64 {
     let (chunks, rest) = bytes.as_chunks::<8>();
+    debug_assert!(rest.is_empty());
     for c in chunks {
         h = (h ^ u64::from_le_bytes(*c))
             .wrapping_mul(0x100000001b3)
             .rotate_left(23);
     }
+    h
+}
+
+/// The end of [`checksum`]: the last (fewer than 8) bytes.
+fn checksum_tail(mut h: u64, rest: &[u8]) -> u64 {
     for &b in rest {
         h = (h ^ b as u64).wrapping_mul(0x100000001b3);
     }
     h
+}
+
+/// Read `out.len()` bytes of `f` at offset `off` into `out` and return their [`checksum`]. The
+/// reads are spread over a few threads in chunks; the checksum (one sequential chain) follows
+/// them chunk by chunk on this thread, so a load takes about as long as the checksum alone.
+fn read_checksummed(f: &std::fs::File, off: u64, out: &mut [u8]) -> std::io::Result<u64> {
+    use std::os::unix::fs::FileExt;
+    use std::sync::atomic::AtomicBool;
+    const CHUNK: usize = 4 << 20;
+    const READERS: usize = 3;
+    let n = out.len();
+    let chunks = n.div_ceil(CHUNK);
+    let ready: Vec<AtomicBool> = (0..chunks).map(|_| AtomicBool::new(false)).collect();
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    // The chunks are disjoint: each is written by one reader, then read here once marked ready.
+    let base = out.as_mut_ptr() as usize;
+    let chunk = |i: usize| (i * CHUNK, ((i + 1) * CHUNK).min(n));
+    std::thread::scope(|s| {
+        let mut readers = vec![];
+        for _ in 0..READERS.min(chunks) {
+            readers.push(s.spawn(|| -> std::io::Result<()> {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= chunks || failed.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    let (lo, hi) = chunk(i);
+                    // SAFETY: chunk i is only touched by this reader until it is marked ready.
+                    let buf =
+                        unsafe { std::slice::from_raw_parts_mut((base + lo) as *mut u8, hi - lo) };
+                    if let Err(e) = f.read_exact_at(buf, off + lo as u64) {
+                        failed.store(true, Ordering::Relaxed);
+                        return Err(e);
+                    }
+                    ready[i].store(true, Ordering::Release);
+                }
+            }));
+        }
+        let mut h = CHECKSUM_INIT;
+        for (i, r) in ready.iter().enumerate() {
+            while !r.load(Ordering::Acquire) {
+                if failed.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            if failed.load(Ordering::Relaxed) {
+                break;
+            }
+            let (lo, hi) = chunk(i);
+            // SAFETY: chunk i is complete (Acquire above) and no longer written.
+            let buf = unsafe { std::slice::from_raw_parts((base + lo) as *const u8, hi - lo) };
+            let words = buf.len() / 8 * 8;
+            h = checksum_words(h, &buf[..words]);
+            if hi == n {
+                h = checksum_tail(h, &buf[words..]);
+            }
+        }
+        for r in readers {
+            r.join().expect("table reader panicked")?;
+        }
+        Ok(h)
+    })
 }
 
 const MAGIC: &[u8; 8] = b"EGGGTAB1";
@@ -312,8 +392,18 @@ pub fn save(path: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(tmp, path)
 }
 
-/// Load a table saved by [`save`] into `out` (which must have exactly the saved length).
+/// Load a table saved by [`save`] into `out` (which must have exactly the saved length). The
+/// whole table is checksummed before this returns. Inside a [`LoadGroup`], a failed load (after
+/// which the caller generates the table) first waits for the generation token.
 pub fn load(path: &Path, name: &str, out: &mut [u8]) -> Result<(), String> {
+    let r = load_checked(path, name, out);
+    if r.is_err() {
+        LoadGroup::before_generating();
+    }
+    r
+}
+
+fn load_checked(path: &Path, name: &str, out: &mut [u8]) -> Result<(), String> {
     let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut hdr = [0u8; 16];
     f.read_exact(&mut hdr).map_err(|e| e.to_string())?;
@@ -336,16 +426,113 @@ pub fn load(path: &Path, name: &str, out: &mut [u8]) -> Result<(), String> {
     if len != out.len() {
         return Err(format!("length mismatch: {len} vs {}", out.len()));
     }
-    f.read_exact(out).map_err(|e| e.to_string())?;
-    if checksum(out) != sum {
+    let off = (8 + 8 + nl + 16) as u64;
+    if read_checksummed(&f, off, out).map_err(|e| e.to_string())? != sum {
         return Err("checksum mismatch".into());
     }
     Ok(())
 }
 
+/// Marks the current thread as one of several loading tables concurrently, until dropped.
+/// Loads run in parallel, but the tables that fail to load are generated one at a time (a
+/// generation takes all threads and can need several times the table's memory): the first
+/// failed [`load`] of a group takes a process-wide token, which the group keeps until it ends.
+pub struct LoadGroup(());
+
+static GENERATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+thread_local! {
+    /// (in a group, the generation token once taken).
+    static GROUP: std::cell::RefCell<(bool, Option<std::sync::MutexGuard<'static, ()>>)> =
+        const { std::cell::RefCell::new((false, None)) };
+}
+
+impl LoadGroup {
+    pub fn enter() -> LoadGroup {
+        GROUP.with(|g| g.borrow_mut().0 = true);
+        LoadGroup(())
+    }
+
+    fn before_generating() {
+        GROUP.with(|g| {
+            let mut g = g.borrow_mut();
+            if g.0 && g.1.is_none() {
+                g.1 = Some(GENERATION.lock().unwrap_or_else(|e| e.into_inner()));
+            }
+        });
+    }
+}
+
+impl Drop for LoadGroup {
+    fn drop(&mut self) {
+        GROUP.with(|g| *g.borrow_mut() = (false, None));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunked_load_matches_checksum_and_rejects_corruption() {
+        let dir = std::env::temp_dir().join(format!("eggg-table-test-{}", std::process::id()));
+        // Sizes around the chunk size, including a tail of fewer than 8 bytes.
+        for n in [
+            0usize,
+            5,
+            4096,
+            (4 << 20) - 3,
+            (4 << 20) + 13,
+            (13 << 20) + 7,
+        ] {
+            let bytes: Vec<u8> = (0..n).map(|i| (i * 7919 % 251) as u8).collect();
+            let path = dir.join(format!("t{n}.tab"));
+            save(&path, "t", &bytes).unwrap();
+            let mut out = vec![0u8; n];
+            load(&path, "t", &mut out).unwrap();
+            assert_eq!(out, bytes);
+            assert!(load(&path, "u", &mut out).is_err());
+            assert!(load(&path, "t", &mut vec![0u8; n + 1]).is_err());
+            if n > 0 {
+                // One flipped bit anywhere is rejected.
+                let mut raw = std::fs::read(&path).unwrap();
+                let at = raw.len() - 1 - (n * 3 / 5);
+                raw[at] ^= 0x10;
+                std::fs::write(&path, &raw).unwrap();
+                assert_eq!(load(&path, "t", &mut out), Err("checksum mismatch".into()));
+                // So is a truncated file.
+                raw.truncate(raw.len() - 1);
+                std::fs::write(&path, &raw).unwrap();
+                assert!(load(&path, "t", &mut out).is_err());
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn generation_is_one_group_at_a_time() {
+        use std::sync::atomic::AtomicUsize;
+        let missing = std::path::Path::new("/nonexistent/eggg-table.tab");
+        let (active, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    let _g = LoadGroup::enter();
+                    for _ in 0..2 {
+                        // A failed load, then "generating".
+                        assert!(load(missing, "t", &mut [0u8; 8]).is_err());
+                        let a = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(a, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(most.into_inner(), 1);
+        // Outside a group, failed loads do not wait.
+        assert!(load(missing, "t", &mut [0u8; 8]).is_err());
+    }
 
     #[test]
     fn mod3_decode() {
