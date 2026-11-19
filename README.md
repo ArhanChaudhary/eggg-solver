@@ -89,7 +89,9 @@ orientation, so the output needs no rotations.
    never wait for one another.
 2. **Phase 2** (TPR phase 3): pair the dedges and solve the centres with
    U D F B R2 L2 Uw2 Rw2 Fw2, guided by an exact centre table and either the pairing
-   permutation table or the much tighter joint table.
+   permutation table or the much tighter joint table, which is read twice per state: for the
+   U/D centres, and for the F/B centres through the rotation x (which swaps the two axes and
+   keeps the phase-2 moves), the larger of the two being the bound.
 3. **Phase 3**: solve the reduced 3x3x3 in one IDA* search with H48 pruning tables (as in
    nissy's H48 solver and egg-solver), from both ends of the solution at once.
 
@@ -117,5 +119,6 @@ after 60 s.
   `scripts/paired.py A.json B.json` for a per-position paired comparison (runs of one build
   reproduce per-position lengths, so small differences are measurable).
 - `examples/` holds deterministic checks used during optimisation: `p1check` (phase-1
-  endpoint hash and node count), `p2jcheck` (joint-table admissibility), `p3check`,
+  endpoint hash and node count), `p2jcheck` (joint-table admissibility), `p2cost` (phase-2
+  nodes and CPU time per solution, by depth above the bound), `p3check`,
   `p3nodes` and `p3tasks` (phase-3 bounds, node counts and task splitting).
