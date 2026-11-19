@@ -35,6 +35,8 @@ use crate::simd::V32;
 use crate::table::HugeBuf;
 
 const MASK24: u32 = 0xff_ffff;
+/// The default of [`MaskTable::slack_batch`].
+pub const SLACK_BATCH: u8 = 8;
 /// The 36 outer block moves: the solver's 27, then Dw, Lw, Bw (each power).
 const N36: usize = 36;
 /// The 36-move masks' bits of a reduced entry.
@@ -71,6 +73,10 @@ pub struct MaskTable {
     pub batch_leaves: bool,
     /// Pending batch nodes that start a batch run (`EGGG_P1_BATCH`, default 32).
     pub batch: usize,
+    /// With the reduced table, nodes with slack (distance < moves left) and at most this
+    /// many moves left are expanded in batches too (`EGGG_P1_SLACK_BATCH`, default
+    /// [`SLACK_BATCH`]; 0: none).
+    pub slack_batch: u8,
     big: HugeBuf<u32>,
     /// The reduced table's entries: the decreasing moves' 36-bit mask with the viability bits
     /// above it, and the equal moves' mask (16 bytes, aligned: one cache line).
@@ -156,6 +162,10 @@ impl MaskTable {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(32),
+            slack_batch: std::env::var("EGGG_P1_SLACK_BATCH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(SLACK_BATCH),
             big: HugeBuf::zeroed(1),
             red: HugeBuf::zeroed(1),
             pair: HugeBuf::zeroed(1),
