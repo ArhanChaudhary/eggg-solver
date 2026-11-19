@@ -522,7 +522,7 @@ fn cmd_bench(a: BenchArgs) -> Result<(), String> {
         let final_len = sol.as_ref().map(|s| s.len()).unwrap_or(0);
         if a.verbose {
             eprintln!(
-                "#{:<3} {:2} moves (first {:2} at {:.3} s) phases {:?} {:.2} s  nodes {}/{}/{}",
+                "#{:<3} {:2} moves (first {:2} at {:.3} s) phases {:?} {:.2} s  nodes {}/{}/{} p1 {:.2} s endpoints {} kept {}",
                 i + 1,
                 final_len,
                 history.first().map(|h| h.1).unwrap_or(0),
@@ -531,7 +531,10 @@ fn cmd_bench(a: BenchArgs) -> Result<(), String> {
                 wall,
                 stats.nodes1,
                 stats.nodes2,
-                stats.nodes3
+                stats.nodes3,
+                stats.time[0].as_secs_f64(),
+                stats.endpoints,
+                stats.kept
             );
         }
         rows.push((history, final_len, stats, wall));

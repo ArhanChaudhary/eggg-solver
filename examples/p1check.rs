@@ -25,7 +25,8 @@ fn main() {
     }
     let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(3);
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    let (mut nodes, mut reads, mut eps) = (0u64, 0u64, 0usize);
+    let (mut nodes, mut reads, mut eps, mut cut) = (0u64, 0u64, 0usize, 0u64);
+    let mut prof = [0u64; 8];
     let t0 = Instant::now();
     for _ in 0..cubes {
         let cube = Cube::random(&mut rng);
@@ -40,13 +41,23 @@ fn main() {
             s.dfs(&root, d0, len, N_MOVES);
             nodes += s.nodes;
             reads += s.reads;
+            cut += s.wing2_cut;
+            for k in 0..8 {
+                prof[k] += s.prof[k];
+            }
             eps += found.len();
             found.hash(&mut h);
         }
     }
     println!(
-        "endpoints {eps}, hash {:016x}, nodes {nodes}, reads {reads}, {:.3} s",
+        "endpoints {eps}, hash {:016x}, nodes {nodes}, reads {reads}, wing2 cut {cut}, {:.3} s",
         h.finish(),
         t0.elapsed().as_secs_f64()
     );
+    if std::env::var_os("PROF").is_some() {
+        println!(
+            "leaf calls: under slack k2 {}, under tight k2 {}, all {}; k2 batch nodes: slack d0 {} d1 {}, tight {} (viability drop {}); leaf moves tested {}",
+            prof[0], prof[1], prof[2], prof[3], prof[4], prof[5], prof[6], prof[7]
+        );
+    }
 }

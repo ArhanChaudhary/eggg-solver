@@ -806,6 +806,9 @@ pub struct P1Tables {
     pub pat: Option<crate::p1pat::PatTable>,
     /// The move-mask table (with the large staging table, see [`crate::p1mask`]).
     pub mask: Option<crate::p1mask::MaskTable>,
+    /// The wing lookahead of nodes two moves from the end (see [`crate::wing2`]; off with
+    /// `EGGG_P1_WING2=0`).
+    pub wing2: Option<Box<crate::wing2::Wing2>>,
 }
 
 /// [`Search1::pair`] for the search over all pairs, pruned by the staging table only.
@@ -844,7 +847,7 @@ impl P1Tables {
             }
             v
         });
-        P1Tables {
+        let mut t = P1Tables {
             staging,
             table,
             big: false,
@@ -856,7 +859,12 @@ impl P1Tables {
             stage_rep,
             pat: None,
             mask: None,
+            wing2: None,
+        };
+        if std::env::var("EGGG_P1_WING2").map_or(true, |v| v != "0") {
+            t.wing2 = Some(Box::new(crate::wing2::Wing2::new(&t)));
         }
+        t
     }
 
     pub fn table_len() -> usize {
@@ -977,6 +985,12 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     pub nodes: u64,
     /// Table entries read (each a likely cache miss): children's distances, move masks.
     pub reads: u64,
+    /// Nodes cut by the wing lookahead.
+    pub wing2_cut: u64,
+    /// Counters (analysis): leaf calls under slack k=2 batch nodes, under tight k=2 batch
+    /// nodes, others; k=2 batch nodes slack (d=0, d=1), tight; tight k=2 dropped by
+    /// viability; leaf moves tested.
+    pub prof: [u64; 8],
     pub on_endpoint: F,
     pub stop: bool,
     pub abort: Option<&'a std::sync::atomic::AtomicBool>,
@@ -1088,6 +1102,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             path: Vec::with_capacity(32),
             nodes: 0,
             reads: 0,
+            wing2_cut: 0,
+            prof: [0; 8],
             on_endpoint,
             stop: false,
             abort: None,
@@ -1105,6 +1121,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     /// its mask table's first index `idx`.
     #[inline(always)]
     fn push_batch(&mut self, s: P1State, idx: u64, left: u8, last: usize, m: Option<u8>, d: u8) {
+        if !self.wing2_possible(&s, left, d) {
+            return;
+        }
         let off = self.batch_roots.len();
         self.batch_roots.push(0);
         self.batch_roots.extend_from_slice(&self.path);
@@ -1135,6 +1154,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     /// `nd`.
     #[inline(always)]
     fn push_child(&mut self, nd: &BNode, c: &P1State, idx: u64, m: usize, d: u8) {
+        if !self.wing2_possible(c, nd.left - 1, d) {
+            return;
+        }
         let id = self.batch_tree.len() as u32;
         self.batch_tree.push((nd.id, m as u8));
         self.t.mask.as_ref().unwrap().prefetch(self.t, idx);
@@ -1150,6 +1172,24 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             last: m as u8,
             d,
         });
+    }
+
+    /// Can a node (state `s`, `left` moves left, staging distance `d`) still reach an
+    /// endpoint, by the wing lookahead (only nodes with 2 moves left, over all pairs; see
+    /// [`crate::wing2`])?
+    #[inline(always)]
+    fn wing2_possible(&mut self, s: &P1State, left: u8, d: u8) -> bool {
+        if left != 2 || self.pair != ALL_PAIRS {
+            return true;
+        }
+        match &self.t.wing2 {
+            Some(w) => {
+                let ok = w.possible(&s.pos, s.parity, d == 2);
+                self.wing2_cut += !ok as u64;
+                ok
+            }
+            None => true,
+        }
     }
 
     /// Set `self.path` to the path of batch node `id` (see [`Search1::batch_tree`]).
@@ -1217,6 +1257,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     // own entry, as in `dfs_eq`; they are all queued, or with one move left
                     // tested.
                     let (d, left) = (nd.d, nd.left);
+                    if left == 2 {
+                        self.prof[3 + d as usize] += 1;
+                    }
                     let allowed = ALLOWED_AFTER[nd.last as usize];
                     let (dec, eq) = mt.get_dec_eq(nd.idx, nd.sym);
                     let (dec, eq) = (dec & allowed, eq & allowed);
@@ -1231,6 +1274,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         let c = s.apply(m, t);
                         if left == 2 {
                             let run = run_after(nd.run, nd.last as usize, m);
+                            self.prof[0] += 1;
                             self.leaf(&c, dc, m, None, run, Some((nd.id, Some(m as u8))));
                             if self.stop {
                                 self.batch.clear();
@@ -1247,8 +1291,14 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 }
                 // A node whose wing parity cannot reach an endpoint in moves left = distance
                 // moves (its entry's viability bit, see `MaskTable::add_viable`) is dropped.
+                if nd.left == 2 {
+                    self.prof[5] += 1;
+                }
                 if viable && !mt.viable(nd.idx, nd.parity) {
                     self.reads += 1;
+                    if nd.left == 2 {
+                        self.prof[6] += 1;
+                    }
                     continue;
                 }
                 let mut a =
@@ -1292,6 +1342,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         a &= a - 1;
                         let c = s.apply(m, t);
                         let run = run_after(nd.run, nd.last as usize, m);
+                        self.prof[1] += 1;
                         self.leaf(&c, 1, m, None, run, Some((nd.id, Some(m as u8))));
                         if self.stop {
                             self.batch.clear();
@@ -1566,6 +1617,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             test &= WIDE_MOVES;
         }
         let centres = s.centres;
+        self.prof[2] += 1;
+        self.prof[7] += test.count_ones() as u64;
         while test != 0 {
             let m = test.trailing_zeros() as usize;
             test &= test - 1;

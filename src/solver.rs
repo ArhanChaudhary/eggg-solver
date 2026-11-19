@@ -104,6 +104,8 @@ impl Solution {
 
 #[derive(Default, Debug, Clone)]
 pub struct Stats {
+    /// Phase-2 candidates kept when made (endpoint x frame within the phase-2 limit).
+    pub kept: usize,
     pub nodes1: u64,
     pub nodes2: u64,
     pub nodes3: u64,
@@ -775,6 +777,7 @@ impl<'a, 'r> Run<'a, 'r> {
             let mut made = made.into_inner().unwrap();
             made.sort_unstable_by_key(|m| m.0);
             self.made_cands += eps.iter().map(|e| e.1.count_ones() as usize).sum::<usize>();
+            self.stats.kept += made.iter().map(|m| m.1.len()).sum::<usize>();
             self.cands.extend(made.into_iter().flat_map(|m| m.1));
             self.cand_time += tc.elapsed();
         }
@@ -1205,7 +1208,7 @@ pub fn load_mask(p1: &mut P1Tables, dir: &std::path::Path, big: bool, verbose: b
 }
 
 /// Load or build the phase-2 tables in `dir`; `joint`: also the joint table (1.05 GB).
-fn load_p2(dir: &std::path::Path, joint: bool, threads: usize, verbose: bool) -> P2Tables {
+pub fn load_p2(dir: &std::path::Path, joint: bool, threads: usize, verbose: bool) -> P2Tables {
     let p2_path = dir.join("p2-tau.tab");
     let mut p2 = {
         let n = crate::phase2::N_TAU;

@@ -17,3 +17,4 @@ pub mod phase3;
 pub mod simd;
 pub mod solver;
 pub mod table;
+pub mod wing2;
