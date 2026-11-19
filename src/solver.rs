@@ -521,8 +521,11 @@ impl<'a, 'r> Run<'a, 'r> {
             debug(
                 self.start,
                 &format!(
-                    "phase 1: {} endpoints (length {}), nodes {}",
-                    self.made_cands, self.level.len, self.stats.nodes1
+                    "phase 1: {} endpoints (length {}), nodes {}, cut at {:?} s",
+                    self.made_cands,
+                    self.level.len,
+                    self.stats.nodes1,
+                    self.p1_cut.map(|c| (c - self.start).as_secs_f64())
                 ),
             );
             // A round whose phase 1 was cut short asks phase 2 for proportionally fewer
@@ -648,6 +651,10 @@ impl<'a, 'r> Run<'a, 'r> {
             let close = Close::new(self.p1_cut);
             let idle = AtomicUsize::new(0);
             let out = Mutex::new(vec![]);
+            // Once a solution exists, a candidate whose phase-2 bound already puts its
+            // reductions past the deepest level phase 2 will ever search is never needed.
+            let limit = self.useful_l12();
+            let (tables, cube) = (self.t, &self.cube);
             std::thread::scope(|s| {
                 for _ in 0..threads {
                     s.spawn(|| {
@@ -684,7 +691,21 @@ impl<'a, 'r> Run<'a, 'r> {
                             if found.fetch_add(k, Ordering::Relaxed) + k >= need {
                                 close.raise();
                             }
-                            local.push((j, eps, spill));
+                            // The candidates of the (endpoint, frame) pairs, made here rather
+                            // than after the batch (standardising and the phase-2 bounds cost
+                            // ~30 us each): a batch cut at the round's phase-1 cut then ends
+                            // there, not seconds later. (Levels, jobs and handed-back subtrees
+                            // are disjoint: no endpoint comes twice.)
+                            let mut cands = vec![];
+                            for (moves, frames) in eps {
+                                for f in (0..3).filter(|f| frames >> f & 1 == 1) {
+                                    cands.extend(
+                                        make_candidate(tables, cube, &moves, f)
+                                            .filter(|c| c.moves1.len() + c.h2 as usize <= limit),
+                                    );
+                                }
+                            }
+                            local.push((j, k, cands, spill));
                         }
                         nodes.fetch_add(n, Ordering::Relaxed);
                         out.lock().unwrap().extend(local);
@@ -693,8 +714,7 @@ impl<'a, 'r> Run<'a, 'r> {
             });
             self.stats.nodes1 += nodes.load(Ordering::Relaxed);
             if self.stopped() {
-                // The run is over: these endpoints would never be searched (making their
-                // candidates took up to seconds past the time limit in long runs).
+                // The run is over: these endpoints would never be searched.
                 break;
             }
             let next = claimed.load(Ordering::Relaxed).min(jobs.len());
@@ -704,7 +724,7 @@ impl<'a, 'r> Run<'a, 'r> {
             let mut rest: Vec<(u8, Vec<u8>)> = vec![];
             for r in &mut results {
                 let pair = jobs[r.0].0;
-                rest.extend(r.2.drain(..).map(|p| (pair, p)));
+                rest.extend(r.3.drain(..).map(|p| (pair, p)));
             }
             if rest.is_empty() {
                 self.level.next = next;
@@ -713,37 +733,11 @@ impl<'a, 'r> Run<'a, 'r> {
                 self.level.jobs = rest;
                 self.level.next = 0;
             }
-            // New (endpoint, frame) pairs, in job order; their candidates are made in
-            // parallel (standardising and the phase-2 bounds cost ~30 us each).
-            let mut todo: Vec<(Vec<u8>, usize)> = vec![];
-            for (_, eps, _) in results {
-                for (moves, frames) in eps {
-                    for f in 0..3 {
-                        // (Levels, jobs and handed-back subtrees are disjoint: no endpoint
-                        // comes twice.)
-                        if frames >> f & 1 == 1 {
-                            todo.push((moves.clone(), f));
-                        }
-                    }
-                }
+            // The new candidates, in job order.
+            for (_, k, cands, _) in results {
+                self.made_cands += k;
+                self.cands.extend(cands);
             }
-            let made: Vec<Mutex<Option<Candidate>>> =
-                (0..todo.len()).map(|_| Mutex::new(None)).collect();
-            let (t, cube) = (self.t, &self.cube);
-            crate::par::for_chunks(todo.len(), 64, |r| {
-                for i in r {
-                    *made[i].lock().unwrap() = make_candidate(t, cube, &todo[i].0, todo[i].1);
-                }
-            });
-            self.made_cands += todo.len();
-            // Once a solution exists, a candidate whose phase-2 bound already puts its
-            // reductions past the deepest level phase 2 will ever search is never needed.
-            let limit = self.useful_l12();
-            self.cands.extend(
-                made.into_iter()
-                    .filter_map(|m| m.into_inner().unwrap())
-                    .filter(|c| c.moves1.len() + c.h2 as usize <= limit),
-            );
         }
         self.stats.endpoints = self.made_cands;
     }
