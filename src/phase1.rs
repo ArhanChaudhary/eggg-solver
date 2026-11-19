@@ -1566,12 +1566,21 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             test &= WIDE_MOVES;
         }
         let centres = s.centres;
+        // The staging test first, for all the moves (its outcome is close to a coin flip:
+        // without branches on it, no mispredictions), then the wing tests in move order.
+        if check_staged {
+            let mut a = test;
+            let mut ok = 0u32;
+            while a != 0 {
+                let m = a.trailing_zeros() as usize;
+                a &= a - 1;
+                ok |= (t.staged_after(&centres, m) as u32) << m;
+            }
+            test = ok;
+        }
         while test != 0 {
             let m = test.trailing_zeros() as usize;
             test &= test - 1;
-            if check_staged && !t.staged_after(&centres, m) {
-                continue;
-            }
             let excl = unsafe { *t.p2_frames.get_unchecked(m) } as u32
                 | run_frames as u32 & 0u32.wrapping_sub(same >> m & 1);
             let p = unsafe { t.wing_dst.get_unchecked(m) }.gather(&pos);
