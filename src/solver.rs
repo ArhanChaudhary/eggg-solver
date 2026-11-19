@@ -68,6 +68,10 @@ pub struct Options {
     pub endpoints: usize,
     /// Reductions collected in the first round (doubled each round).
     pub reductions: usize,
+    /// Once a solution exists, search each new phase-1 length's jobs best first, by their
+    /// prefix's yield at the previous length (see [`order_by_yield`]); otherwise in move
+    /// order.
+    pub order_jobs: bool,
 }
 
 impl Default for Options {
@@ -79,6 +83,7 @@ impl Default for Options {
             threads: crate::par::threads(),
             endpoints: 128,
             reductions: 32,
+            order_jobs: true,
         }
     }
 }
@@ -354,6 +359,46 @@ fn make_candidates(
     }
 }
 
+/// The first three moves of a phase-1 path (the driver's job prefixes at lengths >= 7).
+fn prefix3(moves: &[u8]) -> Option<[u8; 3]> {
+    moves.get(..3).map(|p| [p[0], p[1], p[2]])
+}
+
+/// Reorder a new phase-1 level's jobs best first, by the yield of their 3-move prefix at the
+/// previous length (`yields`: kept candidates and phase-1 nodes per prefix): kept candidates
+/// per node, smoothed towards the mean over all prefixes by one mean-sized job's worth of
+/// nodes (unknown prefixes get the mean); ties keep their order. The jobs are only permuted.
+///
+/// A job's yield at one length predicts its yield at the next (its 3-move prefix fixes much
+/// of the centres' and wings' structure): sampled on 4 cubes, the quarter of the length-16
+/// jobs with the best length-15 yield held 60% of the length-16 kept candidates in 45% of the
+/// nodes. Only the last length a run reaches is searched partly, so only there does the
+/// order matter: its best jobs come first.
+fn order_by_yield(jobs: &mut Vec<(u8, Vec<u8>)>, yields: &HashMap<[u8; 3], (u64, u64)>) {
+    if yields.is_empty() {
+        return;
+    }
+    let (kept, nodes) = yields
+        .values()
+        .fold((0u64, 0u64), |a, v| (a.0 + v.0, a.1 + v.1));
+    let mean_nodes = (nodes as f64 / yields.len() as f64).max(1.0);
+    let rate = kept as f64 / (nodes as f64).max(1.0);
+    let score = |p: &[u8]| {
+        let (k, n) = prefix3(p)
+            .and_then(|key| yields.get(&key).copied())
+            .unwrap_or((0, 0));
+        (k as f64 + rate * mean_nodes) / (n as f64 + mean_nodes)
+    };
+    let mut order: Vec<(f64, usize)> = jobs
+        .iter()
+        .enumerate()
+        .map(|(i, j)| (score(&j.1), i))
+        .collect();
+    order.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut old: Vec<Option<(u8, Vec<u8>)>> = jobs.drain(..).map(Some).collect();
+    jobs.extend(order.iter().map(|&(_, i)| old[i].take().unwrap()));
+}
+
 /// The frame rotation of a candidate's phase 2, the last phase-1 move in that frame, and the
 /// moves allowed to open phase 2 (see [`first_moves`]).
 fn phase2_root(c: &Candidate) -> (Mat, usize, u32) {
@@ -412,6 +457,12 @@ struct Run<'a, 'r> {
     cands: Vec<Candidate>,
     reds: Vec<Reduction>,
     red_index: HashMap<(usize, Cube3), usize>,
+    /// See [`Options::order_jobs`].
+    order_jobs: bool,
+    /// Per 3-move job prefix, (kept candidates, phase-1 nodes) at the current length so far
+    /// and at the previous length.
+    yields: HashMap<[u8; 3], (u64, u64)>,
+    prev_yields: HashMap<[u8; 3], (u64, u64)>,
 }
 
 impl<'a> Solver<'a> {
@@ -481,6 +532,9 @@ impl<'a> Solver<'a> {
             cands: vec![],
             reds: vec![],
             red_index: HashMap::new(),
+            order_jobs: self.opts.order_jobs,
+            yields: HashMap::new(),
+            prev_yields: HashMap::new(),
         };
         run.level.jobs = run.level_jobs(len0);
         std::thread::scope(|scope| {
@@ -670,12 +724,16 @@ impl<'a, 'r> Run<'a, 'r> {
             && !self.p1_cut.is_some_and(|c| Instant::now() >= c)
         {
             if self.level.next >= self.level.jobs.len() {
+                // The level is complete: its yields rank the next level's jobs, once a
+                // solution exists (before, every candidate counts as kept, and the order
+                // made some first solutions later on the M2).
                 let len = self.level.len + 1;
-                self.level = Level1 {
-                    len,
-                    jobs: self.level_jobs(len),
-                    next: 0,
-                };
+                self.prev_yields = std::mem::take(&mut self.yields);
+                let mut jobs = self.level_jobs(len);
+                if self.order_jobs && self.best.is_some() {
+                    order_by_yield(&mut jobs, &self.prev_yields);
+                }
+                self.level = Level1 { len, jobs, next: 0 };
                 continue;
             }
             let need = want - self.made_cands;
@@ -724,12 +782,14 @@ impl<'a, 'r> Run<'a, 'r> {
                             let last = prefix.last().map(|&m| m as usize).unwrap_or(N_MOVES);
                             let left = len - prefix.len() as u8;
                             p1_run(&mut srch, &st, d, left, last, 2, &close, &mut spill);
-                            n += srch.nodes;
+                            let job_nodes = srch.nodes;
+                            drop(srch);
+                            n += job_nodes;
                             let k: usize = eps.iter().map(|e| e.1.count_ones() as usize).sum();
                             if found.fetch_add(k, Ordering::Relaxed) + k >= need {
                                 close.raise();
                             }
-                            local.push((j, eps, spill));
+                            local.push((j, eps, spill, job_nodes));
                         }
                         nodes.fetch_add(n, Ordering::Relaxed);
                         out.lock().unwrap().extend(local);
@@ -747,6 +807,11 @@ impl<'a, 'r> Run<'a, 'r> {
             results.sort_by_key(|r| r.0);
             // Subtrees handed back go first, then the jobs not yet claimed.
             let mut rest: Vec<(u8, Vec<u8>)> = vec![];
+            for r in &results {
+                if let Some(k) = prefix3(&jobs[r.0].1) {
+                    self.yields.entry(k).or_default().1 += r.3;
+                }
+            }
             for r in &mut results {
                 let pair = jobs[r.0].0;
                 rest.extend(r.2.drain(..).map(|p| (pair, p)));
@@ -775,6 +840,11 @@ impl<'a, 'r> Run<'a, 'r> {
             let mut made = made.into_inner().unwrap();
             made.sort_unstable_by_key(|m| m.0);
             self.made_cands += eps.iter().map(|e| e.1.count_ones() as usize).sum::<usize>();
+            for c in made.iter().flat_map(|m| &m.1) {
+                if let Some(k) = prefix3(&c.moves1) {
+                    self.yields.entry(k).or_default().0 += 1;
+                }
+            }
             self.cands.extend(made.into_iter().flat_map(|m| m.1));
             self.cand_time += tc.elapsed();
         }
@@ -1850,6 +1920,124 @@ mod tests {
         assert!(total > 1000, "too few solutions to test ({total})");
     }
 
+    /// [`order_by_yield`] permutes the jobs, best smoothed yield first, unknown prefixes at
+    /// the mean, ties in their order.
+    #[test]
+    fn job_order_is_a_permutation_by_yield() {
+        let jobs: Vec<(u8, Vec<u8>)> = vec![
+            (3, vec![0, 3, 6]),
+            (3, vec![0, 3, 7]),
+            (3, vec![1, 4]),
+            (3, vec![2, 5, 8, 1]),
+            (3, vec![0, 3, 6, 9]),
+        ];
+        let mut o = jobs.clone();
+        order_by_yield(&mut o, &HashMap::new());
+        assert_eq!(o, jobs);
+        // Rates 0, 0.05, 0.01; mean 0.02: scores 0.01, 0.035, 0.015, unknown 0.02.
+        let y = HashMap::from([
+            ([0, 3, 6], (0, 1000)),
+            ([0, 3, 7], (50, 1000)),
+            ([2, 5, 8], (10, 1000)),
+        ]);
+        order_by_yield(&mut o, &y);
+        let at = |i: usize| jobs[i].clone();
+        assert_eq!(o, vec![at(1), at(2), at(3), at(0), at(4)]);
+    }
+
+    /// With the jobs of each new length ordered by yield, phase 1 finds exactly the
+    /// candidates of the plain order at every completed length (jobs cut short and resumed
+    /// as the driver does), and the order does change.
+    #[test]
+    fn ordered_levels_find_the_same_candidates() {
+        let t = load_tables(std::path::Path::new("tables"), 3, 8, false);
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(17);
+        for _ in 0..2 {
+            let cube = Cube::random(&mut rng);
+            let root = P1State::from_cube(&cube);
+            let pairs = vec![crate::phase1::ALL_PAIRS];
+            let mut d0 = [0u8; 4];
+            d0[pairs[0]] = t.p1.distance_pair(&root, pairs[0]);
+            let last = d0[pairs[0]] + 4;
+            let mut found = vec![];
+            for order_jobs in [false, true] {
+                let (stop, have) = (AtomicBool::new(false), AtomicBool::new(false));
+                let mut report = |_: &Solution| {};
+                let start = Instant::now();
+                let mut run = Run {
+                    t: &t,
+                    cube,
+                    threads: 4,
+                    stop: &stop,
+                    have: &have,
+                    start,
+                    limit: start + Duration::from_secs(3600),
+                    p1_cut: None,
+                    p2_cut: None,
+                    split2: u8::MAX,
+                    best: None,
+                    report: &mut report,
+                    target: None,
+                    stats: Stats::default(),
+                    root,
+                    d0,
+                    pairs: pairs.clone(),
+                    level: Level1 {
+                        len: d0[crate::phase1::ALL_PAIRS],
+                        jobs: vec![],
+                        next: 0,
+                    },
+                    made_cands: 0,
+                    cand_time: Duration::ZERO,
+                    made_reds: 0,
+                    cands: vec![],
+                    reds: vec![],
+                    red_index: HashMap::new(),
+                    order_jobs,
+                    yields: HashMap::new(),
+                    prev_yields: HashMap::new(),
+                };
+                run.level.jobs = run.level_jobs(run.level.len);
+                // The order applies once a solution exists (a 60-move one keeps every
+                // candidate).
+                run.best = Some(Solution {
+                    moves: vec![0; 60],
+                    phases: [0; 3],
+                    elapsed: Duration::ZERO,
+                });
+                let mut want = 64;
+                while run.level.len <= last {
+                    run.phase1(want);
+                    want *= 2;
+                }
+                let mut c: Vec<(Vec<u8>, usize)> = run
+                    .cands
+                    .iter()
+                    .filter(|c| c.moves1.len() <= last as usize)
+                    .map(|c| (c.moves1.clone(), c.frame))
+                    .collect();
+                c.sort();
+                found.push(c);
+                if order_jobs {
+                    let plain = run.level_jobs(last + 1);
+                    let mut o = plain.clone();
+                    order_by_yield(&mut o, &run.prev_yields);
+                    assert_ne!(o, plain);
+                    o.sort();
+                    let mut p = plain;
+                    p.sort();
+                    assert_eq!(o, p);
+                }
+            }
+            assert!(
+                found[0].len() > 100,
+                "too few candidates ({})",
+                found[0].len()
+            );
+            assert_eq!(found[0], found[1]);
+        }
+    }
+
     /// A phase-2 level with every search split gives exactly the reductions of the unsplit
     /// searches, in the same order.
     #[test]
@@ -1896,6 +2084,9 @@ mod tests {
                 cands: vec![],
                 reds: vec![],
                 red_index: HashMap::new(),
+                order_jobs: true,
+                yields: HashMap::new(),
+                prev_yields: HashMap::new(),
             };
             run.level.jobs = run.level_jobs(run.level.len);
             run.phase1(1000);

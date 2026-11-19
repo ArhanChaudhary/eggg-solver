@@ -100,7 +100,9 @@ orientation, so the output needs no rotations.
 
 The driver collects many phase-1 endpoints and reductions and searches phase 3 level by
 level on the total length over all of them, so each solution found is the shortest the pool
-allows; the pool grows while time remains. Once a solution exists, phase 2 only produces
+allows; the pool grows while time remains. Once a solution exists, each new phase-1 length searches
+its jobs (3-move prefixes) best first, by their kept-candidate yield per node at the previous
+length, so the length the time limit cuts short has searched its most productive subtrees. Once a solution exists, phase 2 only produces
 reductions that a short enough phase 3 could still turn into a shorter solution: phase 3 of
 at most 14 moves at first, 13 after 3 s and 12 after 6 s. Each deeper level has ~16x the
 reductions and each is ~13x less likely to have a short enough phase 3, so every level adds

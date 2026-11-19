@@ -275,6 +275,9 @@ struct SearchArgs {
     /// Reductions collected in the first round (doubled each round).
     #[arg(long, default_value_t = Options::default().reductions)]
     reductions: usize,
+    /// Search each new phase-1 length's jobs in move order, not best first (for comparisons).
+    #[arg(long, hide = true)]
+    no_job_order: bool,
 }
 
 #[derive(Args, Clone)]
@@ -416,6 +419,7 @@ fn options(limits: &LimitArgs, search: &SearchArgs, threads: usize) -> Options {
         threads,
         endpoints: search.endpoints,
         reductions: search.reductions,
+        order_jobs: !search.no_job_order,
     }
 }
 
