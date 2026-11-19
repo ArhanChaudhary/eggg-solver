@@ -294,6 +294,8 @@ struct Run<'a, 'r> {
     level: Level1,
     /// Candidates made so far (including those dropped as hopeless).
     made_cands: usize,
+    /// Wall time spent making candidates.
+    cand_time: Duration,
     /// Reductions stored so far (including those dropped since).
     made_reds: usize,
     cands: Vec<Candidate>,
@@ -359,6 +361,7 @@ impl<'a> Solver<'a> {
                 next: 0,
             },
             made_cands: 0,
+            cand_time: Duration::ZERO,
             made_reds: 0,
             cands: vec![],
             reds: vec![],
@@ -427,8 +430,12 @@ impl<'a, 'r> Run<'a, 'r> {
             debug(
                 self.start,
                 &format!(
-                    "phase 1: {} endpoints (length {}), nodes {}",
-                    self.made_cands, self.level.len, self.stats.nodes1
+                    "phase 1: {} endpoints (length {}), nodes {}, {:.3} s, candidates made in {:.3} s",
+                    self.made_cands,
+                    self.level.len,
+                    self.stats.nodes1,
+                    self.stats.time[0].as_secs_f64(),
+                    self.cand_time.as_secs_f64()
                 ),
             );
             let tp = Instant::now();
@@ -603,6 +610,7 @@ impl<'a, 'r> Run<'a, 'r> {
             }
             // New (endpoint, frame) pairs, in job order; their candidates are made in
             // parallel (standardising and the phase-2 bounds cost ~30 us each).
+            let tc = Instant::now();
             let mut todo: Vec<(Vec<u8>, usize)> = vec![];
             for (_, eps, _) in results {
                 for (moves, frames) in eps {
@@ -632,6 +640,7 @@ impl<'a, 'r> Run<'a, 'r> {
                     .filter_map(|m| m.into_inner().unwrap())
                     .filter(|c| c.moves1.len() + c.h2 as usize <= limit),
             );
+            self.cand_time += tc.elapsed();
         }
         self.stats.endpoints = self.made_cands;
     }
