@@ -977,6 +977,11 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     pub nodes: u64,
     /// Table entries read (each a likely cache miss): children's distances, move masks.
     pub reads: u64,
+    /// Profiling counters: [upper dfs_t expansions (d < left, left >= 2), batch nodes
+    /// expanded, batch rounds, leaf calls, wing tests, endpoints, nodes pushed to batches from
+    /// dfs_t, upper dfs_t expansions with d == left - 1 (all children go to batches or are
+    /// pruned)].
+    pub prof: [u64; 8],
     pub on_endpoint: F,
     pub stop: bool,
     pub abort: Option<&'a std::sync::atomic::AtomicBool>,
@@ -1085,6 +1090,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             path: Vec::with_capacity(32),
             nodes: 0,
             reads: 0,
+            prof: [0; 8],
             on_endpoint,
             stop: false,
             abort: None,
@@ -1201,6 +1207,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.state(), self.pair);
                 }
             }
+            self.prof[2] += 1;
+            self.prof[1] += cur.len() as u64;
             for nd in &cur {
                 let s = nd.state();
                 let mut a =
@@ -1345,6 +1353,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         run: u32,
         batch: Option<(u32, Option<u8>)>,
     ) {
+        self.prof[3] += 1;
         // The last move must leave the wing permutation even, and the wings pairable in a
         // frame where the path's trailing run of same-axis moves has no phase-2 move (else
         // the shorter endpoint without them, with them opening phase 2, covers it): both
@@ -1388,6 +1397,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             if check_staged && !t.staged_after(&centres, m) {
                 continue;
             }
+            self.prof[4] += 1;
             let excl = unsafe { *t.p2_frames.get_unchecked(m) } as u32
                 | run_frames as u32 & 0u32.wrapping_sub(same >> m & 1);
             let p = unsafe { t.wing_dst.get_unchecked(m) }.gather(&pos);
@@ -1414,6 +1424,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 }
             }
             if frames != 0 {
+                self.prof[5] += 1;
                 if let Some((id, mv)) = batch {
                     self.set_batch_path(id);
                     self.path.extend(mv);
@@ -1462,6 +1473,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             return;
         }
         let mut allowed = ALLOWED_AFTER[last];
+        self.prof[0] += 1;
+        if d + 1 == left {
+            self.prof[7] += 1;
+        }
         let t = self.t;
         // Stage 1: the children's centre masks, and a prefetch of their table entry (large
         // tables) or class info (reduced tables); stage 2 (reduced tables): table indices,
@@ -1577,6 +1592,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     } else {
                         t.mask.as_ref().unwrap().pre_index(t, &c, self.pair)
                     };
+                    self.prof[6] += 1;
                     self.push_batch(c, i, dc, m, Some(m as u8));
                     if self.batch.len() >= t.mask.as_ref().unwrap().batch {
                         self.run_batch();

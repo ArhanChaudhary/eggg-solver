@@ -166,6 +166,17 @@ fn transpose(m: &Mat) -> Mat {
     t
 }
 
+fn prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("EGGG_PROF").is_some())
+}
+
+fn prof(start: Instant, msg: &str) {
+    if prof_on() {
+        eprintln!("P|{:.4}|{msg}", start.elapsed().as_secs_f64());
+    }
+}
+
 fn debug(start: Instant, msg: &str) {
     if std::env::var_os("EGGG_DEBUG").is_some() {
         eprintln!("[{:8.3}] {msg}", start.elapsed().as_secs_f64());
@@ -177,6 +188,16 @@ pub fn verify(facelets: &Facelets, moves: &[u8]) -> bool {
         f.apply_turn(crate::moves::turn_of(m as usize))
     });
     end.is_solved()
+}
+
+struct BusyGuard<'a>(&'a Mutex<f64>, Instant);
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() += self.1.elapsed().as_secs_f64();
+    }
+}
+fn scopeguard(m: &Mutex<f64>, t: Instant) -> BusyGuard<'_> {
+    BusyGuard(m, t)
 }
 
 /// Run `work(i)` for i in 0..n on `threads` threads, claiming indices in order.
@@ -299,6 +320,15 @@ struct Run<'a, 'r> {
     cands: Vec<Candidate>,
     reds: Vec<Reduction>,
     red_index: HashMap<(usize, Cube3), usize>,
+    /// Profiling: phase-1 search counters, candidates dropped unsearched, reductions dropped
+    /// unchecked, phase of the round in progress (1, 2, 3), its start time.
+    p1prof: [u64; 8],
+    dropped_cands_unsearched: usize,
+    dropped_reds_unchecked: usize,
+    kept_cands: usize,
+    cur_phase: u8,
+    round_start: f64,
+    round_made0: usize,
 }
 
 impl<'a> Solver<'a> {
@@ -363,6 +393,13 @@ impl<'a> Solver<'a> {
             cands: vec![],
             reds: vec![],
             red_index: HashMap::new(),
+            p1prof: [0; 8],
+            dropped_cands_unsearched: 0,
+            dropped_reds_unchecked: 0,
+            kept_cands: 0,
+            cur_phase: 0,
+            round_start: 0.0,
+            round_made0: 0,
         };
         run.level.jobs = run.level_jobs(len0);
         std::thread::scope(|scope| {
@@ -382,6 +419,7 @@ impl<'a> Solver<'a> {
                 }
             });
             run.rounds(self.opts.endpoints, self.opts.reductions);
+            run.prof_end();
             if std::env::var_os("EGGG_DEBUG").is_some() {
                 let mut h1 = std::collections::BTreeMap::new();
                 for c in &run.cands {
@@ -407,6 +445,34 @@ impl<'a, 'r> Run<'a, 'r> {
         self.stop.load(Ordering::Relaxed)
     }
 
+    fn prof_end(&self) {
+        if !prof_on() {
+            return;
+        }
+        let never2 = self.cands.iter().filter(|c| c.done2 == 0).count();
+        let never3 = self.reds.iter().filter(|r| r.done3 == 0).count();
+        prof(
+            self.start,
+            &format!(
+                "END phase={} round_start={:.4} round_made={} made_cands={} kept_cands={} cands={} cands_unsearched={} dropped_cands_unsearched={} made_reds={} reds={} reds_unchecked={} dropped_reds_unchecked={} best={} p1prof={:?}",
+                self.cur_phase,
+                self.round_start,
+                self.made_cands - self.round_made0,
+                self.made_cands,
+                self.kept_cands,
+                self.cands.len(),
+                never2,
+                self.dropped_cands_unsearched,
+                self.made_reds,
+                self.reds.len(),
+                never3,
+                self.dropped_reds_unchecked,
+                self.best_len(),
+                self.p1prof
+            ),
+        );
+    }
+
     fn best_len(&self) -> usize {
         self.best.as_ref().map(|b| b.len()).unwrap_or(usize::MAX)
     }
@@ -422,8 +488,12 @@ impl<'a, 'r> Run<'a, 'r> {
             self.stats.rounds += 1;
             let t0 = Instant::now();
             let tp = Instant::now();
+            self.round_start = self.start.elapsed().as_secs_f64();
+            self.round_made0 = self.made_cands;
+            self.cur_phase = 1;
             self.phase1(want1);
             self.stats.time[0] += tp.elapsed();
+            let d1 = tp.elapsed().as_secs_f64();
             debug(
                 self.start,
                 &format!(
@@ -432,8 +502,10 @@ impl<'a, 'r> Run<'a, 'r> {
                 ),
             );
             let tp = Instant::now();
+            self.cur_phase = 2;
             self.phase2(want2);
             self.stats.time[1] += tp.elapsed();
+            let d2 = tp.elapsed().as_secs_f64();
             debug(
                 self.start,
                 &format!(
@@ -452,9 +524,30 @@ impl<'a, 'r> Run<'a, 'r> {
             let factor = if self.best.is_some() { 1.5 } else { 4.5 };
             let budget =
                 (produce.mul_f64(factor).saturating_sub(check)).max(Duration::from_millis(10));
+            self.cur_phase = 3;
             self.phase3_levels(t1 + budget);
             self.stats.time[2] += t1.elapsed();
             check += t1.elapsed();
+            prof(
+                self.start,
+                &format!(
+                    "R round={} start={:.4} p1={:.4} p2={:.4} p3={:.4} budget3={:.4} made_cands={} cands={} reds={} made_reds={} level={} best={} stopped={}",
+                    self.stats.rounds,
+                    self.round_start,
+                    d1,
+                    d2,
+                    t1.elapsed().as_secs_f64(),
+                    budget.as_secs_f64(),
+                    self.made_cands,
+                    self.cands.len(),
+                    self.reds.len(),
+                    self.made_reds,
+                    self.level.len,
+                    self.best_len(),
+                    self.stopped()
+                ),
+            );
+            self.cur_phase = 0;
             if self.stopped() || self.level.len > 40 {
                 return;
             }
@@ -541,11 +634,17 @@ impl<'a, 'r> Run<'a, 'r> {
             let close = AtomicBool::new(false);
             let idle = AtomicUsize::new(0);
             let out = Mutex::new(vec![]);
+            let tstats = Mutex::new(vec![]);
+            let reason = AtomicUsize::new(0);
+            let scope_t0 = Instant::now();
             std::thread::scope(|s| {
                 for _ in 0..threads {
                     s.spawn(|| {
                         let mut local = vec![];
                         let mut n = 0;
+                        let mut busy = 0f64;
+                        let mut nj = 0usize;
+                        let mut pp = [0u64; 8];
                         loop {
                             if stop.load(Ordering::Relaxed) || close.load(Ordering::Relaxed) {
                                 break;
@@ -554,9 +653,16 @@ impl<'a, 'r> Run<'a, 'r> {
                             if j >= jobs.len() {
                                 if (idle.fetch_add(1, Ordering::Relaxed) + 1) * 4 >= threads {
                                     close.store(true, Ordering::Relaxed);
+                                    let _ = reason.compare_exchange(
+                                        0,
+                                        2,
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed,
+                                    );
                                 }
                                 break;
                             }
+                            let tj = Instant::now();
                             let (pair, ref prefix) = jobs[j];
                             let pair = pair as usize;
                             let (st, d) = root.after_pair(prefix, d0[pair], t, pair);
@@ -573,18 +679,87 @@ impl<'a, 'r> Run<'a, 'r> {
                             let left = len - prefix.len() as u8;
                             p1_run(&mut srch, &st, d, left, last, 2, &close, &mut spill);
                             n += srch.nodes;
+                            for (a, b) in pp.iter_mut().zip(srch.prof) {
+                                *a += b;
+                            }
+                            drop(srch);
+                            busy += tj.elapsed().as_secs_f64();
+                            nj += 1;
                             let k: usize = eps.iter().map(|e| e.1.count_ones() as usize).sum();
                             if found.fetch_add(k, Ordering::Relaxed) + k >= need {
                                 close.store(true, Ordering::Relaxed);
+                                let _ = reason.compare_exchange(
+                                    0,
+                                    1,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                );
                             }
                             local.push((j, eps, spill));
                         }
+                        tstats.lock().unwrap().push((
+                            busy,
+                            scope_t0.elapsed().as_secs_f64(),
+                            nj,
+                            pp,
+                            n,
+                        ));
                         nodes.fetch_add(n, Ordering::Relaxed);
                         out.lock().unwrap().extend(local);
                     });
                 }
             });
             self.stats.nodes1 += nodes.load(Ordering::Relaxed);
+            {
+                let wall = scope_t0.elapsed().as_secs_f64();
+                let ts = tstats.into_inner().unwrap();
+                let busy: f64 = ts.iter().map(|x| x.0).sum();
+                let first = ts.iter().map(|x| x.1).fold(f64::MAX, f64::min);
+                let last = ts.iter().map(|x| x.1).fold(0.0, f64::max);
+                let jobs_run: usize = ts.iter().map(|x| x.2).sum();
+                let mut pp = [0u64; 8];
+                for x in &ts {
+                    for k in 0..8 {
+                        pp[k] += x.3[k];
+                    }
+                }
+                for k in 0..8 {
+                    self.p1prof[k] += pp[k];
+                }
+                let spills: usize = out
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|r: &(usize, Vec<(Vec<u8>, u8)>, Vec<Vec<u8>>)| r.2.len())
+                    .sum();
+                let eps: usize = out
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|r: &(usize, Vec<(Vec<u8>, u8)>, Vec<Vec<u8>>)| {
+                        r.1.iter().map(|e| e.1.count_ones() as usize).sum::<usize>()
+                    })
+                    .sum();
+                prof(
+                    self.start,
+                    &format!(
+                        "P1 len={} wall={:.4} busy={:.4} util={:.3} first_exit={:.4} tail={:.4} reason={} jobs_run={} jobs_left={} spills={} nodes={} eps={} prof={:?}",
+                        len,
+                        wall,
+                        busy,
+                        busy / (wall * threads as f64),
+                        first,
+                        last - first,
+                        reason.load(Ordering::Relaxed),
+                        jobs_run,
+                        jobs.len() - claimed.load(Ordering::Relaxed).min(jobs.len()),
+                        spills,
+                        nodes.load(Ordering::Relaxed),
+                        eps,
+                        pp
+                    ),
+                );
+            }
             let next = claimed.load(Ordering::Relaxed).min(jobs.len());
             let mut results = out.into_inner().unwrap();
             results.sort_by_key(|r| r.0);
@@ -618,19 +793,53 @@ impl<'a, 'r> Run<'a, 'r> {
             let made: Vec<Mutex<Option<Candidate>>> =
                 (0..todo.len()).map(|_| Mutex::new(None)).collect();
             let (t, cube) = (self.t, &self.cube);
+            let tm = Instant::now();
+            let mk_busy = Mutex::new(0f64);
             crate::par::for_chunks(todo.len(), 64, |r| {
+                let tc = Instant::now();
                 for i in r {
                     *made[i].lock().unwrap() = make_candidate(t, cube, &todo[i].0, todo[i].1);
                 }
+                *mk_busy.lock().unwrap() += tc.elapsed().as_secs_f64();
             });
+            let mk_wall = tm.elapsed().as_secs_f64();
             self.made_cands += todo.len();
             // Once a solution exists, a candidate whose phase-2 bound already puts its
             // reductions past the deepest level phase 2 will ever search is never needed.
             let limit = self.useful_l12();
+            let made: Vec<Candidate> = made
+                .into_iter()
+                .filter_map(|m| m.into_inner().unwrap())
+                .collect();
+            let n_some = made.len();
+            let mut by_l1: std::collections::BTreeMap<usize, (usize, usize, [usize; 20])> =
+                Default::default();
+            for c in &made {
+                let e = by_l1.entry(c.moves1.len()).or_insert((0, 0, [0; 20]));
+                e.0 += 1;
+                if c.moves1.len() + c.h2 as usize <= limit {
+                    e.1 += 1;
+                }
+                e.2[(c.h2 as usize).min(19)] += 1;
+            }
+            let before = self.cands.len();
             self.cands.extend(
                 made.into_iter()
-                    .filter_map(|m| m.into_inner().unwrap())
                     .filter(|c| c.moves1.len() + c.h2 as usize <= limit),
+            );
+            self.kept_cands += self.cands.len() - before;
+            prof(
+                self.start,
+                &format!(
+                    "MK n={} some={} kept={} limit={} wall={:.4} busy={:.4} by_l1(made,kept,h2hist)={:?}",
+                    todo.len(),
+                    n_some,
+                    self.cands.len() - before,
+                    limit,
+                    mk_wall,
+                    mk_busy.into_inner().unwrap(),
+                    by_l1
+                ),
             );
         }
         self.stats.endpoints = self.made_cands;
@@ -649,11 +858,19 @@ impl<'a, 'r> Run<'a, 'r> {
             return;
         }
         let limit = self.useful_l12();
+        let n0 = self.cands.len();
+        let u0 = self.cands.iter().filter(|c| c.done2 == 0).count();
         self.cands
             .retain(|c| c.moves1.len() + c.h2.max(c.done2) as usize <= limit);
+        let u1 = self.cands.iter().filter(|c| c.done2 == 0).count();
+        self.dropped_cands_unsearched += u0 - u1;
         let best = self.best_len();
+        let r0 = self.reds.iter().filter(|r| r.done3 == 0).count();
         self.reds
             .retain(|r| r.moves12.len() + (r.h3.max(r.done3) as usize) < best);
+        let r1 = self.reds.iter().filter(|r| r.done3 == 0).count();
+        self.dropped_reds_unchecked += r0 - r1;
+        let _ = n0;
         self.red_index.clear();
         for (i, r) in self.reds.iter().enumerate() {
             self.red_index.insert((r.frame, r.c3), i);
@@ -725,10 +942,13 @@ impl<'a, 'r> Run<'a, 'r> {
         let stop = self.stop;
         let made = AtomicUsize::new(0);
         let ran: Vec<AtomicBool> = (0..jobs.len()).map(|_| AtomicBool::new(false)).collect();
+        let p2t = Mutex::new((0f64, 0f64, 0usize, 0usize));
+        let tw = Instant::now();
         par_jobs(jobs.len(), self.threads, stop, |j| {
             if made.load(Ordering::Relaxed) >= need {
                 return;
             }
+            let tj = Instant::now();
             ran[j].store(true, Ordering::Relaxed);
             let c = &cands[jobs[j]];
             let l2 = (t12 - c.moves1.len()) as u8;
@@ -784,8 +1004,36 @@ impl<'a, 'r> Run<'a, 'r> {
             }
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
             made.fetch_add(local.len(), Ordering::Relaxed);
+            {
+                let dt = tj.elapsed().as_secs_f64();
+                let mut g = p2t.lock().unwrap();
+                g.0 += dt;
+                g.1 = g.1.max(dt);
+                g.2 += seen;
+                g.3 += local.len();
+            }
             out.lock().unwrap().push((j, local));
         });
+        {
+            let g = p2t.into_inner().unwrap();
+            let wall = tw.elapsed().as_secs_f64();
+            prof(
+                self.start,
+                &format!(
+                    "P2 t12={} jobs={} ran={} wall={:.4} busy={:.4} util={:.3} maxjob={:.4} sols={} kept={} nodes={}",
+                    t12,
+                    jobs.len(),
+                    ran.iter().filter(|r| r.load(Ordering::Relaxed)).count(),
+                    wall,
+                    g.0,
+                    g.0 / (wall * self.threads as f64).max(1e-9),
+                    g.1,
+                    g.2,
+                    g.3,
+                    nodes.load(Ordering::Relaxed)
+                ),
+            );
+        }
         if !self.stopped() {
             for (k, &j) in jobs.iter().enumerate() {
                 if !ran[k].load(Ordering::Relaxed) {
@@ -896,10 +1144,14 @@ impl<'a, 'r> Run<'a, 'r> {
         let nodes = AtomicU64::new(0);
         let finished: Vec<AtomicUsize> = (0..reds.len()).map(|_| AtomicUsize::new(0)).collect();
         let stop = self.stop;
+        let p3busy = Mutex::new(0f64);
+        let tw = Instant::now();
         par_jobs(jobs.len(), self.threads, stop, |j| {
             if found.load(Ordering::Relaxed) || Instant::now() >= deadline {
                 return;
             }
+            let tj = Instant::now();
+            let _g = scopeguard(&p3busy, tj);
             let (i, task) = &jobs[j];
             let r = &reds[*i];
             let d = (total - r.moves12.len()) as u8;
@@ -926,6 +1178,23 @@ impl<'a, 'r> Run<'a, 'r> {
             }
         });
         self.stats.nodes3 += nodes.load(Ordering::Relaxed);
+        {
+            let wall = tw.elapsed().as_secs_f64();
+            let b = *p3busy.lock().unwrap();
+            prof(
+                self.start,
+                &format!(
+                    "P3 total={} jobs={} wall={:.4} busy={:.4} util={:.3} found={} nodes={}",
+                    total,
+                    jobs.len(),
+                    wall,
+                    b,
+                    b / (wall * self.threads as f64).max(1e-9),
+                    found.load(Ordering::Relaxed),
+                    nodes.load(Ordering::Relaxed)
+                ),
+            );
+        }
         for i in 0..self.reds.len() {
             if (parts[i] > 0 && finished[i].load(Ordering::Relaxed) == parts[i])
                 || pruned.contains(&i)
