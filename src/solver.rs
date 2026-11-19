@@ -48,6 +48,11 @@ const MIN_ROUND: Duration = Duration::from_millis(20);
 /// ~5 ms to 1.5 s on the M2, the others less than a millisecond (see `Run::phase2_level`).
 const P2_SPLIT_SLACK: u8 = 3;
 
+/// Phase-1 jobs hand back their unstarted subtrees (see `p1_run`) down to subtrees of this
+/// many moves: a 10-move subtree (two levels below a 15-move job's prefix) can take seconds,
+/// a 7-move one ~10 ms on the M2.
+const P1_HAND_BACK: u8 = 7;
+
 pub struct Tables {
     pub p1: P1Tables,
     pub p2: P2Tables,
@@ -685,7 +690,8 @@ impl<'a, 'r> Run<'a, 'r> {
                             srch.path.extend_from_slice(prefix);
                             let last = prefix.last().map(|&m| m as usize).unwrap_or(N_MOVES);
                             let left = len - prefix.len() as u8;
-                            p1_run(&mut srch, &st, d, left, last, 2, &close, &mut spill);
+                            let split = left.saturating_sub(P1_HAND_BACK).max(2);
+                            p1_run(&mut srch, &st, d, left, last, split, &close, &mut spill);
                             n += srch.nodes;
                             let k: usize = eps.iter().map(|e| e.1.count_ones() as usize).sum();
                             if found.fetch_add(k, Ordering::Relaxed) + k >= need {
@@ -1614,8 +1620,8 @@ mod tests {
         assert!(total > 3000, "too few reductions to test ({total})");
     }
 
-    /// Jobs cut short at random points, with their handed-back subtrees searched later, find
-    /// exactly the endpoints of one uninterrupted search.
+    /// Jobs cut short at random points, with their handed-back subtrees (two to four levels
+    /// deep) searched later, find exactly the endpoints of one uninterrupted search.
     #[test]
     fn split_jobs_find_the_same_endpoints() {
         let t = load_p1(std::path::Path::new("tables"), false, 8, false);
@@ -1661,7 +1667,7 @@ mod tests {
                         d,
                         len - prefix.len() as u8,
                         last,
-                        2,
+                        2 + scramble as u8 % 3,
                         &close,
                         &mut spill,
                     );
