@@ -980,6 +980,21 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     pub on_endpoint: F,
     pub stop: bool,
     pub abort: Option<&'a std::sync::atomic::AtomicBool>,
+    /// Once raised, every subtree not yet started (with at least [`SPILL_MIN_LEFT`] moves
+    /// left) is pushed to `spill`, as its move prefix, instead of being searched: a job can
+    /// then be cut short at any depth and its unsearched subtrees searched later (they are
+    /// disjoint from the searched ones, so no endpoint is lost or found twice). Its flag is
+    /// read before each such subtree, its clock every [`CLOCK_NODES`] nodes.
+    pub close: Option<&'a Close>,
+    /// The subtrees handed back after `close` (their move prefixes).
+    pub spill: Vec<Vec<u8>>,
+    /// The node count at which `close`'s clock is read next (then every [`CLOCK_NODES`]
+    /// nodes; a job is claimed after a clock read, so the first comes after `CLOCK_NODES`).
+    pub clock_next: u64,
+    /// The length of the path to the node [`Search1::dfs`] was called on: that node itself
+    /// (queued for a batch at distance = moves left) is never handed back, so that a job
+    /// cut short has always made progress.
+    root_len: usize,
     /// The colour pair whose endpoints (those whose special axis holds it) are searched for,
     /// pruned by its pattern table; [`ALL_PAIRS`]: all endpoints, pruned by the staging table.
     pub pair: usize,
@@ -997,6 +1012,52 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
 
 /// See [`Search1::batch_tree`].
 const ROOT: u32 = 1 << 31;
+
+/// Subtrees with fewer moves left are searched even after [`Search1::close`] (handing them
+/// back costs about as much as searching them).
+pub const SPILL_MIN_LEFT: u8 = 4;
+
+/// A search reads [`Close`]'s clock once per this many nodes (~2 ms per thread on the M2).
+const CLOCK_NODES: u64 = 1 << 18;
+
+/// Tells running phase-1 searches to hand back their unstarted subtrees (see
+/// [`Search1::close`]): raised by [`Close::raise`] (enough endpoints found, threads out of
+/// jobs), or once the clock reaches `at` (a round's phase-1 cut).
+pub struct Close {
+    flag: std::sync::atomic::AtomicBool,
+    at: Option<std::time::Instant>,
+}
+
+impl Close {
+    pub fn new(at: Option<std::time::Instant>) -> Self {
+        Close {
+            flag: std::sync::atomic::AtomicBool::new(false),
+            at,
+        }
+    }
+
+    pub fn raise(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether raised, without reading the clock.
+    #[inline(always)]
+    pub fn flag(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether raised, or past `at` (then raised).
+    pub fn is_raised(&self) -> bool {
+        if self.flag() {
+            return true;
+        }
+        if self.at.is_some_and(|t| std::time::Instant::now() >= t) {
+            self.raise();
+            return true;
+        }
+        false
+    }
+}
 
 /// A node of a batch (moves left = staging distance): its state, mask-table index, and its
 /// path's entry in [`Search1::batch_tree`].
@@ -1091,6 +1152,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             on_endpoint,
             stop: false,
             abort: None,
+            close: None,
+            spill: vec![],
+            clock_next: CLOCK_NODES,
+            root_len: 0,
             pair: ALL_PAIRS,
             batch: vec![],
             batch_next: vec![],
@@ -1152,6 +1217,26 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         });
     }
 
+    /// The path of batch node `id` (see [`Search1::batch_tree`]), unless it is the node
+    /// [`Search1::dfs`] was called on.
+    #[cold]
+    fn batch_spill_path(&self, id: u32) -> Option<Vec<u8>> {
+        let mut tail = vec![];
+        let mut e = self.batch_tree[id as usize];
+        while e.0 & ROOT == 0 {
+            tail.push(e.1);
+            e = self.batch_tree[e.0 as usize];
+        }
+        let off = (e.0 & !ROOT) as usize;
+        let n = self.batch_roots[off] as usize;
+        if tail.is_empty() && n <= self.root_len {
+            return None;
+        }
+        let mut path = self.batch_roots[off + 1..off + 1 + n].to_vec();
+        path.extend(tail.iter().rev());
+        Some(path)
+    }
+
     /// Set `self.path` to the path of batch node `id` (see [`Search1::batch_tree`]).
     #[cold]
     fn set_batch_path(&mut self, id: u32) {
@@ -1200,6 +1285,23 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             if self.stop {
                 self.batch.clear();
                 return;
+            }
+            if self.closing() {
+                // Hand back this round's nodes (none started: queued by the depth-first search,
+                // or children of nodes expanded in the rounds before) with enough moves left.
+                let mut k = 0;
+                for i in 0..cur.len() {
+                    let nd = cur[i];
+                    if nd.left >= SPILL_MIN_LEFT
+                        && let Some(p) = self.batch_spill_path(nd.id)
+                    {
+                        self.spill.push(p);
+                        continue;
+                    }
+                    cur[k] = nd;
+                    k += 1;
+                }
+                cur.truncate(k);
             }
             if matches!(
                 mt.kind,
@@ -1332,6 +1434,36 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         }
     }
 
+    /// After [`Search1::close`]: hand back the child after move `m` (with `left` moves left),
+    /// if it has enough moves left; whether it was handed back.
+    #[inline(always)]
+    fn spill_child(&mut self, m: usize, left: u8) -> bool {
+        if left < SPILL_MIN_LEFT || !self.closing() {
+            return false;
+        }
+        self.path.push(m as u8);
+        self.spill.push(self.path.clone());
+        self.path.pop();
+        true
+    }
+
+    /// Whether [`Search1::close`] is raised: its flag, and every [`CLOCK_NODES`] nodes its
+    /// clock.
+    #[inline(always)]
+    fn closing(&mut self) -> bool {
+        match self.close {
+            None => false,
+            Some(c) => c.flag() || (self.nodes >= self.clock_next && self.read_clock(c)),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn read_clock(&mut self, c: &Close) -> bool {
+        self.clock_next = self.nodes + CLOCK_NODES;
+        c.is_raised()
+    }
+
     /// The fewest moves left of a node queued for a batch (1 if the batches also read the
     /// masks of nodes one move from the end, to test only their staging last moves).
     #[inline(always)]
@@ -1352,6 +1484,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     /// Search below `s` (exact distance `d` in the table guiding this search: staging, or
     /// the pair's pattern table) for paths of exactly `left` more moves.
     pub fn dfs(&mut self, s: &P1State, d: u8, left: u8, last: usize) {
+        self.root_len = self.path.len();
         if self.pair != ALL_PAIRS {
             if self.t.pat.as_ref().unwrap().big {
                 self.dfs_t::<K_PAT_BIG>(s, d, left, last)
@@ -1491,6 +1624,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         while a != 0 {
             let m = a.trailing_zeros() as usize;
             a &= a - 1;
+            if self.spill_child(m, left - 1) {
+                continue;
+            }
             // d - 1, d or d + 1 (the masks are disjoint).
             let dc = d + 1 - 2 * (dec >> m & 1) as u8 - (eq >> m & 1) as u8;
             let c = s.apply(m, t);
@@ -1754,6 +1890,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 dcs[k]
             };
             if dc < left {
+                if self.spill_child(m, left - 1) {
+                    continue;
+                }
                 let c = s.apply(m, t);
                 if batched && dc == left - 1 && dc >= self.batch_min_left() {
                     let i = if K == K_MASK {

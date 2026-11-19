@@ -15,7 +15,7 @@
 use crate::cube::{Cube, Facelets, Mat};
 use crate::cube3::Cube3;
 use crate::moves::{ALLOWED_AFTER, MOVE_PERMS, N_MOVES, frame_rotation, rotate_move};
-use crate::phase1::{P1State, P1Tables, Search1};
+use crate::phase1::{Close, P1State, P1Tables, Search1};
 use crate::phase2::{P2Tables, Search2, Task2, first_moves, standardise};
 use crate::phase3::{P3Tables, Search3, Task};
 
@@ -213,78 +213,6 @@ fn par_jobs(n: usize, threads: usize, stop: &AtomicBool, work: impl Fn(usize) + 
             });
         }
     });
-}
-
-/// Tells the phase-1 jobs of a batch to hand back their unstarted subtrees: raised when enough
-/// endpoints are found or threads run out of jobs, and at time `at` (the round's phase-1 cut).
-struct Close {
-    flag: AtomicBool,
-    at: Option<Instant>,
-}
-
-impl Close {
-    fn new(at: Option<Instant>) -> Self {
-        Close {
-            flag: AtomicBool::new(false),
-            at,
-        }
-    }
-
-    fn raise(&self) {
-        self.flag.store(true, Ordering::Relaxed);
-    }
-
-    fn is_raised(&self) -> bool {
-        if self.flag.load(Ordering::Relaxed) {
-            return true;
-        }
-        if self.at.is_some_and(|t| Instant::now() >= t) {
-            self.raise();
-            return true;
-        }
-        false
-    }
-}
-
-/// Phase-1 search below `srch.path` (state `st`, staging distance `d`, exactly `left` more
-/// moves), expanding the first `split` levels here so that the job can be cut short: once
-/// `close` is raised, each subtree not yet started at those levels is pushed to `spill` (as
-/// its move prefix) instead of being searched. The subtrees visited, and the endpoints found,
-/// are exactly those of `srch.dfs`.
-#[allow(clippy::too_many_arguments)]
-fn p1_run<F: FnMut(&[u8], u8) -> bool>(
-    srch: &mut Search1<'_, F>,
-    st: &P1State,
-    d: u8,
-    left: u8,
-    last: usize,
-    split: u8,
-    close: &Close,
-    spill: &mut Vec<Vec<u8>>,
-) {
-    if split == 0 || left <= 3 {
-        srch.dfs(st, d, left, last);
-        return;
-    }
-    let t = srch.t;
-    let mut allowed = ALLOWED_AFTER[last];
-    while allowed != 0 && !srch.stop {
-        let m = allowed.trailing_zeros() as usize;
-        allowed &= allowed - 1;
-        let c = st.apply(m, t);
-        let dc = Mod3Table::decode(d, srch.value(&c));
-        srch.nodes += 1;
-        if dc >= left {
-            continue;
-        }
-        srch.path.push(m as u8);
-        if close.is_raised() {
-            spill.push(srch.path.clone());
-        } else {
-            p1_run(srch, &c, dc, left - 1, m, split - 1, close, spill);
-        }
-        srch.path.pop();
-    }
 }
 
 /// Phase-2 candidates from phase-1 endpoints `(moves, frame bits)`, appended to `out` in order
@@ -702,7 +630,8 @@ impl<'a, 'r> Run<'a, 'r> {
             let nodes = AtomicU64::new(0);
             // Raised when enough endpoints are found, when a quarter of the threads have run
             // out of jobs, or at the round's phase-1 cut: running jobs then hand back their
-            // unstarted subtrees, so that no thread waits long for the slowest job.
+            // unstarted subtrees (at any depth, see `Search1::close`), so that no thread waits
+            // long for the slowest job and the cut is kept within milliseconds.
             let close = Close::new(self.p1_cut);
             let idle = AtomicUsize::new(0);
             let out = Mutex::new(vec![]);
@@ -726,22 +655,24 @@ impl<'a, 'r> Run<'a, 'r> {
                             let pair = pair as usize;
                             let (st, d) = root.after_pair(prefix, d0[pair], t, pair);
                             let mut eps = vec![];
-                            let mut spill = vec![];
                             let mut srch = Search1::new(t, |p: &[u8], f| {
                                 eps.push((p.to_vec(), f));
+                                let k = f.count_ones() as usize;
+                                if found.fetch_add(k, Ordering::Relaxed) + k >= need {
+                                    close.raise();
+                                }
                                 true
                             });
                             srch.abort = Some(stop);
+                            srch.close = Some(&close);
                             srch.pair = pair;
                             srch.path.extend_from_slice(prefix);
                             let last = prefix.last().map(|&m| m as usize).unwrap_or(N_MOVES);
                             let left = len - prefix.len() as u8;
-                            p1_run(&mut srch, &st, d, left, last, 2, &close, &mut spill);
+                            srch.dfs(&st, d, left, last);
                             n += srch.nodes;
-                            let k: usize = eps.iter().map(|e| e.1.count_ones() as usize).sum();
-                            if found.fetch_add(k, Ordering::Relaxed) + k >= need {
-                                close.raise();
-                            }
+                            let spill = std::mem::take(&mut srch.spill);
+                            drop(srch);
                             local.push((j, eps, spill));
                         }
                         nodes.fetch_add(n, Ordering::Relaxed);
@@ -1950,22 +1881,57 @@ mod tests {
     }
 
     /// Jobs cut short at random points, with their handed-back subtrees searched later, find
-    /// exactly the endpoints of one uninterrupted search.
+    /// exactly the endpoints of one uninterrupted search: with the staging table, and with
+    /// the reduced move-mask table where ./tables has it. A job never hands back its own root.
     #[test]
     fn split_jobs_find_the_same_endpoints() {
-        let t = load_p1(std::path::Path::new("tables"), false, 8, false);
+        let dir = std::path::Path::new("tables");
+        let mut t = load_p1(dir, false, 8, false);
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(7);
-        for scramble in 0..6 {
-            let mut cube = Cube::SOLVED;
-            for _ in 0..9 {
-                let m = rand::Rng::gen_range(&mut rng, 0..N_MOVES);
-                cube = cube.apply_perm(&MOVE_PERMS[m]);
-            }
-            let root = P1State::from_cube(&cube);
+        let scrambles: Vec<P1State> = (0..6)
+            .map(|_| {
+                let mut cube = Cube::SOLVED;
+                for _ in 0..9 {
+                    let m = rand::Rng::gen_range(&mut rng, 0..N_MOVES);
+                    cube = cube.apply_perm(&MOVE_PERMS[m]);
+                }
+                P1State::from_cube(&cube)
+            })
+            .collect();
+        let modes = [0, 1, 2, 0, CLOSE_CLOCK, CLOSE_START];
+        let cases: Vec<_> = scrambles.iter().copied().zip(modes).collect();
+        split_jobs_check(&t, &cases, |d0| d0.max(4)..d0.max(4) + 2);
+        if dir.join("p1-mask2.tab").exists() {
+            load_mask(&mut t, dir, false, false);
+            split_jobs_check(&t, &cases, |d0| d0.max(4)..d0.max(4) + 3);
+            // Random cubes: longer jobs, closed by the clock deep in their search, with nodes
+            // queued for batches.
+            let cases: Vec<_> = (0..2)
+                .map(|_| (P1State::from_cube(&Cube::random(&mut rng)), CLOSE_CLOCK))
+                .collect();
+            split_jobs_check(&t, &cases, |d0| d0 + 1..d0 + 3);
+        }
+    }
+
+    /// [`split_jobs_check`]'s jobs are closed at every third endpoint (from the n-th, n < 3),
+    /// by the clock (`CLOSE_CLOCK`: a cut already past, read after a varied number of nodes),
+    /// or from the start (`CLOSE_START`).
+    const CLOSE_CLOCK: u8 = 3;
+    const CLOSE_START: u8 = 4;
+
+    /// [`split_jobs_find_the_same_endpoints`] per root and how its jobs are closed, for the
+    /// lengths `lens(root distance)`.
+    fn split_jobs_check(
+        t: &P1Tables,
+        cases: &[(P1State, u8)],
+        lens: impl Fn(u8) -> std::ops::Range<u8>,
+    ) {
+        for (case, &(root, mode)) in cases.iter().enumerate() {
             let d0 = t.distance(&root);
-            for len in d0.max(4)..d0.max(4) + 2 {
+            let mut found = 0;
+            for len in lens(d0) {
                 let mut want = vec![];
-                let mut srch = Search1::new(&t, |p: &[u8], f| {
+                let mut srch = Search1::new(t, |p: &[u8], f| {
                     want.push((p.to_vec(), f));
                     true
                 });
@@ -1977,39 +1943,42 @@ mod tests {
                 let mut queue: Vec<Vec<u8>> = vec![vec![]];
                 let mut count = 0usize;
                 while let Some(prefix) = queue.pop() {
-                    let close = Close::new(None);
-                    let (st, d) = root.after(&prefix, d0, &t);
-                    let mut spill = vec![];
-                    let mut srch = Search1::new(&t, |p: &[u8], f| {
+                    // (Closed from the start, a job hands back all it can, but always makes
+                    // progress.)
+                    let past = std::time::Instant::now();
+                    let close = Close::new((mode == CLOSE_CLOCK).then_some(past));
+                    if mode == CLOSE_START {
+                        close.raise();
+                    }
+                    let (st, d) = root.after(&prefix, d0, t);
+                    let mut srch = Search1::new(t, |p: &[u8], f| {
                         got.push((p.to_vec(), f));
                         count += 1;
-                        if count % 3 == scramble % 3 {
+                        if count % 3 == mode as usize {
                             close.raise();
                         }
                         true
                     });
+                    srch.close = Some(&close);
+                    // (The clock is read at varied points, so that closes find nodes queued
+                    // for batches.)
+                    srch.clock_next = 100 + (queue.len() as u64 * 977) % 20000;
                     srch.path.extend_from_slice(&prefix);
                     let last = prefix.last().map(|&m| m as usize).unwrap_or(N_MOVES);
-                    p1_run(
-                        &mut srch,
-                        &st,
-                        d,
-                        len - prefix.len() as u8,
-                        last,
-                        2,
-                        &close,
-                        &mut spill,
-                    );
+                    srch.dfs(&st, d, len - prefix.len() as u8, last);
+                    let spill = std::mem::take(&mut srch.spill);
                     drop(srch);
+                    for p in &spill {
+                        assert!(p.len() > prefix.len() && p.starts_with(&prefix));
+                        assert!(len - p.len() as u8 >= crate::phase1::SPILL_MIN_LEFT);
+                    }
                     queue.extend(spill);
                 }
                 got.sort();
-                assert!(
-                    !want.is_empty() || len == d0,
-                    "no endpoints at length {len}"
-                );
-                assert_eq!(got, want, "scramble {scramble}, length {len}");
+                found += want.len();
+                assert_eq!(got, want, "case {case}, length {len}");
             }
+            assert!(found > 0, "case {case}: no endpoints");
         }
     }
 }
