@@ -37,6 +37,12 @@ const DEEPEST_MARGIN: usize = 13;
 const P1_SHARE: f64 = 1.0 / 1.3;
 const P2_SHARE: f64 = 0.96;
 
+/// Once a solution exists, each round's phase 1 lasts at most this share of the time elapsed
+/// (but at least `MIN_ROUND`): rounds then grow ~1.25x instead of 2x, so that the endpoints
+/// found are searched by phases 2 and 3 sooner.
+const ROUND_SHARE: f64 = 0.25;
+const MIN_ROUND: Duration = Duration::from_millis(20);
+
 pub struct Tables {
     pub p1: P1Tables,
     pub p2: P2Tables,
@@ -458,7 +464,8 @@ impl<'a, 'r> Run<'a, 'r> {
     }
 
     fn rounds(&mut self, endpoints: usize, reductions: usize) {
-        let (mut want1, mut want2) = (endpoints.max(1), reductions.max(1));
+        let (endpoints, reductions) = (endpoints.max(1), reductions.max(1));
+        let (mut want1, mut want2) = (endpoints, reductions);
         // Time spent producing reductions (phases 1 and 2) and checking them (phase 3).
         let (mut produce, mut check) = (Duration::ZERO, Duration::ZERO);
         loop {
@@ -472,10 +479,12 @@ impl<'a, 'r> Run<'a, 'r> {
             // phases 2 and 3 only run after it: without the cut, the last round's endpoints
             // would never be searched (~28% of the run on average). Earlier rounds end long
             // before the cut and are unchanged.
+            // Rounds are also kept small (see `ROUND_SHARE`).
             (self.p1_cut, self.p2_cut) = if self.best.is_some() {
                 let left = self.limit.saturating_duration_since(t0);
+                let small = (t0 - self.start).mul_f64(ROUND_SHARE).max(MIN_ROUND);
                 (
-                    Some(t0 + left.mul_f64(P1_SHARE)),
+                    Some(t0 + left.mul_f64(P1_SHARE).min(small)),
                     Some(t0 + left.mul_f64(P2_SHARE)),
                 )
             } else {
@@ -491,8 +500,16 @@ impl<'a, 'r> Run<'a, 'r> {
                     self.made_cands, self.level.len, self.stats.nodes1
                 ),
             );
+            // A round whose phase 1 was cut short asks phase 2 for proportionally fewer
+            // reductions (the usual ratio of reductions to endpoints).
+            let want2_now = if self.made_cands < want1 {
+                let ratio = reductions as f64 / endpoints as f64;
+                ((self.made_cands as f64 * ratio) as usize).clamp(1, want2)
+            } else {
+                want2
+            };
             let tp = Instant::now();
-            self.phase2(want2);
+            self.phase2(want2_now);
             self.stats.time[1] += tp.elapsed();
             debug(
                 self.start,
@@ -518,8 +535,8 @@ impl<'a, 'r> Run<'a, 'r> {
             if self.stopped() || self.level.len > 40 {
                 return;
             }
-            want1 *= 2;
-            want2 *= 2;
+            want1 = want1.saturating_mul(2);
+            want2 = want2.saturating_mul(2);
         }
     }
 
