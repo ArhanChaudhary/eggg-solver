@@ -577,9 +577,9 @@ impl<'a> Search2<'a> {
         let j = t.joint.as_ref().unwrap();
         let fb = &j.fb;
         let allowed = after & PHASE2_MASK & if left == 1 { last_mask(last) } else { u32::MAX };
-        // Stage 1: children within the centre bound; the class-table entries of both views
-        // prefetched (the class table is 3.3 MB: its misses would stall every index).
+        // Stage 1 (former): children within the centre bound, table entries prefetched.
         let mut kids = [(0u32, [0u8; 16], [0u8; 16], 0usize, 0usize, 0u8); 17];
+        let mut idx = [(0usize, 0usize); 17];
         let mut nk = 0;
         for (i, &m) in P2_MOVES.iter().enumerate() {
             if allowed >> m & 1 == 0 {
@@ -591,26 +591,17 @@ impl<'a> Search2<'a> {
             }
             let t2 = t.tau_move(tau, i);
             let f2 = fb.tau_move(tf, i);
-            let ru = j.raw(c2 / 1680, &t2);
-            j.prefetch_cls(ru);
-            let rf = j.raw(fb.ud(c2), &f2);
-            j.prefetch_cls(rf);
-            kids[nk] = (c2, t2, f2, ru, rf, m);
+            let a = j.index(c2 / 1680, &t2, c2 & 1);
+            j.prefetch(a);
+            let b = j.index(fb.ud(c2), &f2, c2 & 1);
+            j.prefetch(b);
+            idx[nk] = (a, b);
+            kids[nk] = (c2, t2, f2, 0, 0, m);
             nk += 1;
         }
         self.nodes += nk as u64;
         if self.halted() {
             return false;
-        }
-        // Stage 2: table indices of both views, entries prefetched.
-        let mut idx = [(0usize, 0usize); 17];
-        for k in 0..nk {
-            let (c2, t2, f2, ru, rf, _) = &kids[k];
-            let a = j.index_raw(*ru, t2, c2 & 1);
-            j.prefetch(a);
-            let b = j.index_raw(*rf, f2, c2 & 1);
-            j.prefetch(b);
-            idx[k] = (a, b);
         }
         // Stage 3: read, decode, descend.
         for k in 0..nk {
