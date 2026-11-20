@@ -51,6 +51,10 @@ pub struct Wing2 {
     high_odd: Row,
     /// The node-parallel form (see [`Wing2::possible_soa`]), per wing parity.
     soa: [SoaPlanes; 2],
+    /// Tight nodes of even wing parity (12 preimages per frame): per slot, the preimages
+    /// of the three frames in one word (bits 16 f..), and the `high_odd` bits.
+    te: [u64; 24],
+    te_high_odd: u64,
 }
 
 /// The preimages of one wing parity in bit planes of 8 (the tight ones first, all frames),
@@ -144,7 +148,51 @@ impl Wing2 {
             }
             planes
         });
-        Wing2 { b, high_odd, soa }
+        let mut te = [0u64; 24];
+        let mut te_high_odd = 0u64;
+        for (f, fr) in frames.iter().enumerate() {
+            let pre = Self::preimages(fr, wing_dst, true, false);
+            assert!(pre.len() <= 16);
+            for (j, p) in pre.iter().enumerate() {
+                for (x, w) in te.iter_mut().enumerate() {
+                    if p >> x & 1 == 1 {
+                        *w |= 1 << (16 * f + j);
+                    }
+                }
+            }
+            if high_odd.0[f] != 0 {
+                te_high_odd |= 0xffff << (16 * f);
+            }
+        }
+        Wing2 {
+            b,
+            high_odd,
+            soa,
+            te,
+            te_high_odd,
+        }
+    }
+
+    /// [`Wing2::possible_unchecked`], with the tight even-parity nodes' preimages in one word.
+    #[inline(always)]
+    pub fn possible_packed(&self, pos: &V32, odd: bool, tight: bool) -> bool {
+        if !tight || odd {
+            return self.possible_unchecked(pos, odd, tight);
+        }
+        let mut ok = !0u64;
+        let mut h = 0u64;
+        for e in 0..12 {
+            // SAFETY: wing slots are < 24.
+            let (x, y) = unsafe {
+                (
+                    *self.te.get_unchecked(pos.0[2 * e] as usize),
+                    *self.te.get_unchecked(pos.0[2 * e + 1] as usize),
+                )
+            };
+            ok &= x ^ y;
+            h ^= x;
+        }
+        ok & !(h ^ self.te_high_odd) != 0
     }
 
     /// The distinct preimages (24-bit slot masks) of frame `fr`'s low slots under the move
@@ -361,6 +409,10 @@ mod tests {
                 assert_eq!(
                     t.wing2
                         .possible_unchecked(&rows[i], odd, tight >> i & 1 == 1),
+                    want
+                );
+                assert_eq!(
+                    t.wing2.possible_packed(&rows[i], odd, tight >> i & 1 == 1),
                     want
                 );
                 passes += want as usize;

@@ -1389,6 +1389,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             || self.pair != ALL_PAIRS
             || if self.soa == 2 {
                 self.t.wing2.possible_unchecked(&s.pos, s.parity, d == 2)
+            } else if self.soa == 3 {
+                self.t.wing2.possible_packed(&s.pos, s.parity, d == 2)
             } else {
                 self.t.wing2.possible(&s.pos, s.parity, d == 2)
             }

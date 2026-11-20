@@ -75,6 +75,12 @@ fn main() {
             .map(|(p, o, ti)| w.possible_unchecked(p, *o, *ti))
             .collect()
     });
+    run("per node, packed tight-even", &mut || {
+        tests
+            .iter()
+            .map(|(p, o, ti)| w.possible_packed(p, *o, *ti))
+            .collect()
+    });
     // Node-parallel: the tests in order, queued by class (parity, and tight or not, or
     // parity only); a full queue (32) is transposed and tested.
     for by_tight in [true, false] {
