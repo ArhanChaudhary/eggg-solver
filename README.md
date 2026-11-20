@@ -51,7 +51,7 @@ the time (one thread: first solution after 6.2 s with `huge`, 1.4 s with `xl`, 0
 `xxl`, on average); with many threads phase 1 dominates.
 
 Phase-1 move masks (same phase-1 endpoints, fewer table reads; see `src/p1mask.rs`): the
-reduced move-mask table (`p1-mask2.tab`, 1.6 GB, generated in ~10 s; on by default
+reduced move-mask table (`p1-mask-live.tab`, 1.6 GB, generated in ~15 s; on by default
 in the large and larger tiers, `--p1-mask none` to turn it off) stores, per staging state,
 the moves that decrease the staging distance: deep in the tree almost every node is at
 distance = moves left, and then one read of its mask replaces ~20 reads of its children; such
@@ -61,7 +61,11 @@ all; phase 1 5x faster on the M2; in 60 s runs on the M2, 8 threads, 20 position
 entries also mark the wing parities with which a node at distance = moves left can still end
 at an endpoint (over half of these nodes cannot, and are dropped), and hold the moves that
 keep the distance: a node with slack gets all its children's distances from its own entry,
-so the search needs no large staging table. A per-node pass
+so the search needs no large staging table. The entries also say, per move, whether the child via the
+move can still reach an endpoint when it is at distance = moves left (its parity viability,
+and a decreasing move that the canonical order allows after the move; Dw, Lw and Bw share the
+bits of Uw, Rw and Fw, which makes room): such children are neither queued nor tested (27%
+fewer batch nodes, phase 1 1.2x faster on the M2, same endpoints). A per-node pass
 over the masked search (parent-pointer paths, cheaper leaf tests, byte-lookup pext on ARM)
 made it another 3x faster with the same endpoints, and the parity and equal-distance bits
 2x more. A node two moves from the end is only searched if its wings can still be made
