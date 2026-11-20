@@ -18,6 +18,7 @@ use crate::cube::{Cube, GEO, ROTATIONS, centre_slot, mat_apply};
 use crate::moves::{
     ALLOWED_AFTER, MOVE_PERMS, N_MOVES, PHASE2_MASK, WIDE_QUARTER, frame_rotation, rotate_move,
 };
+use crate::p1mask::UNRESOLVED;
 use crate::simd::V32;
 use crate::table::Mod3Table;
 
@@ -991,6 +992,10 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     /// batches (see [`Search1::run_batch`]).
     batch: Vec<BNode>,
     batch_next: Vec<BNode>,
+    /// The positions in `batch` (and `batch_next`) of the nodes whose reduced index is still
+    /// to be resolved (see [`BNode::idx`]).
+    batch_unres: Vec<u32>,
+    batch_unres_next: Vec<u32>,
     /// The paths of the batch nodes, as a tree: per node (by [`BNode::id`]), its parent's id
     /// and its last move, or for a node queued by the depth-first search, [`ROOT`] | the
     /// offset in `batch_roots` of its path (its length, then the moves).
@@ -1009,7 +1014,8 @@ struct BNode {
     centres: V32,
     pos: V32,
     /// The mask table's first index (see `MaskTable::pre_index`; for the reduced and pair
-    /// tables, their index, once resolved at the start of the node's round, with `sym`).
+    /// tables, their index, once resolved at the start of the node's round, with `sym`), or
+    /// the reduced index from the parent's successors (`sym` < [`UNRESOLVED`]).
     idx: u64,
     id: u32,
     /// The moves of its path's trailing run of same-axis moves (see [`trailing_run`]).
@@ -1098,6 +1104,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             pair: ALL_PAIRS,
             batch: vec![],
             batch_next: vec![],
+            batch_unres: vec![],
+            batch_unres_next: vec![],
             batch_tree: vec![],
             batch_roots: vec![],
             batch_path: Vec::with_capacity(48),
@@ -1133,6 +1141,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         let id = self.batch_tree.len() as u32;
         self.batch_tree.push((ROOT | off as u32, 0));
         self.t.mask.as_ref().unwrap().prefetch(self.t, idx);
+        self.batch_unres.push(self.batch.len() as u32);
         self.batch.push(BNode {
             centres: s.centres,
             pos: s.pos,
@@ -1140,24 +1149,38 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             id,
             run,
             parity: s.parity,
-            sym: 0,
+            sym: UNRESOLVED,
             left,
             last: last as u8,
             d,
         });
     }
 
-    /// Queue the child `c` (after move `m`, first index `idx()`, computed only if it is
-    /// queued, distance `d`) of batch node `nd`.
+    /// Queue the child `c` (after move `m`, distance `d`) of batch node `nd`, with `idx()`
+    /// (computed only if it is queued): its first index and [`UNRESOLVED`], or its reduced
+    /// index and symmetry (from the node's successors).
     #[inline(always)]
-    fn push_child(&mut self, nd: &BNode, c: &P1State, idx: impl FnOnce() -> u64, m: usize, d: u8) {
+    fn push_child(
+        &mut self,
+        nd: &BNode,
+        c: &P1State,
+        idx: impl FnOnce() -> (u64, u8),
+        m: usize,
+        d: u8,
+    ) {
         if !self.wings_possible(c, nd.left - 1, d) {
             return;
         }
-        let idx = idx();
+        let (idx, sym) = idx();
         let id = self.batch_tree.len() as u32;
         self.batch_tree.push((nd.id, m as u8));
-        self.t.mask.as_ref().unwrap().prefetch(self.t, idx);
+        let mt = self.t.mask.as_ref().unwrap();
+        if sym == UNRESOLVED {
+            mt.prefetch(self.t, idx);
+            self.batch_unres.push(self.batch.len() as u32);
+        } else {
+            mt.prefetch_entry(idx);
+        }
         self.batch.push(BNode {
             centres: c.centres,
             pos: c.pos,
@@ -1165,7 +1188,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             id,
             run: run_after(nd.run, nd.last as usize, m),
             parity: c.parity,
-            sym: 0,
+            sym,
             left: nd.left - 1,
             last: m as u8,
             d,
@@ -1220,6 +1243,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             let mut cur = std::mem::take(&mut self.batch);
             std::mem::swap(&mut self.batch, &mut self.batch_next);
             self.batch.clear();
+            let mut unres = std::mem::take(&mut self.batch_unres);
+            std::mem::swap(&mut self.batch_unres, &mut self.batch_unres_next);
+            self.batch_unres.clear();
             if self
                 .abort
                 .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
@@ -1227,15 +1253,18 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 self.stop = true;
             }
             if self.stop {
-                self.batch.clear();
+                self.clear_batch();
                 return;
             }
             if matches!(
                 mt.kind,
                 crate::p1mask::MaskKind::Reduced | crate::p1mask::MaskKind::Pair
             ) {
-                // The reduced table's index needs the class info (prefetched at the push).
-                for nd in cur.iter_mut() {
+                // The reduced table's index needs the class info (prefetched at the push),
+                // but for the nodes that have it from their parent's successors.
+                for &k in &unres {
+                    // SAFETY: the positions are those of nodes pushed to this batch.
+                    let nd = unsafe { cur.get_unchecked_mut(k as usize) };
                     (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.state(), self.pair);
                 }
             }
@@ -1262,14 +1291,14 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                             let run = run_after(nd.run, nd.last as usize, m);
                             self.leaf(&c, dc, m, None, run, Some((nd.id, Some(m as u8))));
                             if self.stop {
-                                self.batch.clear();
+                                self.clear_batch();
                                 return;
                             }
                         } else {
                             let i = || {
                                 let g = unsafe { child_flags(&flags, m, t) };
                                 let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
-                                t.staging.rank24(!nud & MASK24) as u64
+                                (t.staging.rank24(!nud & MASK24) as u64, UNRESOLVED)
                             };
                             self.push_child(nd, &c, i, m, dc);
                         }
@@ -1296,7 +1325,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         Some((nd.id, None)),
                     );
                     if self.stop {
-                        self.batch.clear();
+                        self.clear_batch();
                         return;
                     }
                 } else if nd.left == 2 && !mt.batch_leaves {
@@ -1325,7 +1354,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         let run = run_after(nd.run, nd.last as usize, m);
                         self.leaf(&c, 1, m, None, run, Some((nd.id, Some(m as u8))));
                         if self.stop {
-                            self.batch.clear();
+                            self.clear_batch();
                             return;
                         }
                     }
@@ -1337,10 +1366,22 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         a &= a - 1;
                         let i = || {
                             let g = unsafe { child_flags(&flags, m, t) };
-                            t.staging.rank24(crate::simd::movemask(&g)) as u64
+                            (
+                                t.staging.rank24(crate::simd::movemask(&g)) as u64,
+                                UNRESOLVED,
+                            )
                         };
                         let c = s.apply(m, t);
                         self.push_child(nd, &c, i, m, nd.left - 1);
+                    }
+                } else if reduced && let Some(sc) = mt.succ(nd.idx) {
+                    // The children's reduced index and symmetry from the node's successors.
+                    let sym = nd.sym;
+                    while a != 0 {
+                        let m = a.trailing_zeros() as usize;
+                        a &= a - 1;
+                        let c = s.apply(m, t);
+                        self.push_child(nd, &c, || mt.succ_child(&sc, sym, m), m, nd.left - 1);
                     }
                 } else {
                     let flags = s.centre_flags();
@@ -1350,12 +1391,13 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         let i = || {
                             let g = unsafe { child_flags(&flags, m, t) };
                             // The reduced table needs only the rank of the U/D positions.
-                            if reduced {
+                            let i = if reduced {
                                 let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
                                 t.staging.rank24(!nud & MASK24) as u64
                             } else {
                                 t.staging.big_index_flags(&g)
-                            }
+                            };
+                            (i, UNRESOLVED)
                         };
                         let c = s.apply(m, t);
                         self.push_child(nd, &c, i, m, nd.left - 1);
@@ -1364,7 +1406,15 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             }
             cur.clear();
             self.batch_next = cur;
+            unres.clear();
+            self.batch_unres_next = unres;
         }
+    }
+
+    /// Drop the queued batch nodes (after a stop).
+    fn clear_batch(&mut self) {
+        self.batch.clear();
+        self.batch_unres.clear();
     }
 
     /// The fewest moves left of a node queued for a batch (1 if the batches also read the
@@ -1939,10 +1989,17 @@ mod tests {
                 let want = endpoint_set(&t, &root, len, false);
                 t.mask = Some(crate::p1mask::MaskTable::virtual_table());
                 assert_eq!(endpoint_set(&t, &root, len, false), want);
-                // Slack nodes batched with at most k moves left (none, the default, more).
-                for k in [0, crate::p1mask::SLACK_BATCH, 10] {
+                // Slack nodes batched with at most k moves left (none, the default, more), with
+                // and without the successors.
+                for (k, succ) in [
+                    (0, true),
+                    (crate::p1mask::SLACK_BATCH, false),
+                    (crate::p1mask::SLACK_BATCH, true),
+                    (10, true),
+                ] {
                     t.mask = reduced.take();
                     t.mask.as_mut().unwrap().slack_batch = k;
+                    t.mask.as_mut().unwrap().use_succ = succ;
                     assert_eq!(endpoint_set(&t, &root, len, false), want);
                     reduced = t.mask.take();
                 }
@@ -1951,6 +2008,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The batches find the same endpoints, in the same order, with the same node and read
+    /// counts, with and without the successors (needs `p1-mask3.tab` or `p1-mask2.tab` in
+    /// ./tables; skipped without them).
+    #[test]
+    fn successors_keep_the_search() {
+        use rand::SeedableRng;
+        let dir = std::path::Path::new("tables");
+        if !dir.join("p1-mask3.tab").exists() && !dir.join("p1-mask2.tab").exists() {
+            return;
+        }
+        let mut t = crate::solver::load_p1(dir, false, 8, false);
+        t.mask = Some(crate::p1mask::load(dir, &t, false, false));
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(9);
+        let mut found = 0;
+        for _ in 0..4 {
+            let root = P1State::from_cube(&Cube::random(&mut rng));
+            let d0 = t.distance(&root);
+            for len in d0..d0 + 3 {
+                let mut runs = vec![];
+                for succ in [false, true] {
+                    t.mask.as_mut().unwrap().use_succ = succ;
+                    let mut found = vec![];
+                    let mut s = Search1::new(&t, |p: &[u8], f| {
+                        found.push((p.to_vec(), f));
+                        true
+                    });
+                    s.dfs(&root, d0, len, N_MOVES);
+                    let counts = (s.nodes, s.reads);
+                    drop(s);
+                    runs.push((found, counts));
+                }
+                found += runs[0].0.len();
+                assert_eq!(runs[0], runs[1]);
+            }
+        }
+        assert!(found > 100, "{found} endpoints");
     }
 
     /// [`P1Tables::staged_after`] agrees with the definition (and with the staging table's
