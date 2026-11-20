@@ -189,12 +189,37 @@ fn main() {
         let ni2 = ic.map_or(0, |c| c.stop());
         let dt2 = i1.elapsed().as_secs_f64() / reps as f64;
         assert_eq!(acc, acc2);
+        // The 16-lane kernel on pre-transposed groups of 16.
+        let g16: Vec<[V32; 12]> = sel
+            .chunks_exact(16)
+            .map(|g| eggg_solver::simd::transpose16(&std::array::from_fn(|j| g[j].0)))
+            .collect();
+        let i2 = Instant::now();
+        let ic = ins.as_ref().map(|c| {
+            c.start();
+            c
+        });
+        let mut acc3 = 0u32;
+        for _ in 0..reps {
+            for g in &g16 {
+                acc3 = acc3.wrapping_add(
+                    w.possible_soa16(std::hint::black_box(g), odd, tm & 0xffff, 0xffff)
+                        .count_ones(),
+                );
+            }
+        }
+        let ni3 = ic.map_or(0, |c| c.stop());
+        let dt3 = i2.elapsed().as_secs_f64() / reps as f64;
+        let k16 = g16.len() * 16;
         println!(
-            "  kernel {name:>10}: SoA {:6.2} ns {:6.1} instr | per node {:6.2} ns {:6.1} instr (per test, {k} tests)",
+            "  kernel {name:>10}: SoA32 {:6.2} ns {:6.1} instr | SoA16 {:6.2} ns {:6.1} instr | per node {:6.2} ns {:6.1} instr (per test, {k} tests)",
             dt * 1e9 / k as f64,
             ni as f64 / (reps * k) as f64,
+            dt3 * 1e9 / k16 as f64,
+            ni3 as f64 / (reps * k16) as f64,
             dt2 * 1e9 / k as f64,
             ni2 as f64 / (reps * k) as f64
         );
+        std::hint::black_box(acc3);
     }
 }
