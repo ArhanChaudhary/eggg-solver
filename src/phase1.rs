@@ -1034,12 +1034,14 @@ impl BNode {
     }
 }
 
-/// Per move, the last moves a leaf with even wing parity after it counts.
-const EVEN_LEAF_MOVES: [u8; N_MOVES] = {
-    let mut t = [0u8; N_MOVES];
+/// Per wing parity (even, odd) and move, the last moves a leaf with that parity after the
+/// move counts (see [`Search1::leaf`]).
+const LEAF_MOVES: [[u8; N_MOVES]; 2] = {
+    let mut t = [[0u8; N_MOVES]; 2];
     let mut m = 0;
     while m < N_MOVES {
-        t[m] = (ALLOWED_AFTER[m] & !WIDE_QUARTER).count_ones() as u8;
+        t[0][m] = (ALLOWED_AFTER[m] & !WIDE_QUARTER).count_ones() as u8;
+        t[1][m] = (ALLOWED_AFTER[m] & WIDE_QUARTER).count_ones() as u8;
         m += 1;
     }
     t
@@ -1247,11 +1249,26 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     // tested.
                     let (d, left) = (nd.d, nd.left);
                     let allowed = ALLOWED_AFTER[nd.last as usize];
-                    let (dec, eq) = mt.get_dec_eq(nd.idx, nd.sym);
-                    let (dec, eq) = (dec & allowed, eq & allowed);
+                    let (dec_all, eq_all) = mt.get_dec_eq(nd.idx, nd.sym);
+                    let (dec, eq) = (dec_all & allowed, eq_all & allowed);
                     self.nodes += allowed.count_ones() as u64;
                     self.reads += 1;
                     let mut a = if d + 1 < left { allowed } else { dec | eq };
+                    if viable {
+                        // The children that cannot reach an endpoint (child bits) are not
+                        // queued, nor tested (their last moves are counted).
+                        let live = self.live_children(nd, a, d, left, dec_all, eq_all);
+                        if left == 2 {
+                            let mut b = a & !live;
+                            while b != 0 {
+                                let m = b.trailing_zeros() as usize;
+                                b &= b - 1;
+                                let odd = nd.parity ^ (WIDE_QUARTER >> m & 1 == 1);
+                                self.nodes += LEAF_MOVES[odd as usize][m] as u64;
+                            }
+                        }
+                        a = live;
+                    }
                     let flags = s.centre_flags();
                     while a != 0 {
                         let m = a.trailing_zeros() as usize;
@@ -1282,8 +1299,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     self.reads += 1;
                     continue;
                 }
-                let mut a =
-                    mt.get(t, nd.idx, nd.sym, &s, self.pair) & ALLOWED_AFTER[nd.last as usize];
+                let dec = mt.get(t, nd.idx, nd.sym, &s, self.pair);
+                let mut a = dec & ALLOWED_AFTER[nd.last as usize];
                 self.nodes += a.count_ones() as u64;
                 self.reads += 1;
                 if nd.left == 1 {
@@ -1315,7 +1332,18 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         while b != 0 {
                             let m = b.trailing_zeros() as usize;
                             b &= b - 1;
-                            self.nodes += EVEN_LEAF_MOVES[m] as u64;
+                            self.nodes += LEAF_MOVES[0][m] as u64;
+                        }
+                    }
+                    // Nor has one that the child bits rule out (odd parity: counted too).
+                    if viable {
+                        let live = self.live_children(nd, a, nd.d, nd.left, dec, 0);
+                        let mut b = a & !live;
+                        a = live;
+                        while b != 0 {
+                            let m = b.trailing_zeros() as usize;
+                            b &= b - 1;
+                            self.nodes += LEAF_MOVES[1][m] as u64;
                         }
                     }
                     while a != 0 {
@@ -1343,6 +1371,11 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         self.push_child(nd, &c, i, m, nd.left - 1);
                     }
                 } else {
+                    if viable {
+                        // The children that cannot reach an endpoint are not queued (the
+                        // reduced table's child bits; they are still counted as nodes).
+                        a = self.live_children(nd, a, nd.d, nd.left, dec, 0);
+                    }
                     let flags = s.centre_flags();
                     while a != 0 {
                         let m = a.trailing_zeros() as usize;
@@ -1365,6 +1398,40 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             cur.clear();
             self.batch_next = cur;
         }
+    }
+
+    /// The children among `a` (moves of batch node `nd`, at distance `d` with `left` moves
+    /// left, its decreasing and keeping moves `dec` and `eq`, all of each) without those at
+    /// distance = moves left after the move that cannot reach an endpoint (the reduced
+    /// table's child bits, see [`crate::p1mask::MaskTable::child_live`]): the children via a
+    /// decreasing move if `d` = `left`, via a keeping move if `d` + 1 = `left`, via any other
+    /// move if `d` + 2 = `left`. A child's decreasing move on the move's axis is then
+    /// respectively a decreasing move, a decreasing or keeping move, or any move of the node.
+    #[inline(always)]
+    fn live_children(&self, nd: &BNode, a: u32, d: u8, left: u8, dec: u32, eq: u32) -> u32 {
+        use crate::p1mask::MaskTable;
+        let (tight, pre) = if d == left {
+            (dec, dec)
+        } else if d + 1 == left {
+            (eq, dec | eq)
+        } else if d + 2 == left {
+            (!(dec | eq), u32::MAX)
+        } else {
+            return a;
+        };
+        let mt = self.t.mask.as_ref().unwrap();
+        let bits = mt.child_bits(nd.idx, nd.parity);
+        let stored = mt.stored_moves(nd.sym);
+        let mut x = a & tight;
+        let mut out = a;
+        while x != 0 {
+            let m = x.trailing_zeros() as usize;
+            x &= x - 1;
+            if !MaskTable::child_live(bits, stored, m, pre) {
+                out &= !(1 << m);
+            }
+        }
+        out
     }
 
     /// The fewest moves left of a node queued for a batch (1 if the batches also read the
