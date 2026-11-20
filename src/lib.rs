@@ -18,3 +18,4 @@ pub mod simd;
 pub mod solver;
 pub mod table;
 pub mod wing2;
+pub mod wingpath;

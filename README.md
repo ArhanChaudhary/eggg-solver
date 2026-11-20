@@ -37,10 +37,10 @@ the default, `auto`, takes the largest tier that fits in a third of the physical
 | `tiny` | h48 h0 | 0.16 GB |
 | `small` | h48 h3 | 0.35 GB |
 | `medium` | h48 h5, joint phase 2 | 2.3 GB |
-| `large` | h48 h6, joint phase 2, phase-1 move masks | 4.7 GB |
-| `huge` | h48 h7, joint phase 2, phase-1 move masks | 6.6 GB |
-| `xl` | h48 h9, joint phase 2, phase-1 move masks | 18.0 GB |
-| `xxl` | h48 h11 (the largest), joint phase 2, phase-1 move masks | 63.6 GB |
+| `large` | h48 h6, joint phase 2, phase-1 move masks, wing paths up to 6 | 4.85 GB |
+| `huge` | h48 h7, joint phase 2, phase-1 move masks, wing paths up to 7 | 7.9 GB |
+| `xl` | h48 h9, joint phase 2, phase-1 move masks, wing paths up to 7 | 19.3 GB |
+| `xxl` | h48 h11 (the largest), joint phase 2, phase-1 move masks, wing paths up to 7 | 64.9 GB |
 
 The tables: phase-1 centre staging (symmetry-reduced, 25 MB; `--p1-big`: 1.2 GB without the
 reduction, faster lookups), phase-2 pairing permutation (60 MB; `--p2-joint`: the joint
@@ -73,7 +73,22 @@ pairable by the last two moves (the last one a wide quarter turn, or with staged
 outer quarter turn of the special axis): a test of its wing positions against the 12 to 51
 slot sets per frame that those move pairs take to the low slots, bit-sliced into one word
 per frame (`src/wing2.rs`, no table). About 90% of these nodes, and of the last-move tests
-below them, go (same endpoints; p1check 1.25x faster on the M2, 1 thread). On the M2 (8 threads), 20 random positions (seed 6060), current version: 39.45
+below them, go (same endpoints; p1check 1.25x faster on the M2, 1 thread). Stronger, with
+the centres: a node at staging distance = moves left (or one less) can only end by one of
+its few staging paths (2.3 per node 3 moves from the end, 4.4 at 6; one keeping move
+allowed with slack), so per centre state (the partition of the centres into colour-pair
+sets) the distinct (frame, preimage of the frame's low slots under the path) pairs decide
+whether its wings can still be paired: 3 to 8 pairs per state, and 99.5% to 99.8% of the
+nodes 3 to 8 moves from the end fail them all (the two-move test passes 5%). The wing-path
+table (`src/wingpath.rs`, built at start-up in about a second: 9 MB up to distance 5,
+144 MB up to 6 (the large tier), 1.24 GB up to 7 (huge and larger); `--p1-wing K`
+overrides it, `EGGG_P1_WINGS` sets the slack-1 lists' distance, `EGGG_P1_WINGR=1` adds the
+next distance stored once per symmetry class) tests a node's tight and slack-1 children
+before they are queued: same endpoints, 9x fewer mask reads, p1check 2.55x faster on the M2
+(1 thread, 3.59 s -> 1.41 s). 50 random positions on the M2 (seed 6060), up to distance 7:
+38.94 -> 38.74 moves after 20 s with 8 threads (8 shorter, none longer), 39.70 -> 39.50
+with one thread after 10 s.
+On the M2 (8 threads), 20 random positions (seed 6060), current version: 39.45
 moves on average after 10 s, 39.10 after 30 s, 38.80 after 60 s (before the parity and
 equal-distance bits, the round cut and the cheaper candidates: 39.65 / 39.30 / 39.15, and
 38.80 only after 2 minutes, 38.60 after 10 minutes). `--p1-mask big` is the same without the symmetry reduction (18.9 GB).

@@ -808,6 +808,9 @@ pub struct P1Tables {
     pub mask: Option<crate::p1mask::MaskTable>,
     /// The wing lookahead of the batched nodes two moves from the end (see [`crate::wing2`]).
     pub wing2: Box<crate::wing2::Wing2>,
+    /// The wing lookahead along the staging paths of tight nodes (see [`crate::wingpath`]),
+    /// for the batched nodes at most its `kmax` moves from the end.
+    pub wingk: Option<Box<crate::wingpath::WingPaths>>,
 }
 
 /// [`Search1::pair`] for the search over all pairs, pruned by the staging table only.
@@ -860,6 +863,7 @@ impl P1Tables {
             pat: None,
             mask: None,
             wing2,
+            wingk: None,
         }
     }
 
@@ -997,7 +1001,16 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     batch_tree: Vec<(u32, u8)>,
     batch_roots: Vec<u8>,
     batch_path: Vec<u8>,
+    /// Per node of the current round, the children that can still reach an endpoint, if
+    /// computed ahead (u32::MAX: not), to prefetch the children's wing-path table entries
+    /// (see [`Search1::run_batch_rounds`]).
+    pre: Vec<u32>,
 }
+
+/// Prefetch the wing-path entries of the tight batch nodes' children a pass ahead
+/// (`EGGG_P1_WKPF=0`: no).
+static WK_PREFETCH: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("EGGG_P1_WKPF").map_or(true, |v| v != "0"));
 
 /// See [`Search1::batch_tree`].
 const ROOT: u32 = 1 << 31;
@@ -1103,6 +1116,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             batch_tree: vec![],
             batch_roots: vec![],
             batch_path: Vec::with_capacity(48),
+            pre: vec![],
         }
     }
 
@@ -1153,7 +1167,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     /// queued, distance `d`) of batch node `nd`.
     #[inline(always)]
     fn push_child(&mut self, nd: &BNode, c: &P1State, idx: impl FnOnce() -> u64, m: usize, d: u8) {
-        if !self.wings_possible(c, nd.left - 1, d) {
+        if !self.child_possible(c, nd.left - 1, d) {
             return;
         }
         let idx = idx();
@@ -1181,6 +1195,32 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     #[inline(always)]
     fn wings_possible(&self, s: &P1State, left: u8, d: u8) -> bool {
         left != 2 || self.pair != ALL_PAIRS || self.t.wing2.possible(&s.pos, s.parity, d == 2)
+    }
+
+    /// Can a batch node's child (state `c`, `left` moves left, staging distance `d`) still
+    /// reach an endpoint as far as its wings tell? A tight child (`d` = `left`) at most the
+    /// wing-path table's `kmax` moves from the end, and a child with one move of slack at
+    /// distance at most its `smax`, get its tests (see [`crate::wingpath`]), stronger than
+    /// [`Search1::wings_possible`]; others that one.
+    #[inline(always)]
+    fn child_possible(&self, c: &P1State, left: u8, d: u8) -> bool {
+        if self.pair == ALL_PAIRS
+            && let Some(w) = self.t.wingk.as_deref()
+        {
+            if d == left && left <= w.kmax {
+                let (ud, rl) = c.masks();
+                return w.possible(ud, rl, &c.pos, c.parity);
+            }
+            if d == left && left == w.kmax + 1 && w.red.is_some() {
+                let (ud, rl) = c.masks();
+                return w.possible_red(ud, rl, &c.pos, c.parity);
+            }
+            if d + 1 == left && d <= w.smax {
+                let (ud, rl) = c.masks();
+                return w.possible_slack(ud, rl, &c.pos, c.parity);
+            }
+        }
+        self.wings_possible(c, left, d)
     }
 
     /// Set `self.path` to the path of batch node `id` (see [`Search1::batch_tree`]).
@@ -1241,7 +1281,63 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.state(), self.pair);
                 }
             }
-            for nd in &cur {
+            // The nodes whose children get the wing-path tests: their live children now (u32::MAX
+            // if not), and the children's table entries prefetched for the pass below.
+            let mut pre = std::mem::take(&mut self.pre);
+            pre.clear();
+            if let Some(w) = t.wingk.as_deref().filter(|_| viable && *WK_PREFETCH) {
+                for nd in &cur {
+                    let (d, left) = (nd.d, nd.left);
+                    let mut e = u32::MAX;
+                    // The moves to children with the tests (tight ones, ones with slack 1).
+                    let mut tested = 0;
+                    if left < 3 {
+                    } else if d == left {
+                        let red = w.red.is_some() && left - 1 == w.kmax + 1;
+                        if (left - 1 <= w.kmax || red) && mt.viable(nd.idx, nd.parity) {
+                            let dec = mt.get(t, nd.idx, nd.sym, &nd.state(), self.pair);
+                            let a = dec & ALLOWED_AFTER[nd.last as usize];
+                            e = self.live_children(nd, a, d, left, dec, 0);
+                            tested = e;
+                        }
+                    } else if left - 1 <= w.kmax || left - 2 <= w.smax {
+                        let allowed = ALLOWED_AFTER[nd.last as usize];
+                        let (dec_all, eq_all) = mt.get_dec_eq(nd.idx, nd.sym);
+                        let (dec, eq) = (dec_all & allowed, eq_all & allowed);
+                        let a = if d + 1 < left { allowed } else { dec | eq };
+                        e = self.live_children(nd, a, d, left, dec_all, eq_all);
+                        // The children with no slack and with one move of slack (a decreasing
+                        // move keeps the slack, a keeping move takes one, another two).
+                        let inc = allowed & !(dec | eq);
+                        let (tight, slack1) = match left - d {
+                            1 => (eq, dec),
+                            2 => (inc, eq),
+                            3 => (0, inc),
+                            _ => (0, 0),
+                        };
+                        tested = e
+                            & (if left - 1 <= w.kmax { tight } else { 0 }
+                                | if left - 2 <= w.smax { slack1 } else { 0 });
+                    }
+                    if tested != 0 {
+                        let flags = nd.state().centre_flags();
+                        let mut b = tested;
+                        while b != 0 {
+                            let m = b.trailing_zeros() as usize;
+                            b &= b - 1;
+                            let (ud, _, rl) = flag_masks(&unsafe { child_flags(&flags, m, t) });
+                            if d == left && left - 1 == w.kmax + 1 {
+                                w.red.as_ref().unwrap().prefetch(ud, rl);
+                            } else {
+                                w.prefetch(ud, rl);
+                            }
+                        }
+                    }
+                    pre.push(e);
+                }
+            }
+            self.pre = pre;
+            for (ix, nd) in cur.iter().enumerate() {
                 let s = nd.state();
                 if nd.d < nd.left {
                     // A node with slack (reduced table): its children's distances from its
@@ -1257,7 +1353,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     if viable {
                         // The children that cannot reach an endpoint (child bits) are not
                         // queued, nor tested (their last moves are counted).
-                        let live = self.live_children(nd, a, d, left, dec_all, eq_all);
+                        let live = match self.pre.get(ix) {
+                            Some(&l) if l != u32::MAX => l,
+                            _ => self.live_children(nd, a, d, left, dec_all, eq_all),
+                        };
                         if left == 2 {
                             let mut b = a & !live;
                             while b != 0 {
@@ -1300,6 +1399,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     continue;
                 }
                 let dec = mt.get(t, nd.idx, nd.sym, &s, self.pair);
+                let live = self.pre.get(ix).copied().filter(|&l| l != u32::MAX);
                 let mut a = dec & ALLOWED_AFTER[nd.last as usize];
                 self.nodes += a.count_ones() as u64;
                 self.reads += 1;
@@ -1374,7 +1474,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     if viable {
                         // The children that cannot reach an endpoint are not queued (the
                         // reduced table's child bits; they are still counted as nodes).
-                        a = self.live_children(nd, a, nd.d, nd.left, dec, 0);
+                        a = match live {
+                            Some(a) => a,
+                            None => self.live_children(nd, a, nd.d, nd.left, dec, 0),
+                        };
                     }
                     let flags = s.centre_flags();
                     while a != 0 {
@@ -2018,6 +2121,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The masked search over all pairs finds the same endpoints, in the same order, with and
+    /// without the wing-path lookahead (largest distance 3 to 5, the last with the reduced
+    /// lists at 6), on random roots and on roots a few moves from endpoints, at their
+    /// distance and up to 3 moves more (needs the reduced mask table in ./tables, loaded or
+    /// made; the small staging table likewise).
+    #[test]
+    fn wing_paths_keep_the_endpoints() {
+        let dir = std::path::Path::new("tables");
+        let mut t = crate::solver::load_p1(dir, false, 8, false);
+        t.mask = Some(crate::p1mask::load(dir, &t, false, false));
+        let mut ws: Vec<_> = (3..=5)
+            .map(|k| {
+                Some(Box::new(crate::wingpath::WingPaths::new(
+                    &t.frames,
+                    k,
+                    k - 1,
+                    k == 5,
+                )))
+            })
+            .collect();
+        let run = |t: &P1Tables, root: &P1State, len: u8| {
+            let mut found = vec![];
+            let mut s = Search1::new(t, |p: &[u8], f| {
+                found.push((p.to_vec(), f));
+                true
+            });
+            s.dfs(root, t.distance(root), len, N_MOVES);
+            let nodes = s.nodes;
+            drop(s);
+            (found, nodes)
+        };
+        let mut rng = <rand_xoshiro::Xoshiro256PlusPlus as rand::SeedableRng>::seed_from_u64(5);
+        let mut found = 0;
+        for i in 0..8 {
+            let root = if i < 4 {
+                P1State::from_cube(&Cube::random(&mut rng))
+            } else {
+                // An endpoint (solved cube) undone by 8 random moves.
+                let mut s = P1State::from_cube(&Cube::SOLVED);
+                for _ in 0..8 {
+                    s = s.apply(rand::Rng::gen_range(&mut rng, 0..N_MOVES), &t);
+                }
+                s
+            };
+            let d0 = t.distance(&root);
+            for len in d0..=d0 + 3 {
+                t.wingk = None;
+                let (want, nodes) = run(&t, &root, len);
+                found += want.len();
+                for w in ws.iter_mut() {
+                    std::mem::swap(&mut t.wingk, w);
+                    let (got, n) = run(&t, &root, len);
+                    std::mem::swap(&mut t.wingk, w);
+                    assert_eq!(got, want, "root {i} len {len}");
+                    assert!(n <= nodes);
+                }
+            }
+        }
+        assert!(found > 0);
     }
 
     /// [`P1Tables::staged_after`] agrees with the definition (and with the staging table's
