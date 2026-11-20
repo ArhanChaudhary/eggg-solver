@@ -467,12 +467,14 @@ fn order_by_yield(jobs: &mut Vec<(u8, Vec<u8>)>, yields: &HashMap<[u8; 4], (u64,
             }
         }
     };
-    let mut order: Vec<(f64, usize)> = jobs
-        .iter()
-        .enumerate()
-        .map(|(i, j)| (score(&j.1), i))
-        .collect();
-    order.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    // (Scored over the threads: there are ~240k 4-move jobs.)
+    let parts = Mutex::new(vec![]);
+    crate::par::for_chunks(jobs.len(), 4096, |r| {
+        let part: Vec<(f64, usize)> = r.clone().map(|i| (score(&jobs[i].1), i)).collect();
+        parts.lock().unwrap().push(part);
+    });
+    let mut order: Vec<(f64, usize)> = parts.into_inner().unwrap().concat();
+    order.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
     let mut old: Vec<Option<(u8, Vec<u8>)>> = jobs.drain(..).map(Some).collect();
     jobs.extend(order.iter().map(|&(_, i)| old[i].take().unwrap()));
 }
@@ -771,45 +773,51 @@ impl<'a, 'r> Run<'a, 'r> {
         } else {
             3
         };
-        let mut jobs: Vec<Vec<u8>> = vec![vec![]];
-        for _ in 0..depth {
-            let mut next = vec![];
-            for p in &jobs {
-                let last = p.last().map(|&m| m as usize).unwrap_or(N_MOVES);
-                let mut allowed = ALLOWED_AFTER[last];
-                while allowed != 0 {
-                    let m = allowed.trailing_zeros();
-                    allowed &= allowed - 1;
-                    let mut q = p.clone();
-                    q.push(m as u8);
-                    next.push(q);
-                }
-            }
-            jobs = next;
-        }
-        // Per search, keep only prefixes that can still reach the goal in `len` moves.
+        // Per search, the prefixes that can still reach the goal in `len` moves, in move
+        // order, expanded a move at a time from the kept ones (the last move over the
+        // threads: there are ~240k 4-move jobs).
         let t = &self.t.p1;
         let mut out = vec![];
         for &pair in &self.pairs {
             if self.d0[pair] > len {
                 continue;
             }
-            out.extend(
-                jobs.iter()
-                    .filter(|p| {
-                        let mut st = self.root;
-                        let mut d = self.d0[pair];
-                        for (i, &m) in p.iter().enumerate() {
-                            st = st.apply(m as usize, t);
-                            d = Mod3Table::decode(d, t.value_pair(&st, pair));
-                            if d as usize > len as usize - i - 1 {
-                                return false;
-                            }
+            let mut level: Vec<(Vec<u8>, P1State, u8)> = vec![(vec![], self.root, self.d0[pair])];
+            for i in 0..depth {
+                let room = len as usize - i - 1;
+                let expand = |p: &(Vec<u8>, P1State, u8),
+                              next: &mut Vec<(Vec<u8>, P1State, u8)>| {
+                    let last = p.0.last().map(|&m| m as usize).unwrap_or(N_MOVES);
+                    let mut allowed = ALLOWED_AFTER[last];
+                    while allowed != 0 {
+                        let m = allowed.trailing_zeros() as usize;
+                        allowed &= allowed - 1;
+                        let st = p.1.apply(m, t);
+                        let d = Mod3Table::decode(p.2, t.value_pair(&st, pair));
+                        if d as usize <= room {
+                            let mut q = p.0.clone();
+                            q.push(m as u8);
+                            next.push((q, st, d));
                         }
-                        true
-                    })
-                    .map(|p| (pair as u8, p.clone())),
-            );
+                    }
+                };
+                level = if level.len() < 1024 {
+                    let mut next = vec![];
+                    level.iter().for_each(|p| expand(p, &mut next));
+                    next
+                } else {
+                    let parts = Mutex::new(vec![]);
+                    crate::par::for_chunks(level.len(), 256, |r| {
+                        let mut next = vec![];
+                        level[r.clone()].iter().for_each(|p| expand(p, &mut next));
+                        parts.lock().unwrap().push((r.start, next));
+                    });
+                    let mut parts = parts.into_inner().unwrap();
+                    parts.sort_unstable_by_key(|x| x.0);
+                    parts.into_iter().flat_map(|x| x.1).collect()
+                };
+            }
+            out.extend(level.into_iter().map(|p| (pair as u8, p.0)));
         }
         out
     }
@@ -849,10 +857,19 @@ impl<'a, 'r> Run<'a, 'r> {
                 self.prev_yields = std::mem::take(&mut self.yields);
                 self.debug_level("complete", &self.prev_yields, self.level.len);
                 let order = self.order_jobs && self.best.is_some();
+                let tj = Instant::now();
                 let mut jobs = self.level_jobs(len, order);
                 if order {
                     order_by_yield(&mut jobs, &self.prev_yields);
                 }
+                debug(
+                    self.start,
+                    &format!(
+                        "level {len}: {} jobs made in {:.4} s",
+                        jobs.len(),
+                        tj.elapsed().as_secs_f64()
+                    ),
+                );
                 self.level = Level1 { len, jobs, next: 0 };
                 continue;
             }
@@ -2295,6 +2312,38 @@ mod tests {
                     prev_yields: HashMap::new(),
                 };
                 run.level.jobs = run.level_jobs(run.level.len, false);
+                // The jobs are the prefixes (3 moves, or 4 when fine) that pass the distance
+                // test after each move, in move order.
+                for len in [d0[3] - 1, d0[3], d0[3] + 2, d0[3] + 4] {
+                    for fine in [false, true] {
+                        let depth = if fine && len >= 8 { 4 } else { 3 };
+                        let mut all: Vec<Vec<u8>> = vec![vec![]];
+                        for _ in 0..depth {
+                            all = all
+                                .iter()
+                                .flat_map(|p| {
+                                    let last = p.last().map_or(N_MOVES, |&m| m as usize);
+                                    (0..N_MOVES as u8)
+                                        .filter(move |&m| ALLOWED_AFTER[last] >> m & 1 == 1)
+                                        .map(move |m| [p.clone(), vec![m]].concat())
+                                })
+                                .collect();
+                        }
+                        let want: Vec<(u8, Vec<u8>)> = all
+                            .into_iter()
+                            .filter(|p| {
+                                let (mut st, mut d) = (root, d0[3]);
+                                p.iter().enumerate().all(|(i, &m)| {
+                                    st = st.apply(m as usize, &t.p1);
+                                    d = Mod3Table::decode(d, t.p1.value(&st));
+                                    (d as usize) < len as usize - i
+                                })
+                            })
+                            .map(|p| (3, p))
+                            .collect();
+                        assert_eq!(run.level_jobs(len, fine), want, "length {len}");
+                    }
+                }
                 // The order applies once a solution exists (a 60-move one keeps every
                 // candidate).
                 run.best = Some(Solution {
