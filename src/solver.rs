@@ -386,6 +386,29 @@ fn make_candidates(
     }
 }
 
+/// The phase-2 bound h2 of each candidate the driver would make from phase-1 endpoints `eps`
+/// (see [`make_candidates`]: frames whose L1 + h2 is within `limit`): (endpoint index, frame,
+/// h2), in endpoint order. For analysis tools.
+pub fn candidate_bounds(
+    p2: &P2Tables,
+    cube: &Cube,
+    eps: &[(Vec<u8>, u8)],
+    limit: usize,
+) -> Vec<(usize, usize, u8)> {
+    let mut cands = vec![];
+    make_candidates(p2, cube, eps, limit, &mut cands);
+    let mut e = 0;
+    cands
+        .iter()
+        .map(|c| {
+            while eps[e].0 != c.moves1 {
+                e += 1;
+            }
+            (e, c.frame, c.h2)
+        })
+        .collect()
+}
+
 /// The first three moves of a phase-1 path (the driver's job prefixes at lengths >= 7).
 fn prefix3(moves: &[u8]) -> Option<[u8; 3]> {
     moves.get(..3).map(|p| [p[0], p[1], p[2]])
@@ -581,6 +604,7 @@ impl<'a> Solver<'a> {
                 }
             });
             run.rounds(self.opts.endpoints, self.opts.reductions);
+            run.debug_level("at the end", &run.yields, run.level.len);
             if std::env::var_os("EGGG_DEBUG").is_some() {
                 let mut h1 = std::collections::BTreeMap::new();
                 for c in &run.cands {
@@ -742,6 +766,25 @@ impl<'a, 'r> Run<'a, 'r> {
         out
     }
 
+    /// With EGGG_DEBUG: a phase-1 level's nodes and kept candidates (from its yields).
+    fn debug_level(&self, what: &str, yields: &HashMap<[u8; 3], (u64, u64)>, len: u8) {
+        if std::env::var_os("EGGG_DEBUG").is_none() {
+            return;
+        }
+        let (kept, nodes) = yields
+            .values()
+            .fold((0u64, 0u64), |a, v| (a.0 + v.0, a.1 + v.1));
+        debug(
+            self.start,
+            &format!(
+                "level {len} {what}: nodes {nodes}, kept {kept} (limit {}), jobs {}/{}",
+                self.useful_l12(),
+                self.level.next,
+                self.level.jobs.len()
+            ),
+        );
+    }
+
     /// Collect phase-1 endpoints until there are `want` candidates in total (or until the
     /// round's phase-1 cut).
     fn phase1(&mut self, want: usize) {
@@ -756,6 +799,7 @@ impl<'a, 'r> Run<'a, 'r> {
                 // made some first solutions later on the M2).
                 let len = self.level.len + 1;
                 self.prev_yields = std::mem::take(&mut self.yields);
+                self.debug_level("complete", &self.prev_yields, self.level.len);
                 let mut jobs = self.level_jobs(len);
                 if self.order_jobs && self.best.is_some() {
                     order_by_yield(&mut jobs, &self.prev_yields);
