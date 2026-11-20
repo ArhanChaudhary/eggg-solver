@@ -902,8 +902,12 @@ impl<'a, 'r> Run<'a, 'r> {
                             srch.path.extend_from_slice(prefix);
                             let last = prefix.last().map(|&m| m as usize).unwrap_or(N_MOVES);
                             let left = len - prefix.len() as u8;
+                            // The subtrees searched whole (`Search1::dfs`) start 5 moves deep:
+                            // each ends with a partial batch, and 6-move ones (~150 nodes at
+                            // length 15) made phase 1 19% slower on the M2.
+                            let split = if prefix.len() >= 4 { 1 } else { 2 };
                             p1_run(
-                                &mut srch, &st, d, left, last, 2, &close, &mut spill, &mut per4,
+                                &mut srch, &st, d, left, last, split, &close, &mut spill, &mut per4,
                             );
                             let job_nodes = srch.nodes;
                             drop(srch);
