@@ -1189,17 +1189,22 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
 
     /// Can a batch node's child (state `c`, `left` moves left, staging distance `d`) still
     /// reach an endpoint as far as its wings tell? A tight child (`d` = `left`) at most the
-    /// wing-path table's `kmax` moves from the end gets its test (see [`crate::wingpath`]),
-    /// stronger than [`Search1::wings_possible`]; others that one.
+    /// wing-path table's `kmax` moves from the end, and a child with one move of slack at
+    /// distance at most its `smax`, get its tests (see [`crate::wingpath`]), stronger than
+    /// [`Search1::wings_possible`]; others that one.
     #[inline(always)]
     fn child_possible(&self, c: &P1State, left: u8, d: u8) -> bool {
-        if d == left
-            && self.pair == ALL_PAIRS
+        if self.pair == ALL_PAIRS
             && let Some(w) = self.t.wingk.as_deref()
-            && left <= w.kmax
         {
-            let (ud, rl) = c.masks();
-            return w.possible(ud, rl, &c.pos, c.parity);
+            if d == left && left <= w.kmax {
+                let (ud, rl) = c.masks();
+                return w.possible(ud, rl, &c.pos, c.parity);
+            }
+            if d + 1 == left && d <= w.smax {
+                let (ud, rl) = c.masks();
+                return w.possible_slack(ud, rl, &c.pos, c.parity);
+            }
         }
         self.wings_possible(c, left, d)
     }
@@ -2053,7 +2058,13 @@ mod tests {
         let mut t = crate::solver::load_p1(dir, false, 8, false);
         t.mask = Some(crate::p1mask::load(dir, &t, false, false));
         let mut ws: Vec<_> = (3..=5)
-            .map(|k| Some(Box::new(crate::wingpath::WingPaths::new(&t.frames, k))))
+            .map(|k| {
+                Some(Box::new(crate::wingpath::WingPaths::new(
+                    &t.frames,
+                    k,
+                    k - 1,
+                )))
+            })
             .collect();
         let run = |t: &P1Tables, root: &P1State, len: u8| {
             let mut found = vec![];
