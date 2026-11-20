@@ -1,12 +1,13 @@
 //! Deterministic phase-1 check: endpoint-set hash and node counts on fixed cubes.
-//! EGGG_P1_BIG: the large staging table; EGGG_P1_MASK=small|big: the move-mask table (the
+//! EGGG_P1_BIG: the large staging table; EGGG_P1_MASK=small|wide|big: the move-mask table (the
 //! large one with the large staging table). CUBES, EXTRA: the workload (default 5 cubes,
 //! lengths d0..=d0+3).
 //! The hash covers the endpoints in the order the search reports them.
 use eggg_solver::cube::Cube;
 use eggg_solver::moves::N_MOVES;
+use eggg_solver::p1mask::MaskSel;
 use eggg_solver::phase1::{P1State, Search1};
-use eggg_solver::solver::{load_mask, load_p1};
+use eggg_solver::solver::{load_mask_sel, load_p1};
 use rand::SeedableRng;
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
@@ -20,7 +21,12 @@ fn main() {
     let mut p1 = load_p1(dir, big, 8, false);
     p1.table.data.collapse();
     if let Some(kind) = &mask {
-        load_mask(&mut p1, dir, kind == "big", true);
+        let sel = match kind.as_str() {
+            "big" => MaskSel::Big,
+            "wide" => MaskSel::Succ,
+            _ => MaskSel::Reduced,
+        };
+        load_mask_sel(&mut p1, dir, sel, true);
         p1.mask.as_ref().unwrap().collapse();
     }
     let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(3);

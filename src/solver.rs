@@ -1301,6 +1301,16 @@ pub fn load_mask(p1: &mut P1Tables, dir: &std::path::Path, big: bool, verbose: b
     p1.mask = Some(crate::p1mask::load(dir, p1, big, verbose));
 }
 
+/// [`load_mask`] of any of the move-mask tables (see [`crate::p1mask::load_sel`]).
+pub fn load_mask_sel(
+    p1: &mut P1Tables,
+    dir: &std::path::Path,
+    sel: crate::p1mask::MaskSel,
+    verbose: bool,
+) {
+    p1.mask = Some(crate::p1mask::load_sel(dir, p1, sel, verbose));
+}
+
 /// Load or build the phase-2 tables in `dir`; `joint`: also the joint table (1.05 GB).
 pub fn load_p2(dir: &std::path::Path, joint: bool, threads: usize, verbose: bool) -> P2Tables {
     let p2_path = dir.join("p2-tau.tab");
@@ -1351,7 +1361,7 @@ pub fn load_tables_with(
     h48_k: u32,
     joint: bool,
     p1_big: bool,
-    p1_extra: (Option<bool>, Option<bool>),
+    p1_extra: (Option<bool>, Option<crate::p1mask::MaskSel>),
     threads: usize,
     verbose: bool,
 ) -> Tables {
@@ -1377,12 +1387,12 @@ pub fn load_tables_with(
     if let Some(big) = p1_extra.0 {
         load_pat(&mut p1, dir, big, threads, verbose);
     }
-    if let Some(big) = p1_extra.1 {
+    if let Some(sel) = p1_extra.1 {
         assert!(
-            p1_big || !big || p1.pat.is_some(),
+            p1_big || sel != crate::p1mask::MaskSel::Big || p1.pat.is_some(),
             "the large move-mask table needs the large staging table"
         );
-        load_mask(&mut p1, dir, big, verbose);
+        load_mask_sel(&mut p1, dir, sel, verbose);
     }
     drop(g);
     let p2 = p2.join().expect("loading the phase-2 tables");
@@ -2316,7 +2326,25 @@ mod tests {
     /// exactly the endpoints of one uninterrupted search.
     #[test]
     fn split_jobs_find_the_same_endpoints() {
-        let t = load_p1(std::path::Path::new("tables"), false, 8, false);
+        let dir = std::path::Path::new("tables");
+        let mut t = load_p1(dir, false, 8, false);
+        // Without a move-mask table, with the reduced one, and with the successor table
+        // (if there).
+        split_jobs_endpoints(&t);
+        t.mask = Some(crate::p1mask::load(dir, &t, false, false));
+        split_jobs_endpoints(&t);
+        if dir.join("p1-succ-live.tab").exists() {
+            t.mask = Some(crate::p1mask::load_sel(
+                dir,
+                &t,
+                crate::p1mask::MaskSel::Succ,
+                false,
+            ));
+            split_jobs_endpoints(&t);
+        }
+    }
+
+    fn split_jobs_endpoints(t: &P1Tables) {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(7);
         for scramble in 0..6 {
             let mut cube = Cube::SOLVED;
@@ -2328,7 +2356,7 @@ mod tests {
             let d0 = t.distance(&root);
             for len in d0.max(4)..d0.max(4) + 2 {
                 let mut want = vec![];
-                let mut srch = Search1::new(&t, |p: &[u8], f| {
+                let mut srch = Search1::new(t, |p: &[u8], f| {
                     want.push((p.to_vec(), f));
                     true
                 });
@@ -2341,9 +2369,9 @@ mod tests {
                 let mut count = 0usize;
                 while let Some(prefix) = queue.pop() {
                     let close = Close::new(None);
-                    let (st, d) = root.after(&prefix, d0, &t);
+                    let (st, d) = root.after(&prefix, d0, t);
                     let mut spill = vec![];
-                    let mut srch = Search1::new(&t, |p: &[u8], f| {
+                    let mut srch = Search1::new(t, |p: &[u8], f| {
                         got.push((p.to_vec(), f));
                         count += 1;
                         if count % 3 == scramble % 3 {

@@ -18,6 +18,7 @@ use crate::cube::{Cube, GEO, ROTATIONS, centre_slot, mat_apply};
 use crate::moves::{
     ALLOWED_AFTER, MOVE_PERMS, N_MOVES, PHASE2_MASK, WIDE_QUARTER, frame_rotation, rotate_move,
 };
+use crate::p1mask::UNRESOLVED;
 use crate::simd::V32;
 use crate::table::Mod3Table;
 
@@ -1009,7 +1010,9 @@ struct BNode {
     centres: V32,
     pos: V32,
     /// The mask table's first index (see `MaskTable::pre_index`; for the reduced and pair
-    /// tables, their index, once resolved at the start of the node's round, with `sym`).
+    /// tables, their index, once resolved at the start of the node's round, with `sym`), or
+    /// with the successor table possibly the reduced index from the parent's successors
+    /// (`sym` below [`UNRESOLVED`]).
     idx: u64,
     id: u32,
     /// The moves of its path's trailing run of same-axis moves (see [`trailing_run`]).
@@ -1142,24 +1145,37 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             id,
             run,
             parity: s.parity,
-            sym: 0,
+            sym: UNRESOLVED,
             left,
             last: last as u8,
             d,
         });
     }
 
-    /// Queue the child `c` (after move `m`, first index `idx()`, computed only if it is
-    /// queued, distance `d`) of batch node `nd`.
+    /// Queue the child `c` (after move `m`, distance `d`) of batch node `nd`, with `idx()`
+    /// (computed only if it is queued): its first index and [`UNRESOLVED`], or its reduced
+    /// index and symmetry (from the node's successors).
     #[inline(always)]
-    fn push_child(&mut self, nd: &BNode, c: &P1State, idx: impl FnOnce() -> u64, m: usize, d: u8) {
+    fn push_child(
+        &mut self,
+        nd: &BNode,
+        c: &P1State,
+        idx: impl FnOnce() -> (u64, u8),
+        m: usize,
+        d: u8,
+    ) {
         if !self.wings_possible(c, nd.left - 1, d) {
             return;
         }
-        let idx = idx();
+        let (idx, sym) = idx();
         let id = self.batch_tree.len() as u32;
         self.batch_tree.push((nd.id, m as u8));
-        self.t.mask.as_ref().unwrap().prefetch(self.t, idx);
+        let mt = self.t.mask.as_ref().unwrap();
+        if sym == UNRESOLVED {
+            mt.prefetch(self.t, idx);
+        } else {
+            mt.prefetch_entry(idx);
+        }
         self.batch.push(BNode {
             centres: c.centres,
             pos: c.pos,
@@ -1167,7 +1183,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             id,
             run: run_after(nd.run, nd.last as usize, m),
             parity: c.parity,
-            sym: 0,
+            sym,
             left: nd.left - 1,
             last: m as u8,
             d,
@@ -1206,13 +1222,21 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     fn run_batch(&mut self) {
         // The batch nodes' paths replace the search's path meanwhile.
         std::mem::swap(&mut self.path, &mut self.batch_path);
-        self.run_batch_rounds();
+        // (Two versions: with the successors, and the one without them.)
+        let mt = self.t.mask.as_ref().unwrap();
+        if mt.succ && mt.use_succ && self.pair == ALL_PAIRS {
+            self.run_batch_rounds::<true>();
+        } else {
+            self.run_batch_rounds::<false>();
+        }
         std::mem::swap(&mut self.path, &mut self.batch_path);
         self.batch_tree.clear();
         self.batch_roots.clear();
     }
 
-    fn run_batch_rounds(&mut self) {
+    /// The rounds of [`Search1::run_batch`]; `SUCC`: the children's reduced indices from
+    /// their parents' successors where these hold them (see `MaskTable::widen`).
+    fn run_batch_rounds<const SUCC: bool>(&mut self) {
         let t = self.t;
         let mt = t.mask.as_ref().unwrap();
         let reduced = mt.kind == crate::p1mask::MaskKind::Reduced;
@@ -1236,9 +1260,12 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 mt.kind,
                 crate::p1mask::MaskKind::Reduced | crate::p1mask::MaskKind::Pair
             ) {
-                // The reduced table's index needs the class info (prefetched at the push).
+                // The reduced table's index needs the class info (prefetched at the push), but
+                // for the nodes that have it from their parent's successors.
                 for nd in cur.iter_mut() {
-                    (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.state(), self.pair);
+                    if !SUCC || nd.sym == UNRESOLVED {
+                        (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.state(), self.pair);
+                    }
                 }
             }
             for nd in &cur {
@@ -1270,6 +1297,14 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         a = live;
                     }
                     let flags = s.centre_flags();
+                    // With one move of slack the children are the decreasing and keeping
+                    // moves: their indices from the node's successors, where it has those.
+                    let sc = if SUCC && left >= 3 && d + 1 == left {
+                        mt.succ_of(nd.idx).filter(|sc| sc.eq)
+                    } else {
+                        None
+                    };
+                    let sym = nd.sym;
                     while a != 0 {
                         let m = a.trailing_zeros() as usize;
                         a &= a - 1;
@@ -1284,9 +1319,12 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                             }
                         } else {
                             let i = || {
+                                if let Some(sc) = &sc {
+                                    return mt.succ_child(sc, sym, m);
+                                }
                                 let g = unsafe { child_flags(&flags, m, t) };
                                 let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
-                                t.staging.rank24(!nud & MASK24) as u64
+                                (t.staging.rank24(!nud & MASK24) as u64, UNRESOLVED)
                             };
                             self.push_child(nd, &c, i, m, dc);
                         }
@@ -1365,7 +1403,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         a &= a - 1;
                         let i = || {
                             let g = unsafe { child_flags(&flags, m, t) };
-                            t.staging.rank24(crate::simd::movemask(&g)) as u64
+                            (
+                                t.staging.rank24(crate::simd::movemask(&g)) as u64,
+                                UNRESOLVED,
+                            )
                         };
                         let c = s.apply(m, t);
                         self.push_child(nd, &c, i, m, nd.left - 1);
@@ -1376,6 +1417,18 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         // reduced table's child bits; they are still counted as nodes).
                         a = self.live_children(nd, a, nd.d, nd.left, dec, 0);
                     }
+                    if SUCC && let Some(sc) = mt.succ_of(nd.idx) {
+                        // The children's reduced index and symmetry from the successors.
+                        let sym = nd.sym;
+                        while a != 0 {
+                            let m = a.trailing_zeros() as usize;
+                            a &= a - 1;
+                            let c = s.apply(m, t);
+                            let i = || mt.succ_child(&sc, sym, m);
+                            self.push_child(nd, &c, i, m, nd.left - 1);
+                        }
+                        continue;
+                    }
                     let flags = s.centre_flags();
                     while a != 0 {
                         let m = a.trailing_zeros() as usize;
@@ -1383,12 +1436,13 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         let i = || {
                             let g = unsafe { child_flags(&flags, m, t) };
                             // The reduced table needs only the rank of the U/D positions.
-                            if reduced {
+                            let i = if reduced {
                                 let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
                                 t.staging.rank24(!nud & MASK24) as u64
                             } else {
                                 t.staging.big_index_flags(&g)
-                            }
+                            };
+                            (i, UNRESOLVED)
                         };
                         let c = s.apply(m, t);
                         self.push_child(nd, &c, i, m, nd.left - 1);
@@ -1993,6 +2047,11 @@ mod tests {
         }
         let mut t = crate::solver::load_p1(dir, true, 8, false);
         let mut reduced = Some(crate::p1mask::load(dir, &t, false, false));
+        // The successor table (if there), with its successors used.
+        let mut succ = dir
+            .join("p1-succ-live.tab")
+            .exists()
+            .then(|| crate::p1mask::load_sel(dir, &t, crate::p1mask::MaskSel::Succ, false));
         let with_pat = dir.join("p1-pat.tab").exists();
         if with_pat {
             crate::solver::load_pat(&mut t, dir, false, 8, false);
@@ -2013,11 +2072,68 @@ mod tests {
                     assert_eq!(endpoint_set(&t, &root, len, false), want);
                     reduced = t.mask.take();
                 }
+                if succ.is_some() {
+                    t.mask = succ.take();
+                    assert_eq!(endpoint_set(&t, &root, len, false), want);
+                    succ = t.mask.take();
+                }
                 if with_pat {
                     assert_eq!(endpoint_set(&t, &root, len, true), want);
                 }
             }
         }
+    }
+
+    /// The batches find the same endpoints, in the same order, with the same node and read
+    /// counts, with the reduced table and with the successor table (successors used or not;
+    /// needs `p1-mask-live.tab` in ./tables, skipped without it; the successor table only if
+    /// `p1-succ-live.tab` is there).
+    #[test]
+    fn successors_keep_the_search() {
+        use crate::p1mask::MaskSel;
+        use rand::SeedableRng;
+        let dir = std::path::Path::new("tables");
+        if !dir.join("p1-mask-live.tab").exists() {
+            return;
+        }
+        let mut t = crate::solver::load_p1(dir, false, 8, false);
+        let mut sels = vec![MaskSel::Reduced];
+        if dir.join("p1-succ-live.tab").exists() {
+            sels.push(MaskSel::Succ);
+        }
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(9);
+        let roots: Vec<P1State> = (0..4)
+            .map(|_| P1State::from_cube(&Cube::random(&mut rng)))
+            .collect();
+        let mut want = vec![];
+        for sel in sels {
+            t.mask = Some(crate::p1mask::load_sel(dir, &t, sel, false));
+            for succ in [false, true] {
+                t.mask.as_mut().unwrap().use_succ = succ;
+                let mut runs = vec![];
+                for root in &roots {
+                    let d0 = t.distance(root);
+                    for len in d0..d0 + 3 {
+                        let mut found = vec![];
+                        let mut s = Search1::new(&t, |p: &[u8], f| {
+                            found.push((p.to_vec(), f));
+                            true
+                        });
+                        s.dfs(root, d0, len, N_MOVES);
+                        let counts = (s.nodes, s.reads);
+                        drop(s);
+                        runs.push((found, counts));
+                    }
+                }
+                if want.is_empty() {
+                    want = runs.clone();
+                }
+                assert_eq!(runs, want, "{sel:?}, successors {succ}");
+            }
+            t.mask = None;
+        }
+        let found: usize = want.iter().map(|r| r.0.len()).sum();
+        assert!(found > 100, "{found} endpoints");
     }
 
     /// [`P1Tables::staged_after`] agrees with the definition (and with the staging table's
