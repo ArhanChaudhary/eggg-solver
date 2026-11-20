@@ -1280,7 +1280,7 @@ pub fn load_p1(dir: &std::path::Path, big: bool, threads: usize, verbose: bool) 
 
 /// Load or build all tables in `dir`.
 pub fn load_tables(dir: &std::path::Path, h48_k: u32, threads: usize, verbose: bool) -> Tables {
-    load_tables_with(dir, h48_k, false, false, (None, None), threads, verbose)
+    load_tables_with(dir, h48_k, false, false, P1Extra::NONE, threads, verbose)
 }
 
 /// Load (or build) the phase-1 pattern table into `p1`: the reduced one (0.9 GB) or the
@@ -1297,17 +1297,36 @@ pub fn load_pat(
 
 /// Load (or build from the staging table) the phase-1 move-mask table into `p1`: the large
 /// one (`big`, 18.9 GB; needs the large staging table) or the reduced one (1.6 GB).
-pub fn load_mask(p1: &mut P1Tables, dir: &std::path::Path, big: bool, verbose: bool) {
+pub fn load_mask(p1: &mut P1Tables, dir: &std::path::Path, big: bool, wing_k: u8, verbose: bool) {
     p1.mask = Some(crate::p1mask::load(dir, p1, big, verbose));
-    p1.wingk = wing_paths(verbose);
+    p1.wingk = wing_paths(wing_k, verbose);
 }
 
-/// The wing-path lookahead for the batched nodes, built (`EGGG_P1_WINGK`: its largest
-/// distance for tight nodes, default [`WINGK`], 0: none; `EGGG_P1_WINGS`: for nodes with one
-/// move of slack, default [`WINGS`], at most the former; see [`crate::wingpath`]).
-pub fn wing_paths(verbose: bool) -> Option<Box<crate::wingpath::WingPaths>> {
+/// The optional phase-1 tables of [`load_tables_with`]: the pattern table and the move-mask
+/// table (each `Some(big)`: reduced or large) and, with the move masks, the wing-path
+/// lookahead's largest distance for tight nodes (0: none; see [`wing_paths`]).
+#[derive(Clone, Copy, Debug)]
+pub struct P1Extra {
+    pub pat: Option<bool>,
+    pub mask: Option<bool>,
+    pub wing_k: u8,
+}
+
+impl P1Extra {
+    /// No pattern table, move masks or wing paths.
+    pub const NONE: P1Extra = P1Extra {
+        pat: None,
+        mask: None,
+        wing_k: 0,
+    };
+}
+
+/// The wing-path lookahead for the batched nodes, built with largest distance `k` for tight
+/// nodes (0: none; the tiers' defaults are [`WINGK`] and 6 for the large tier) and, for
+/// nodes with one move of slack, `EGGG_P1_WINGS` (default [`WINGS`], at most `k`); see
+/// [`crate::wingpath`].
+pub fn wing_paths(k: u8, verbose: bool) -> Option<Box<crate::wingpath::WingPaths>> {
     let env = |k: &str, d: u8| std::env::var(k).ok().map_or(d, |v| v.parse().expect(k));
-    let k = env("EGGG_P1_WINGK", WINGK);
     if k == 0 {
         return None;
     }
@@ -1385,7 +1404,7 @@ pub fn load_tables_with(
     h48_k: u32,
     joint: bool,
     p1_big: bool,
-    p1_extra: (Option<bool>, Option<bool>),
+    p1_extra: P1Extra,
     threads: usize,
     verbose: bool,
 ) -> Tables {
@@ -1407,15 +1426,16 @@ pub fn load_tables_with(
         })
     };
     // The wing-path table (with the move masks) is built meanwhile too.
+    let wing_k = p1_extra.wing_k;
     let wk = p1_extra
-        .1
-        .map(|_| std::thread::spawn(move || wing_paths(verbose)));
+        .mask
+        .map(|_| std::thread::spawn(move || wing_paths(wing_k, verbose)));
     let g = crate::table::LoadGroup::enter();
     let mut p1 = load_p1(dir, p1_big, threads, verbose);
-    if let Some(big) = p1_extra.0 {
+    if let Some(big) = p1_extra.pat {
         load_pat(&mut p1, dir, big, threads, verbose);
     }
-    if let Some(big) = p1_extra.1 {
+    if let Some(big) = p1_extra.mask {
         assert!(
             p1_big || !big || p1.pat.is_some(),
             "the large move-mask table needs the large staging table"
@@ -1547,7 +1567,7 @@ mod tests {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(3);
-        load_tables_with(&dir, k, true, false, (None, None), 8, false)
+        load_tables_with(&dir, k, true, false, P1Extra::NONE, 8, false)
     }
 
     type Endpoints = Vec<(Vec<u8>, u8)>;
@@ -2101,7 +2121,7 @@ mod tests {
         use crate::phase2::P2_MOVES;
         let dir = std::path::Path::new("tables");
         let small = load_tables(dir, 3, 8, false);
-        let joint = load_tables_with(dir, 3, true, false, (None, None), 8, false);
+        let joint = load_tables_with(dir, 3, true, false, P1Extra::NONE, 8, false);
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(12);
         let mut total = 0;
         for t in [&small, &joint] {
@@ -2269,7 +2289,7 @@ mod tests {
     #[test]
     fn split_phase2_gives_the_same_reductions() {
         let dir = std::path::Path::new("tables");
-        let t = load_tables_with(dir, 3, true, false, (None, None), 8, false);
+        let t = load_tables_with(dir, 3, true, false, P1Extra::NONE, 8, false);
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(13);
         let mut total = 0;
         for _ in 0..3 {

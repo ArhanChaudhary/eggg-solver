@@ -1,7 +1,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eggg_solver::cube::{Cube, Facelets};
 use eggg_solver::notation::{Style, format_moves, parse_moves};
-use eggg_solver::solver::{Options, Solution, Solver, Tables, load_tables_with, verify};
+use eggg_solver::solver::{Options, P1Extra, Solution, Solver, Tables, load_tables_with, verify};
 use rand::SeedableRng;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -87,29 +87,33 @@ enum Tier {
     Small,
     /// ~2.3 GB: h48 h5 and the joint phase-2 table.
     Medium,
-    /// ~4.7 GB: h48 h6, the joint phase-2 table and the phase-1 move masks.
+    /// ~4.85 GB: h48 h6, the joint phase-2 table, the phase-1 move masks and wing paths up to
+    /// distance 6 (0.14 GB).
     Large,
-    /// ~6.6 GB: h48 h7, the joint phase-2 table and the phase-1 move masks.
+    /// ~7.9 GB: h48 h7, the joint phase-2 table, the phase-1 move masks and wing paths up to
+    /// distance 7 (1.24 GB).
     Huge,
-    /// ~18.0 GB: h48 h9, the joint phase-2 table and the phase-1 move masks (phase 3 3.6x
-    /// faster than huge; single-threaded first solutions ~4x sooner).
+    /// ~19.3 GB: h48 h9, the joint phase-2 table, the phase-1 move masks and wing paths up to
+    /// distance 7 (phase 3 3.6x faster than huge; single-threaded first solutions ~4x sooner).
     Xl,
-    /// ~63.6 GB: h48 h11 (the largest), the joint phase-2 table and the phase-1 move masks
-    /// (phase 3 11x faster than huge; single-threaded first solutions ~12x sooner).
+    /// ~64.9 GB: h48 h11 (the largest), the joint phase-2 table, the phase-1 move masks and
+    /// wing paths up to distance 7 (phase 3 11x faster than huge; single-threaded first
+    /// solutions ~12x sooner).
     Xxl,
 }
 
 impl Tier {
-    /// (h48 K, joint phase-2 table, phase-1 move masks, measured peak memory in bytes).
-    fn tables(self) -> (u32, bool, bool, f64) {
+    /// (h48 K, joint phase-2 table, phase-1 move masks, wing-path distance, peak memory in
+    /// bytes: measured, plus the wing-path table).
+    fn tables(self) -> (u32, bool, bool, u8, f64) {
         match self {
-            Tier::Tiny => (0, false, false, 0.16e9),
-            Tier::Small => (3, false, false, 0.35e9),
-            Tier::Medium => (5, true, false, 2.3e9),
-            Tier::Large => (6, true, true, 4.7e9),
-            Tier::Huge | Tier::Auto => (7, true, true, 6.6e9),
-            Tier::Xl => (9, true, true, 18.0e9),
-            Tier::Xxl => (11, true, true, 63.6e9),
+            Tier::Tiny => (0, false, false, 0, 0.16e9),
+            Tier::Small => (3, false, false, 0, 0.35e9),
+            Tier::Medium => (5, true, false, 0, 2.3e9),
+            Tier::Large => (6, true, true, 6, 4.85e9),
+            Tier::Huge | Tier::Auto => (7, true, true, 7, 7.9e9),
+            Tier::Xl => (9, true, true, 7, 19.3e9),
+            Tier::Xxl => (11, true, true, 7, 64.9e9),
         }
     }
 
@@ -136,7 +140,7 @@ impl Tier {
             Tier::Small,
         ]
         .into_iter()
-        .find(|&t| t.tables().3 <= ram / 3.0 && (t.tables().0 <= 7 || present(t)))
+        .find(|&t| t.tables().4 <= ram / 3.0 && (t.tables().0 <= 7 || present(t)))
         .unwrap_or(Tier::Tiny)
     }
 }
@@ -174,6 +178,11 @@ struct TableArgs {
     /// table instead (pattern-distance-decreasing moves, 17.5 GB).
     #[arg(long, value_enum)]
     p1_mask: Option<PatArg>,
+    /// Phase-1 wing-path lookahead (with the move masks): per centre state, the wing slot
+    /// sets its staging paths need, up to this distance (0: none; 6: 0.14 GB, 7: 1.24 GB,
+    /// built in ~1 s; default: the tier's).
+    #[arg(long, value_name = "K")]
+    p1_wing: Option<u8>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
@@ -184,25 +193,31 @@ enum PatArg {
 }
 
 impl TableArgs {
-    /// (h48 K, joint phase-2 table, phase-1 move masks, large phase-1 staging table) from the
-    /// tier and the overrides.
-    fn config(&self) -> (u32, bool, bool, bool) {
-        let (k, joint, masks, _) = self.tier.resolve(&self.dir()).tables();
+    /// (h48 K, joint phase-2 table, phase-1 move masks, large phase-1 staging table,
+    /// wing-path distance) from the tier and the overrides.
+    fn config(&self) -> (u32, bool, bool, bool, u8) {
+        let (k, joint, masks, wing, _) = self.tier.resolve(&self.dir()).tables();
         (
             self.h48.unwrap_or(k),
             joint || self.p2_joint,
             masks,
             self.p1_big,
+            self.p1_wing.unwrap_or(wing),
         )
     }
 
     fn load(&self, threads: usize, verbose: bool) -> Tables {
-        let (k, joint, masks, big) = self.config();
+        let (k, joint, masks, big, wing_k) = self.config();
         if verbose {
             eprintln!(
-                "tables: h48 h{k}{}{}{} ({:?} tier)",
+                "tables: h48 h{k}{}{}{}{} ({:?} tier)",
                 if joint { ", joint phase 2" } else { "" },
                 if masks { ", phase-1 move masks" } else { "" },
+                if masks && wing_k > 0 {
+                    format!(", wing paths <= {wing_k}")
+                } else {
+                    String::new()
+                },
                 if big { ", large phase 1" } else { "" },
                 self.tier.resolve(&self.dir())
             );
@@ -249,7 +264,7 @@ impl TableArgs {
             k,
             joint,
             big || (pat.is_none() && mask == Some(true)),
-            (pat, mask),
+            P1Extra { pat, mask, wing_k },
             threads,
             verbose,
         )

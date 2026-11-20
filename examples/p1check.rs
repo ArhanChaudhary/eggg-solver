@@ -20,7 +20,7 @@ fn main() {
     let mut p1 = load_p1(dir, big, 8, false);
     p1.table.data.collapse();
     if let Some(kind) = &mask {
-        load_mask(&mut p1, dir, kind == "big", true);
+        load_mask(&mut p1, dir, kind == "big", wing_k(), true);
         p1.mask.as_ref().unwrap().collapse();
     }
     let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(3);
@@ -49,4 +49,14 @@ fn main() {
         h.finish(),
         t0.elapsed().as_secs_f64()
     );
+}
+
+/// The wing-path lookahead's largest distance for tight nodes: `EGGG_P1_WINGK` (default the
+/// solver's [`eggg_solver::solver::WINGK`]; 0: none).
+fn wing_k() -> u8 {
+    std::env::var("EGGG_P1_WINGK")
+        .ok()
+        .map_or(eggg_solver::solver::WINGK, |v| {
+            v.parse().expect("EGGG_P1_WINGK")
+        })
 }

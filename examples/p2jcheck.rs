@@ -4,7 +4,7 @@ use eggg_solver::cube::Cube;
 use eggg_solver::moves::{ALLOWED_AFTER, MOVE_PERMS, N_MOVES};
 use eggg_solver::phase1::{P1State, Search1};
 use eggg_solver::phase2::{P2_MOVES, Search2, standardise};
-use eggg_solver::solver::load_tables_with;
+use eggg_solver::solver::{P1Extra, load_tables_with};
 use rand::{Rng, SeedableRng};
 
 fn main() {
@@ -13,7 +13,7 @@ fn main() {
         2,
         true,
         false,
-        (None, None),
+        P1Extra::NONE,
         8,
         false,
     );

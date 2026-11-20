@@ -114,7 +114,7 @@ fn main() {
             // the pair mask table (pair).
             Ok("virtual") => p1.mask = Some(eggg_solver::p1mask::MaskTable::virtual_table()),
             Ok("lazy") => p1.mask = Some(eggg_solver::p1mask::MaskTable::lazy_pair_table()),
-            Ok("pair") => load_mask(&mut p1, dir, false, true),
+            Ok("pair") => load_mask(&mut p1, dir, false, wing_k(), true),
             _ => {}
         }
         eprintln!(
@@ -136,7 +136,7 @@ fn main() {
         if kind == "virtual" {
             p1.mask = Some(eggg_solver::p1mask::MaskTable::virtual_table());
         } else {
-            load_mask(&mut p1, dir, kind == "big", true);
+            load_mask(&mut p1, dir, kind == "big", wing_k(), true);
         }
         p1.mask.as_ref().unwrap().collapse();
         eprintln!("mask table loaded in {:.1} s", t0.elapsed().as_secs_f64());
@@ -153,4 +153,14 @@ fn main() {
         let (eps, nodes, el) = run(&p1, false, threads);
         report("plain search", &eps, nodes, el, threads);
     }
+}
+
+/// The wing-path lookahead's largest distance for tight nodes: `EGGG_P1_WINGK` (default the
+/// solver's [`eggg_solver::solver::WINGK`]; 0: none).
+fn wing_k() -> u8 {
+    std::env::var("EGGG_P1_WINGK")
+        .ok()
+        .map_or(eggg_solver::solver::WINGK, |v| {
+            v.parse().expect("EGGG_P1_WINGK")
+        })
 }
