@@ -43,12 +43,13 @@ const N36: usize = 36;
 const MASK36: u64 = (1 << N36) - 1;
 /// The first of a reduced entry's two viability bits (see [`MaskTable::add_viable`]).
 const VIABLE_SHIFT: u32 = 36;
-/// A reduced entry's successors (see [`MaskTable::add_succ`]), [`SUCC_BITS`] bits each: the
-/// first two from bit [`SUCC_SHIFT0`] of the entry's first word (above the viability bits),
-/// the next two from bit 36 of its second word (above the equal moves' mask), and in the
-/// wide table's entries four more in each of their two extra words. Bit [`SUCC_FLAG`] of the
-/// second word is set where they are stored, and bit [`SUCC_EQ`] where they are those of the
-/// decreasing and the equal moves (else of the decreasing moves only).
+/// A reduced entry's successors (see [`MaskTable::add_succ`]), [`SUCC_BITS`] bits each, those
+/// of its decreasing moves in move order, then those of its equal moves if stored: the first
+/// two from bit [`SUCC_SHIFT0`] of the entry's first word (above the viability bits), the
+/// next two from bit 36 of its second word (above the equal moves' mask), and in the wide
+/// table four more in each word of the entry's extension. Bit [`SUCC_FLAG`] of the second word
+/// is set where the decreasing moves' successors are stored, and bit [`SUCC_EQ`] where the
+/// equal moves' are too.
 const SUCC_BITS: u32 = 13;
 const SUCC_SHIFT0: u32 = 38;
 const SUCC_FLAG: u32 = 62;
@@ -95,10 +96,10 @@ pub struct MaskTable {
     big: HugeBuf<u32>,
     /// The reduced table's entries: the decreasing moves' 36-bit mask with the viability bits
     /// above it, and the equal moves' mask (16 bytes, aligned: one cache line); in the wide
-    /// table, each followed by 16 bytes of further successors.
+    /// table, followed by the entries' extensions (16 bytes each, further successors).
     red: HugeBuf<[u64; 2]>,
-    /// log2 of the 16-byte units per entry of `red` (1: the wide table).
-    shift: u32,
+    /// The wide table (with the extensions).
+    wide: bool,
     /// The pair table: 5 bytes per entry (and 3 bytes of padding).
     pair: HugeBuf<u8>,
     /// The pair table's entries are computed when read, from the pattern table (tests).
@@ -121,11 +122,14 @@ pub struct MaskTable {
 /// A batch node's successors (see [`MaskTable::succ`]).
 #[derive(Clone, Copy)]
 pub struct Succ {
-    /// The moves (of the 36) whose successors are stored: the decreasing ones, and the equal
-    /// ones if `eq`.
-    list: u64,
-    /// The successors in the order of their moves, four per word ([`SUCC_BITS`] each).
-    ch: [u64; 3],
+    /// The decreasing moves (of the 36).
+    dec: u64,
+    /// The equal moves, if their successors are stored (else 0).
+    eqm: u64,
+    /// The first four successors ([`SUCC_BITS`] each).
+    ch: u64,
+    /// The entry's extension (the wide table's; the successors past the fourth).
+    ext: *const [u64; 2],
     /// The node's class times 36: its row of `succ_class`.
     row: usize,
     /// The equal moves' successors are stored too.
@@ -211,7 +215,7 @@ impl MaskTable {
                 .unwrap_or(SLACK_BATCH),
             big: HugeBuf::zeroed(1),
             red: HugeBuf::zeroed(1),
-            shift: 0,
+            wide: false,
             pair: HugeBuf::zeroed(1),
             lazy: false,
             conj: vec![],
@@ -368,13 +372,21 @@ impl MaskTable {
     /// The reduced table's entry `i` (its first 16 bytes).
     #[inline(always)]
     fn ent(&self, i: u64) -> [u64; 2] {
-        self.red[(i as usize) << self.shift]
+        self.red[i as usize]
     }
 
     /// Prefetch the reduced table's entry `j`.
     #[inline(always)]
     pub fn prefetch_entry(&self, j: u64) {
-        crate::table::prefetch(unsafe { self.red.as_ptr().add((j as usize) << self.shift) });
+        crate::table::prefetch(unsafe { self.red.as_ptr().add(j as usize) });
+    }
+
+    /// Prefetch the wide table's extension of entry `j` (if wide).
+    #[inline(always)]
+    pub fn prefetch_ext(&self, j: u64) {
+        if self.wide {
+            crate::table::prefetch(unsafe { self.red.as_ptr().add(N_ENTRIES + j as usize) });
+        }
     }
 
     /// The successors of the node with reduced index `i`, if its entry holds them (reduced
@@ -384,17 +396,14 @@ impl MaskTable {
         if !self.use_succ {
             return None;
         }
-        let ext = if self.shift == 1 {
-            self.red[2 * i as usize + 1]
-        } else {
-            [0; 2]
-        };
-        Self::succ_of(self.ent(i), ext, i)
+        // (Its address only: read only for a successor past the fourth.)
+        let ext = self.red.as_ptr().wrapping_add(N_ENTRIES + i as usize);
+        Self::succ_of(self.ent(i), i, ext)
     }
 
-    /// [`MaskTable::succ`] of entry `i` holding `e` (and in the wide table `ext`).
+    /// [`MaskTable::succ`] of entry `i` holding `e`, with extension `ext`.
     #[inline(always)]
-    fn succ_of(e: [u64; 2], ext: [u64; 2], i: u64) -> Option<Succ> {
+    fn succ_of(e: [u64; 2], i: u64, ext: *const [u64; 2]) -> Option<Succ> {
         let [w0, w1] = e;
         if w1 >> SUCC_FLAG & 1 == 0 {
             return None;
@@ -402,12 +411,10 @@ impl MaskTable {
         let half = (1u64 << (2 * SUCC_BITS)) - 1;
         let eq = w1 >> SUCC_EQ & 1 == 1;
         Some(Succ {
-            list: (w0 | if eq { w1 } else { 0 }) & MASK36,
-            ch: [
-                w0 >> SUCC_SHIFT0 | (w1 >> N36 & half) << (2 * SUCC_BITS),
-                ext[0],
-                ext[1],
-            ],
+            dec: w0 & MASK36,
+            eqm: if eq { w1 & MASK36 } else { 0 },
+            ch: w0 >> SUCC_SHIFT0 | (w1 >> N36 & half) << (2 * SUCC_BITS),
+            ext,
             row: (i / N_SPLIT as u64) as usize * N36,
             eq,
         })
@@ -421,13 +428,23 @@ impl MaskTable {
     pub fn succ_child(&self, sc: &Succ, sym: u8, m: usize) -> (u64, u8) {
         debug_assert!(m < N_MOVES && (sym as usize) < 48);
         // SAFETY: sym < 48 (a resolved node's), m < N_MOVES, k < 36, and so is the info's
-        // symmetry; a slot is below the number of stored successors (at most 12).
+        // symmetry; a slot is below the number of stored successors (at most 4, or 12 in
+        // the wide table, whose extensions follow its entries).
         unsafe {
             let k = *self.conj_move.get_unchecked(sym as usize).get_unchecked(m) as u32;
-            debug_assert!(sc.list >> k & 1 == 1);
-            let slot = (sc.list & ((1u64 << k) - 1)).count_ones();
-            let u = sc.ch.get_unchecked(slot as usize / 4) >> (SUCC_BITS * (slot % 4))
-                & ((1 << SUCC_BITS) - 1);
+            debug_assert!((sc.dec | sc.eqm) >> k & 1 == 1);
+            let below = (1u64 << k) - 1;
+            // The decreasing moves' successors first, then the equal moves'.
+            let slot = if sc.dec >> k & 1 == 1 {
+                (sc.dec & below).count_ones()
+            } else {
+                sc.dec.count_ones() + (sc.eqm & below).count_ones()
+            };
+            let u = if slot < 4 {
+                sc.ch >> (SUCC_BITS * slot)
+            } else {
+                (*sc.ext)[(slot as usize - 4) / 4] >> (SUCC_BITS * (slot % 4))
+            } & ((1 << SUCC_BITS) - 1);
             let info = *self.succ_class.get_unchecked(sc.row + k as usize);
             let j = (info >> 8) as u64 * N_SPLIT as u64 + u;
             let t = *self
@@ -674,7 +691,7 @@ impl MaskTable {
     /// info, index or symmetry computation.
     pub fn add_succ(&mut self, st: &Staging) -> u64 {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-        assert_eq!(self.shift, 0);
+        assert!(!self.wide);
         let n = N_CLASSES_A * N_SPLIT;
         let ptr = self.red.as_mut_slice().as_mut_ptr() as usize;
         let mv = moves36();
@@ -684,7 +701,7 @@ impl MaskTable {
             for i in r {
                 // SAFETY: each entry is written by one thread only, within the buffer.
                 let e = unsafe { &mut *(ptr as *mut [u64; 2]).add(i) };
-                *e = with_succ(st, &mv, i as u64, *e, SUCC_MAX)[0];
+                *e = with_succ(st, &mv, i as u64, *e, SUCC_MAX).0;
                 local += e[1] >> SUCC_FLAG & 1;
             }
             count.fetch_add(local, Relaxed);
@@ -692,73 +709,95 @@ impl MaskTable {
         count.into_inner()
     }
 
-    /// The wide table (32-byte entries: up to [`SUCC_MAX_WIDE`] successors, see
-    /// [`MaskTable::add_succ`]) from the reduced one (its masks and viability bits), and the
-    /// number of entries with successors.
+    /// The wide table (entries with up to [`SUCC_MAX_WIDE`] successors, the ones past the
+    /// fourth in the extensions: 32 bytes per state; see [`MaskTable::add_succ`]) from the
+    /// reduced one (its masks and viability bits), and the number of entries with successors.
     pub fn widen(&self, st: &Staging) -> (MaskTable, u64) {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-        assert_eq!((self.kind, self.shift), (MaskKind::Reduced, 0));
-        let n = N_CLASSES_A * N_SPLIT;
-        let mut red = HugeBuf::<[u64; 2]>::zeroed(2 * n);
+        assert!(self.kind == MaskKind::Reduced && !self.wide);
+        let mut red = HugeBuf::<[u64; 2]>::zeroed(2 * N_ENTRIES);
         let ptr = red.as_mut_slice().as_mut_ptr() as usize;
         let mv = moves36();
         let count = AtomicU64::new(0);
-        crate::par::for_chunks(n, 1 << 12, |r| {
+        crate::par::for_chunks(N_ENTRIES, 1 << 12, |r| {
             let mut local = 0;
             for i in r {
-                let w = with_succ(st, &mv, i as u64, self.red[i], SUCC_MAX_WIDE);
-                local += w[0][1] >> SUCC_FLAG & 1;
+                let (e, x) = with_succ(st, &mv, i as u64, self.red[i], SUCC_MAX_WIDE);
+                local += e[1] >> SUCC_FLAG & 1;
                 // SAFETY: each entry is written by one thread only, within the buffer.
-                unsafe { (ptr as *mut [[u64; 2]; 2]).add(i).write(w) };
+                unsafe {
+                    let p = ptr as *mut [u64; 2];
+                    p.add(i).write(e);
+                    p.add(N_ENTRIES + i).write(x);
+                }
             }
             count.fetch_add(local, Relaxed);
         });
         let m = MaskTable {
             red,
-            shift: 1,
+            wide: true,
             ..Self::empty(MaskKind::Reduced)
         };
         (m.with_lookups(st), count.into_inner())
     }
 }
 
+/// The reduced table's entries (and the wide table's extensions).
+const N_ENTRIES: usize = N_CLASSES_A * N_SPLIT;
+
+impl MaskTable {
+    /// Do a sample of the entries hold the successors that [`MaskTable::add_succ`] (or
+    /// [`MaskTable::widen`]) stores? (A check of a loaded table's format.)
+    fn succ_ok(&self, st: &Staging) -> bool {
+        let mv = moves36();
+        let max = if self.wide { SUCC_MAX_WIDE } else { SUCC_MAX };
+        (0..512u64).all(|k| {
+            let i = (k * 195_845_143 + 7) % N_ENTRIES as u64;
+            let x = if self.wide {
+                self.red[N_ENTRIES + i as usize]
+            } else {
+                [0; 2]
+            };
+            with_succ(st, &mv, i, self.red[i as usize], max) == (self.red[i as usize], x)
+        })
+    }
+}
+
 /// Reduced entry `i` (`e`: its masks and viability bits; any successors in it are ignored)
-/// with at most `max` successors (see [`MaskTable::add_succ`]), and the further successors
-/// of a wide entry (`max` > 4).
-fn with_succ(st: &Staging, mv: &[V32; N36], i: u64, e: [u64; 2], max: u32) -> [[u64; 2]; 2] {
+/// with at most `max` successors (see [`MaskTable::add_succ`]), and the wide table's
+/// extension (`max` > 4): those of the decreasing moves, and of the equal moves too if all fit.
+fn with_succ(st: &Staging, mv: &[V32; N36], i: u64, e: [u64; 2], max: u32) -> ([u64; 2], [u64; 2]) {
     let (dec, eq) = (e[0] & MASK36, e[1] & MASK36);
     let e = [e[0] & ((1 << SUCC_SHIFT0) - 1), eq];
-    let list = if (dec | eq).count_ones() <= max {
-        dec | eq
-    } else {
-        dec
-    };
-    if dec == 0 || list.count_ones() > max {
-        return [e, [0; 2]];
+    let with_eq = (dec | eq).count_ones() <= max;
+    if dec == 0 || dec.count_ones() > max {
+        return (e, [0; 2]);
     }
     let (ud, rl) = st.rep_of(i);
     let flags = flags_of(ud, rl);
-    let (mut ch, mut slot, mut d) = ([0u64; 3], 0, list);
-    while d != 0 {
-        let k = d.trailing_zeros() as usize;
-        d &= d - 1;
-        let g = flags.gather(&mv[k]);
-        let info = unsafe { *st.info(flag_masks(&g).0) };
-        let j = st.fast_index_flags(info, &g);
-        debug_assert_eq!(j as usize / N_SPLIT, (info >> 8) as usize);
-        ch[slot / 4] |= (j % N_SPLIT as u64) << (SUCC_BITS as usize * (slot % 4));
-        slot += 1;
+    let mut ch = [0u64; 3];
+    let mut slot = 0;
+    for list in [dec, if with_eq { eq } else { 0 }] {
+        let mut d = list;
+        while d != 0 {
+            let k = d.trailing_zeros() as usize;
+            d &= d - 1;
+            let g = flags.gather(&mv[k]);
+            let info = unsafe { *st.info(flag_masks(&g).0) };
+            let j = st.fast_index_flags(info, &g);
+            debug_assert_eq!(j as usize / N_SPLIT, (info >> 8) as usize);
+            ch[slot / 4] |= (j % N_SPLIT as u64) << (SUCC_BITS as usize * (slot % 4));
+            slot += 1;
+        }
     }
     let half = (1u64 << (2 * SUCC_BITS)) - 1;
-    [
+    (
         [
             e[0] | (ch[0] & half) << SUCC_SHIFT0,
-            eq | (ch[0] >> (2 * SUCC_BITS)) << N36
-                | 1 << SUCC_FLAG
-                | ((list != dec) as u64) << SUCC_EQ,
+            eq | (ch[0] >> (2 * SUCC_BITS)) << N36 | 1 << SUCC_FLAG | (with_eq as u64) << SUCC_EQ,
         ],
         [ch[1], ch[2]],
-    ]
+    )
 }
 
 /// Which move-mask table to load (see [`load_sel`]).
@@ -816,10 +855,15 @@ pub fn load_sel(dir: &std::path::Path, t: &P1Tables, sel: MaskSel, verbose: bool
             let name = "p1-succ";
             let path = dir.join(format!("{name}.tab"));
             let mut m = MaskTable::empty(MaskKind::Reduced);
-            m.red = HugeBuf::zeroed(2 * N_CLASSES_A * N_SPLIT);
-            m.shift = 1;
+            m.red = HugeBuf::zeroed(2 * N_ENTRIES);
+            m.wide = true;
             if crate::table::load(&path, name, m.red.as_bytes_mut()).is_ok() {
-                return m.with_lookups(&t.staging);
+                if m.succ_ok(&t.staging) {
+                    return m.with_lookups(&t.staging);
+                }
+                if verbose {
+                    eprintln!("{name}.tab has another format: making it again");
+                }
             }
             drop(m);
             let r = load_reduced(dir, t, verbose);
@@ -851,7 +895,12 @@ fn load_reduced(dir: &std::path::Path, t: &P1Tables, verbose: bool) -> MaskTable
     let mut m = MaskTable::empty(MaskKind::Reduced);
     m.red = HugeBuf::zeroed(N_CLASSES_A * N_SPLIT);
     if crate::table::load(&path, name, m.red.as_bytes_mut()).is_ok() {
-        return m.with_lookups(&t.staging);
+        if m.succ_ok(&t.staging) {
+            return m.with_lookups(&t.staging);
+        }
+        if verbose {
+            eprintln!("{name}.tab has another format: making it again");
+        }
     }
     let mut m = if crate::table::load(&dir.join("p1-mask2.tab"), "p1-mask2", m.red.as_bytes_mut())
         .is_ok()
@@ -1097,33 +1146,33 @@ mod tests {
             let (j, sym) = resolve(s);
             let e = masks(j);
             assert_eq!((conj(e[0], sym), conj(e[1], sym)), direct(s));
-            // The entry's own successors (reduced and wide entries): of the decreasing and
-            // equal moves if there are at most `max`, else of the decreasing moves if there
-            // are at most `max`.
+            // The entry's own successors (reduced and wide entries): of the decreasing
+            // moves if there are at most `max`, and of the equal moves too if all fit.
             let (dec, eq) = (e[0] & MASK36, e[1] & MASK36);
-            let full = [SUCC_MAX, SUCC_MAX_WIDE].map(|max| {
-                let w = with_succ(st, &mv, j, e, max);
-                assert_eq!([w[0][0] & ((1 << SUCC_SHIFT0) - 1), w[0][1] & MASK36], e);
-                let sc = MaskTable::succ_of(w[0], w[1], j);
-                let n = (dec | eq).count_ones();
-                assert_eq!(
-                    sc.map(|sc| sc.eq),
-                    (dec != 0)
-                        .then_some(n <= max)
-                        .filter(|&b| b || dec.count_ones() <= max)
-                );
-                if max == SUCC_MAX {
-                    assert_eq!(w[1], [0; 2]);
+            let full = [SUCC_MAX, SUCC_MAX_WIDE].map(|max| with_succ(st, &mv, j, e, max));
+            let succs = full.each_ref().map(|(h, x)| {
+                let max = if *x == [0; 2] {
+                    SUCC_MAX
+                } else {
+                    SUCC_MAX_WIDE
+                };
+                assert_eq!([h[0] & ((1 << SUCC_SHIFT0) - 1), h[1] & MASK36], e);
+                let sc = MaskTable::succ_of(*h, j, x);
+                if dec != 0 && dec.count_ones() <= max {
+                    assert_eq!(sc.map(|sc| sc.eq), Some((dec | eq).count_ones() <= max));
+                } else {
+                    assert!(sc.is_none());
                 }
                 sc
             });
+            assert_eq!(full[0].1, [0; 2]);
             for m in 0..N_MOVES {
                 let k = mt.conj_move[sym as usize][m];
                 let one = with_succ(st, &mv, j, [1 << k, 0], SUCC_MAX);
-                let sc = MaskTable::succ_of(one[0], one[1], j).unwrap();
+                let sc = MaskTable::succ_of(one.0, j, &one.1).unwrap();
                 let (j2, sym2) = mt.succ_child(&sc, sym, m);
-                for sf in full.iter().flatten() {
-                    if sf.list >> k & 1 == 1 {
+                for sf in succs.iter().flatten() {
+                    if (sf.dec | sf.eqm) >> k & 1 == 1 {
                         assert_eq!(mt.succ_child(sf, sym, m), (j2, sym2));
                         seen[2 + sf.eq as usize] += 1;
                     }

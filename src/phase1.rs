@@ -992,10 +992,6 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     /// batches (see [`Search1::run_batch`]).
     batch: Vec<BNode>,
     batch_next: Vec<BNode>,
-    /// The positions in `batch` (and `batch_next`) of the nodes whose reduced index is still
-    /// to be resolved (see [`BNode::idx`]).
-    batch_unres: Vec<u32>,
-    batch_unres_next: Vec<u32>,
     /// The paths of the batch nodes, as a tree: per node (by [`BNode::id`]), its parent's id
     /// and its last move, or for a node queued by the depth-first search, [`ROOT`] | the
     /// offset in `batch_roots` of its path (its length, then the moves).
@@ -1104,8 +1100,6 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             pair: ALL_PAIRS,
             batch: vec![],
             batch_next: vec![],
-            batch_unres: vec![],
-            batch_unres_next: vec![],
             batch_tree: vec![],
             batch_roots: vec![],
             batch_path: Vec::with_capacity(48),
@@ -1141,7 +1135,6 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         let id = self.batch_tree.len() as u32;
         self.batch_tree.push((ROOT | off as u32, 0));
         self.t.mask.as_ref().unwrap().prefetch(self.t, idx);
-        self.batch_unres.push(self.batch.len() as u32);
         self.batch.push(BNode {
             centres: s.centres,
             pos: s.pos,
@@ -1177,9 +1170,12 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         let mt = self.t.mask.as_ref().unwrap();
         if sym == UNRESOLVED {
             mt.prefetch(self.t, idx);
-            self.batch_unres.push(self.batch.len() as u32);
         } else {
             mt.prefetch_entry(idx);
+            // A child with slack reads all its successors (the wide table's extension).
+            if d + 1 < nd.left {
+                mt.prefetch_ext(idx);
+            }
         }
         self.batch.push(BNode {
             centres: c.centres,
@@ -1243,9 +1239,6 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             let mut cur = std::mem::take(&mut self.batch);
             std::mem::swap(&mut self.batch, &mut self.batch_next);
             self.batch.clear();
-            let mut unres = std::mem::take(&mut self.batch_unres);
-            std::mem::swap(&mut self.batch_unres, &mut self.batch_unres_next);
-            self.batch_unres.clear();
             if self
                 .abort
                 .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
@@ -1262,10 +1255,13 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             ) {
                 // The reduced table's index needs the class info (prefetched at the push),
                 // but for the nodes that have it from their parent's successors.
-                for &k in &unres {
-                    // SAFETY: the positions are those of nodes pushed to this batch.
-                    let nd = unsafe { cur.get_unchecked_mut(k as usize) };
-                    (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.state(), self.pair);
+                for nd in cur.iter_mut() {
+                    if nd.sym == UNRESOLVED {
+                        (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.state(), self.pair);
+                        if nd.d < nd.left {
+                            mt.prefetch_ext(nd.idx);
+                        }
+                    }
                 }
             }
             for nd in &cur {
@@ -1417,15 +1413,12 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             }
             cur.clear();
             self.batch_next = cur;
-            unres.clear();
-            self.batch_unres_next = unres;
         }
     }
 
     /// Drop the queued batch nodes (after a stop).
     fn clear_batch(&mut self) {
         self.batch.clear();
-        self.batch_unres.clear();
     }
 
     /// The fewest moves left of a node queued for a batch (1 if the batches also read the
