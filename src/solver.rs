@@ -22,7 +22,7 @@ use crate::phase3::{P3Tables, Search3, Task};
 /// Phase-3 checks at least this deep are split into one job per child of the root.
 const SPLIT_DEPTH: u8 = 15;
 use crate::table::Mod3Table;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -72,6 +72,11 @@ pub struct Options {
     /// prefix's yield at the previous length (see [`order_by_yield`]); otherwise in move
     /// order.
     pub order_jobs: bool,
+    /// Also report solutions as long as the best one so far, not only shorter ones: phase 3
+    /// then also searches the best length, collecting one solution per reduction there
+    /// (identical move sequences are reported once). The best solution stays the first one
+    /// of its length.
+    pub ties: bool,
 }
 
 impl Default for Options {
@@ -84,6 +89,7 @@ impl Default for Options {
             endpoints: 128,
             reductions: 32,
             order_jobs: true,
+            ties: false,
         }
     }
 }
@@ -486,6 +492,9 @@ struct Run<'a, 'r> {
     red_index: HashMap<(usize, Cube3), usize>,
     /// See [`Options::order_jobs`].
     order_jobs: bool,
+    /// See [`Options::ties`]; the solutions reported so far.
+    ties: bool,
+    printed: HashSet<Vec<u8>>,
     /// Per 3-move job prefix, (kept candidates, phase-1 nodes) at the current length so far
     /// and at the previous length.
     yields: HashMap<[u8; 3], (u64, u64)>,
@@ -560,6 +569,8 @@ impl<'a> Solver<'a> {
             reds: vec![],
             red_index: HashMap::new(),
             order_jobs: self.opts.order_jobs,
+            ties: self.opts.ties,
+            printed: HashSet::new(),
             yields: HashMap::new(),
             prev_yields: HashMap::new(),
         };
@@ -608,6 +619,12 @@ impl<'a, 'r> Run<'a, 'r> {
 
     fn best_len(&self) -> usize {
         self.best.as_ref().map(|b| b.len()).unwrap_or(usize::MAX)
+    }
+
+    /// The totals still worth reaching are those below this: the best length, or one more
+    /// with [`Options::ties`].
+    fn bound(&self) -> usize {
+        self.best_len().saturating_add(self.ties as usize)
     }
 
     fn rounds(&mut self, endpoints: usize, reductions: usize) {
@@ -893,9 +910,9 @@ impl<'a, 'r> Run<'a, 'r> {
         let limit = self.useful_l12();
         self.cands
             .retain(|c| c.moves1.len() + c.h2.max(c.done2) as usize <= limit);
-        let best = self.best_len();
+        let bound = self.bound();
         self.reds
-            .retain(|r| r.moves12.len() + (r.h3.max(r.done3) as usize) < best);
+            .retain(|r| r.moves12.len() + (r.h3.max(r.done3) as usize) < bound);
         self.red_index.clear();
         for (i, r) in self.reds.iter().enumerate() {
             self.red_index.insert((r.frame, r.c3), i);
@@ -962,7 +979,7 @@ impl<'a, 'r> Run<'a, 'r> {
     /// those of the whole searches.
     fn phase2_level(&mut self, t12: usize, need: usize) -> Vec<Reduction> {
         let t = self.t;
-        let best = self.best_len();
+        let bound = self.bound();
         // Before a first solution phase 2 is not capped, so each search keeps at most 64
         // solutions; after it, the cap bounds the searches and all their solutions count.
         let max_sols = if self.best.is_some() { usize::MAX } else { 64 };
@@ -1014,9 +1031,9 @@ impl<'a, 'r> Run<'a, 'r> {
                 }
                 if let Some(c3) = Cube3::from_reduced(&x) {
                     let h3 = t.p3.lower_bound(&c3);
-                    // A reduction whose phase 3 cannot beat the best solution never will
-                    // (the best only gets shorter).
-                    if c.moves1.len() + p.len() + (h3 as usize) < best {
+                    // A reduction whose phase 3 cannot beat the best solution (or, with
+                    // ties, equal it) never will (the best only gets shorter).
+                    if c.moves1.len() + p.len() + (h3 as usize) < bound {
                         let mut moves12 = c.moves1.clone();
                         moves12.extend(p.iter().map(|&m| rotate_move(m as usize, &rot_inv) as u8));
                         local.push(Reduction {
@@ -1122,7 +1139,17 @@ impl<'a, 'r> Run<'a, 'r> {
             elapsed: self.start.elapsed(),
         };
         debug_assert!(verify(&self.cube.to_facelets(), &sol.moves));
+        if self.ties && sol.len() == self.best_len() {
+            // An equally long solution: reported once, the best one stays.
+            if self.printed.insert(sol.moves.clone()) {
+                (self.report)(&sol);
+            }
+            return;
+        }
         if sol.len() < self.best_len() {
+            if self.ties {
+                self.printed.insert(sol.moves.clone());
+            }
             (self.report)(&sol);
             self.have.store(true, Ordering::Relaxed);
             self.best = Some(sol);
@@ -1138,33 +1165,40 @@ impl<'a, 'r> Run<'a, 'r> {
     /// deadline (a level in progress then stops claiming reductions; finished ones are kept).
     fn phase3_levels(&mut self, deadline: Instant) {
         loop {
-            let best = self.best_len();
+            let (best, bound) = (self.best_len(), self.bound());
             let lo = self
                 .reds
                 .iter()
                 .map(|r| r.moves12.len() + r.h3.max(r.done3) as usize)
                 .min()
                 .unwrap_or(usize::MAX);
-            if lo >= best || self.stopped() || Instant::now() >= deadline {
+            if lo >= bound || self.stopped() || Instant::now() >= deadline {
                 return;
             }
             debug(
                 self.start,
                 &format!("phase 3: total {lo}, nodes {}", self.stats.nodes3),
             );
-            match self.phase3_level(lo, deadline) {
-                Some((r, sol)) => self.record(r, &sol),
-                None => {
-                    if Instant::now() >= deadline {
-                        return;
-                    }
-                }
+            // With ties, the best length's level collects every reduction's solution.
+            let found = self.phase3_level(lo, deadline, lo == best);
+            if found.is_empty() && Instant::now() >= deadline {
+                return;
+            }
+            for (r, sol) in found {
+                self.record(r, &sol);
             }
         }
     }
 
-    /// Phase-3 searches of total length `total` over the reductions; the first solution found.
-    fn phase3_level(&mut self, total: usize, deadline: Instant) -> Option<(usize, Vec<u8>)> {
+    /// Phase-3 searches of total length `total` over the reductions: the first solution found
+    /// (of the earliest reduction among those found together), or with `all` each reduction's
+    /// solution, in reduction order.
+    fn phase3_level(
+        &mut self,
+        total: usize,
+        deadline: Instant,
+        all: bool,
+    ) -> Vec<(usize, Vec<u8>)> {
         let t = self.t;
         let reds = &self.reds;
         let mut order: Vec<usize> = (0..reds.len())
@@ -1198,7 +1232,7 @@ impl<'a, 'r> Run<'a, 'r> {
                 jobs.push((i, None));
             }
         }
-        let result = Mutex::new(None::<(usize, Vec<u8>)>);
+        let result = Mutex::new(Vec::<(usize, Vec<u8>)>::new());
         let found = AtomicBool::new(false);
         let nodes = AtomicU64::new(0);
         let finished: Vec<AtomicUsize> = (0..reds.len()).map(|_| AtomicUsize::new(0)).collect();
@@ -1220,11 +1254,10 @@ impl<'a, 'r> Run<'a, 'r> {
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
             match sol {
                 Some(sol) => {
-                    found.store(true, Ordering::Relaxed);
-                    let mut g = result.lock().unwrap();
-                    if g.as_ref().is_none_or(|(k, _)| *i < *k) {
-                        *g = Some((*i, sol));
+                    if !all {
+                        found.store(true, Ordering::Relaxed);
                     }
+                    result.lock().unwrap().push((*i, sol));
                 }
                 None if !srch.aborted => {
                     finished[*i].fetch_add(1, Ordering::Relaxed);
@@ -1233,6 +1266,11 @@ impl<'a, 'r> Run<'a, 'r> {
             }
         });
         self.stats.nodes3 += nodes.load(Ordering::Relaxed);
+        let mut result = result.into_inner().unwrap();
+        // One solution per reduction (a split search can find one per task), the earliest
+        // reduction's first.
+        result.sort_by_key(|x| x.0);
+        result.dedup_by_key(|x| x.0);
         for i in 0..self.reds.len() {
             if (parts[i] > 0 && finished[i].load(Ordering::Relaxed) == parts[i])
                 || pruned.contains(&i)
@@ -1241,7 +1279,16 @@ impl<'a, 'r> Run<'a, 'r> {
                 r.done3 = r.done3.max((total - r.moves12.len()) as u8 + 1);
             }
         }
-        result.into_inner().unwrap()
+        if all {
+            // A reduction with a solution at this level has given its share.
+            for &(i, _) in &result {
+                let r = &mut self.reds[i];
+                r.done3 = r.done3.max((total - r.moves12.len()) as u8 + 1);
+            }
+        } else {
+            result.truncate(1);
+        }
+        result
     }
 }
 
@@ -2274,6 +2321,8 @@ mod tests {
                     reds: vec![],
                     red_index: HashMap::new(),
                     order_jobs,
+                    ties: false,
+                    printed: HashSet::new(),
                     yields: HashMap::new(),
                     prev_yields: HashMap::new(),
                 };
@@ -2365,6 +2414,8 @@ mod tests {
                 reds: vec![],
                 red_index: HashMap::new(),
                 order_jobs: true,
+                ties: false,
+                printed: HashSet::new(),
                 yields: HashMap::new(),
                 prev_yields: HashMap::new(),
             };

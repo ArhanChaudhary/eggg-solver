@@ -16,13 +16,17 @@ target/release/eggg-solver solve UUUU...BBBB
 target/release/eggg-solver solve "..." -n sign -l 40
 # Ten random positions, solutions only (scrambles can also come one per line on stdin):
 target/release/eggg-solver solve --random 10 -q
+# Also print every other solution as short as the best so far (equally short alternatives):
+target/release/eggg-solver solve "..." -t 30 --ties
 # Generate the tables up front, or benchmark:
 target/release/eggg-solver gen
 target/release/eggg-solver bench -N 10 -t 5
 ```
 
 Each improvement is printed as it is found (`time, length, phase lengths, moves`), then the
-best solution. The time limit is soft until a first solution exists (`--hard-limit` to cap it).
+best solution. With `--ties`, solutions as long as the best so far are printed too (one per
+reduction, each move sequence once; phase 3 then also searches the best length, so they
+mostly appear in longer runs). The time limit is soft until a first solution exists (`--hard-limit` to cap it).
 
 ### Tables and memory
 

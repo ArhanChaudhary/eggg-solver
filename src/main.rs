@@ -294,6 +294,11 @@ struct SearchArgs {
     /// Search each new phase-1 length's jobs in move order, not best first (for comparisons).
     #[arg(long, hide = true)]
     no_job_order: bool,
+    /// Also print every solution as long as the best so far (one per reduction; identical
+    /// move sequences once), not only shorter ones. Phase 3 then also searches the best
+    /// length, so improvements can come a little later.
+    #[arg(long)]
+    ties: bool,
 }
 
 #[derive(Args, Clone)]
@@ -436,6 +441,7 @@ fn options(limits: &LimitArgs, search: &SearchArgs, threads: usize) -> Options {
         endpoints: search.endpoints,
         reductions: search.reductions,
         order_jobs: !search.no_job_order,
+        ties: search.ties,
     }
 }
 
@@ -473,7 +479,7 @@ fn cmd_solve(a: SolveArgs) -> Result<(), String> {
         if !a.output.quiet && positions_label_useful(&p.label) {
             println!("# {}", p.label);
         }
-        let quiet = a.output.quiet;
+        let (quiet, ties) = (a.output.quiet, opts.ties);
         let (sol, stats) = solve_one(&tables, &opts, &p.facelets, |s| {
             if !quiet {
                 println!(
@@ -483,6 +489,8 @@ fn cmd_solve(a: SolveArgs) -> Result<(), String> {
                     s.phases,
                     format_solution(s, style)
                 );
+            } else if ties {
+                println!("{}", format_solution(s, style));
             }
         });
         match sol {
