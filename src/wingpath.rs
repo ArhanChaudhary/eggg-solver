@@ -314,15 +314,26 @@ impl WingPaths {
         find_slot(&self.slots, self.shift, self.mask, key)
     }
 
-    /// The pairs of the staging paths of every state up to distance `kmax` (<= 7), and of
-    /// the slack-1 paths of every state up to distance `smax` (<= `kmax`), for `frames`;
+    /// The pairs of the staging paths of every state up to distance `kmax` (<= 8; 8: an
+    /// estimated 14 GB), and of the slack-1 paths of every state up to distance `smax` (<=
+    /// `kmax`), for `frames`;
     /// `red`: also of the states at distance `kmax` + 1, reduced by symmetry (see
     /// [`Reduced`]).
     pub fn new(frames: &[Frame; 3], kmax: u8, smax: u8, red: bool) -> WingPaths {
-        assert!((1..=7).contains(&kmax) && smax <= kmax);
+        assert!((1..=8).contains(&kmax) && smax <= kmax);
         // States per distance (unlabelled colour pairs: about a sixth of the U/D x R/L mask
         // pairs; 7: an estimate).
-        const COUNT: [usize; 8] = [1, 3, 54, 717, 8955, 116_301, 1_506_114, 19_200_000];
+        const COUNT: [usize; 9] = [
+            1,
+            3,
+            54,
+            717,
+            8955,
+            116_301,
+            1_506_114,
+            19_200_000,
+            198_000_000,
+        ];
         let total: usize = COUNT[..=kmax as usize].iter().sum();
         let bits = (total * 3 / 2).next_power_of_two().trailing_zeros().max(4);
         let mut w = WingPaths {
@@ -395,11 +406,11 @@ impl WingPaths {
         }];
         for k in 1..=kmax as u32 {
             // The states at distance k (found from those at k - 1), and their links: the
-            // state's index << 27 | the child's index << 5 | the state's move to the child,
+            // state's index << 30 | the child's index << 5 | the state's move to the child,
             // or N_MOVES if it cannot be a staging path's move (the last move is a wide
             // quarter turn).
             let prev = &tight[k as usize - 1];
-            assert!(prev.keys.len() < 1 << 22);
+            assert!(prev.keys.len() < 1 << 25);
             let mut links: Vec<u64> = vec![];
             let (mut keys, mut slots) = (vec![], vec![]);
             for (ci, &c) in prev.keys.iter().enumerate() {
@@ -428,7 +439,7 @@ impl WingPaths {
                     } else {
                         N_MOVES
                     };
-                    links.push((i as u64) << 27 | (ci as u64) << 5 | mi as u64);
+                    links.push((i as u64) << 30 | (ci as u64) << 5 | mi as u64);
                 }
             }
             let states: usize = tight.iter().map(|l| l.keys.len()).sum::<usize>() + keys.len();
@@ -436,14 +447,14 @@ impl WingPaths {
             links.sort_unstable();
             let mut first = vec![0u32; keys.len() + 1];
             for &l in &links {
-                first[(l >> 27) as usize + 1] += 1;
+                first[(l >> 30) as usize + 1] += 1;
             }
             for i in 0..keys.len() {
                 first[i + 1] += first[i];
             }
             let lists = Lists::build(keys, slots, |i, _, out| {
                 for &l in &links[first[i] as usize..first[i + 1] as usize] {
-                    let (ci, mi) = ((l >> 5) as usize & ((1 << 22) - 1), (l & 31) as usize);
+                    let (ci, mi) = ((l >> 5) as usize & ((1 << 25) - 1), (l & 31) as usize);
                     if mi < N_MOVES {
                         extend(out, prev.list(ci), mi);
                     }
@@ -538,7 +549,18 @@ impl WingPaths {
     ) -> Reduced {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
         // Classes per distance (about a sixth of the states; 8: an estimate).
-        const COUNT: [usize; 9] = [1, 1, 12, 130, 1_520, 19_500, 252_000, 3_200_000, 33_000_000];
+        const COUNT: [usize; 10] = [
+            1,
+            1,
+            12,
+            130,
+            1_520,
+            19_500,
+            252_000,
+            3_200_000,
+            33_000_000,
+            160_000_000,
+        ];
         let n = COUNT[self.kmax as usize + 1];
         let bits = (n * 2).next_power_of_two().trailing_zeros().max(4);
         let (shift, mask) = (64 - bits, (1usize << bits) - 1);
