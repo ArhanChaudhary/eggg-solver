@@ -2123,13 +2123,11 @@ mod tests {
         }
     }
 
-    /// [`P1Tables::staged_after`] agrees with the definition (and with the staging table's
-    /// goal, distance 0, where the large table is in ./tables).
     /// The masked search over all pairs finds the same endpoints, in the same order, with and
     /// without the wing-path lookahead (largest distance 3 to 5, the last with the reduced
-    /// lists at 6), on random roots and on roots
-    /// a few moves from endpoints, at their distance and up to 3 moves more (needs the reduced
-    /// mask table in ./tables, loaded or made; the small staging table likewise).
+    /// lists at 6), on random roots and on roots a few moves from endpoints, at their
+    /// distance and up to 3 moves more (needs the reduced mask table in ./tables, loaded or
+    /// made; the small staging table likewise).
     #[test]
     fn wing_paths_keep_the_endpoints() {
         let dir = std::path::Path::new("tables");
@@ -2186,6 +2184,8 @@ mod tests {
         assert!(found > 0);
     }
 
+    /// [`P1Tables::staged_after`] agrees with the definition (and with the staging table's
+    /// goal, distance 0, where the large table is in ./tables).
     #[test]
     fn staged_after_matches_definition() {
         let t = P1Tables::with_table(Staging::new(), Mod3Table::from_depths(&[0]));
