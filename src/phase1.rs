@@ -1001,10 +1001,10 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     batch_tree: Vec<(u32, u8)>,
     batch_roots: Vec<u8>,
     batch_path: Vec<u8>,
-    /// Per node of the current round, its decreasing moves and the children that can still
-    /// reach an endpoint, if computed ahead (u32::MAX: not), to prefetch the children's
-    /// wing-path table entries (see [`Search1::run_batch_rounds`]).
-    pre: Vec<(u32, u32)>,
+    /// Per node of the current round, the children that can still reach an endpoint, if
+    /// computed ahead (u32::MAX: not), to prefetch the children's wing-path table entries
+    /// (see [`Search1::run_batch_rounds`]).
+    pre: Vec<u32>,
 }
 
 /// Prefetch the wing-path entries of the tight batch nodes' children a pass ahead
@@ -1277,31 +1277,52 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.state(), self.pair);
                 }
             }
-            // The tight nodes whose children get the wing-path test: their masks and live
-            // children now, and the children's table entries prefetched for the pass below.
+            // The nodes whose children get the wing-path tests: their live children now (u32::MAX
+            // if not), and the children's table entries prefetched for the pass below.
             let mut pre = std::mem::take(&mut self.pre);
             pre.clear();
             if let Some(w) = t.wingk.as_deref().filter(|_| viable && *WK_PREFETCH) {
                 for nd in &cur {
-                    let mut e = (u32::MAX, 0);
-                    if nd.d == nd.left
-                        && nd.left >= 3
-                        && nd.left - 1 <= w.kmax
-                        && mt.viable(nd.idx, nd.parity)
-                    {
-                        let s = nd.state();
-                        let dec = mt.get(t, nd.idx, nd.sym, &s, self.pair);
-                        let a = dec & ALLOWED_AFTER[nd.last as usize];
-                        let a = self.live_children(nd, a, nd.d, nd.left, dec, 0);
-                        let flags = s.centre_flags();
-                        let mut b = a;
+                    let (d, left) = (nd.d, nd.left);
+                    let mut e = u32::MAX;
+                    // The moves to children with the tests (tight ones, ones with slack 1).
+                    let mut tested = 0;
+                    if left < 3 {
+                    } else if d == left {
+                        if left - 1 <= w.kmax && mt.viable(nd.idx, nd.parity) {
+                            let dec = mt.get(t, nd.idx, nd.sym, &nd.state(), self.pair);
+                            let a = dec & ALLOWED_AFTER[nd.last as usize];
+                            e = self.live_children(nd, a, d, left, dec, 0);
+                            tested = e;
+                        }
+                    } else if left - 1 <= w.kmax || left - 2 <= w.smax {
+                        let allowed = ALLOWED_AFTER[nd.last as usize];
+                        let (dec_all, eq_all) = mt.get_dec_eq(nd.idx, nd.sym);
+                        let (dec, eq) = (dec_all & allowed, eq_all & allowed);
+                        let a = if d + 1 < left { allowed } else { dec | eq };
+                        e = self.live_children(nd, a, d, left, dec_all, eq_all);
+                        // The children with no slack and with one move of slack (a decreasing
+                        // move keeps the slack, a keeping move takes one, another two).
+                        let inc = allowed & !(dec | eq);
+                        let (tight, slack1) = match left - d {
+                            1 => (eq, dec),
+                            2 => (inc, eq),
+                            3 => (0, inc),
+                            _ => (0, 0),
+                        };
+                        tested = e
+                            & (if left - 1 <= w.kmax { tight } else { 0 }
+                                | if left - 2 <= w.smax { slack1 } else { 0 });
+                    }
+                    if tested != 0 {
+                        let flags = nd.state().centre_flags();
+                        let mut b = tested;
                         while b != 0 {
                             let m = b.trailing_zeros() as usize;
                             b &= b - 1;
                             let (ud, _, rl) = flag_masks(&unsafe { child_flags(&flags, m, t) });
                             w.prefetch(ud, rl);
                         }
-                        e = (dec, a);
                     }
                     pre.push(e);
                 }
@@ -1323,7 +1344,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     if viable {
                         // The children that cannot reach an endpoint (child bits) are not
                         // queued, nor tested (their last moves are counted).
-                        let live = self.live_children(nd, a, d, left, dec_all, eq_all);
+                        let live = match self.pre.get(ix) {
+                            Some(&l) if l != u32::MAX => l,
+                            _ => self.live_children(nd, a, d, left, dec_all, eq_all),
+                        };
                         if left == 2 {
                             let mut b = a & !live;
                             while b != 0 {
@@ -1365,10 +1389,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     self.reads += 1;
                     continue;
                 }
-                let (dec, live) = match self.pre.get(ix) {
-                    Some(&(dec, a)) if dec != u32::MAX => (dec, Some(a)),
-                    _ => (mt.get(t, nd.idx, nd.sym, &s, self.pair), None),
-                };
+                let dec = mt.get(t, nd.idx, nd.sym, &s, self.pair);
+                let live = self.pre.get(ix).copied().filter(|&l| l != u32::MAX);
                 let mut a = dec & ALLOWED_AFTER[nd.last as usize];
                 self.nodes += a.count_ones() as u64;
                 self.reads += 1;
