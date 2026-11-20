@@ -26,6 +26,7 @@ fn main() {
     let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(3);
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let (mut nodes, mut reads, mut eps) = (0u64, 0u64, 0usize);
+    let mut prof = [0u64; 48];
     let t0 = Instant::now();
     for _ in 0..cubes {
         let cube = Cube::random(&mut rng);
@@ -40,6 +41,9 @@ fn main() {
             s.dfs(&root, d0, len, N_MOVES);
             nodes += s.nodes;
             reads += s.reads;
+            for (a, b) in prof.iter_mut().zip(s.prof) {
+                *a += b;
+            }
             eps += found.len();
             found.hash(&mut h);
         }
@@ -49,4 +53,23 @@ fn main() {
         h.finish(),
         t0.elapsed().as_secs_f64()
     );
+    #[cfg(feature = "p1prof")]
+    if let Ok(path) = std::env::var("EGGG_W2_FILE") {
+        // The captured lookahead inputs: 24 slot bytes, then odd | tight << 1.
+        let cap = eggg_solver::wing2::take_capture();
+        let mut out = Vec::with_capacity(cap.len() * 25);
+        for (pos, odd, tight) in &cap {
+            out.extend_from_slice(&pos.0[..24]);
+            out.push(*odd as u8 | (*tight as u8) << 1);
+        }
+        std::fs::write(&path, out).unwrap();
+        println!("captured {} lookahead tests to {path}", cap.len());
+    }
+    if prof.iter().any(|&x| x != 0) {
+        for (n, v) in eggg_solver::phase1::PROF_NAMES.iter().zip(prof) {
+            if !n.is_empty() {
+                println!("{n:>20} {v:>14}");
+            }
+        }
+    }
 }

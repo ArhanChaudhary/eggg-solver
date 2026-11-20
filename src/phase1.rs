@@ -981,6 +981,8 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     pub nodes: u64,
     /// Table entries read (each a likely cache miss): children's distances, move masks.
     pub reads: u64,
+    /// Profiling counters (feature `p1prof`, see `PROF_NAMES`).
+    pub prof: [u64; 48],
     pub on_endpoint: F,
     pub stop: bool,
     pub abort: Option<&'a std::sync::atomic::AtomicBool>,
@@ -997,10 +999,91 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     batch_tree: Vec<(u32, u8)>,
     batch_roots: Vec<u8>,
     batch_path: Vec<u8>,
+    /// Node-parallel wing lookahead (prototype, `EGGG_P1_SOA=1`): the children of the round
+    /// not yet queued, in order (as queued, but with their parent's id; true: dropped), and
+    /// per class (wing parity + 2 * not tight) those awaiting the lookahead.
+    soa: bool,
+    pend: Vec<(BNode, bool)>,
+    wq: Box<[WQueue; 4]>,
+}
+
+/// Children awaiting the node-parallel wing lookahead: their wing positions, places in
+/// [`Search1::pend`] and which are tight (bits).
+#[derive(Clone, Copy)]
+struct WQueue {
+    k: usize,
+    rows: [V32; 32],
+    at: [u32; 32],
+    tight: u32,
 }
 
 /// See [`Search1::batch_tree`].
 const ROOT: u32 = 1 << 31;
+
+/// The node-parallel wing lookahead (prototype): `EGGG_P1_SOA=1`.
+static P1_SOA: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("EGGG_P1_SOA").is_ok_and(|v| v == "1"));
+
+/// Names of the profiling counters (feature `p1prof`).
+pub const PROF_NAMES: [&str; 48] = [
+    "rounds",
+    "batch nodes",
+    "slack nodes",
+    "slack children",
+    "tight nodes",
+    "viable drops",
+    "tight left1",
+    "tight left2",
+    "left2 even counted",
+    "left2 odd->leaf",
+    "tight left>=3",
+    "left>=3 children",
+    "wing2 tests",
+    "wing2 pass",
+    "push_child",
+    "leaf calls",
+    "leaf test moves",
+    "leaf staged ok",
+    "leaf wings ok",
+    "endpoints",
+    "dfs_eq nodes",
+    "push_batch",
+    "slack left2 leaf",
+    "slack push",
+    "left1 a bits",
+    "resolve",
+    "tl3",
+    "tl4",
+    "tl5",
+    "tl6",
+    "tl7",
+    "tl8+",
+    "sl2",
+    "sl3",
+    "sl4",
+    "sl5",
+    "sl6",
+    "sl7+",
+    "ch-l3",
+    "ch-l4",
+    "ch-l5",
+    "ch-l6+",
+    "w2 tight even",
+    "w2 tight odd",
+    "w2 slack even",
+    "w2 slack odd",
+    "",
+    "",
+];
+
+macro_rules! prof {
+    ($s:expr, $i:expr, $n:expr) => {
+        #[cfg(feature = "p1prof")]
+        {
+            $s.prof[$i] += $n as u64;
+        }
+    };
+}
 
 /// A node of a batch (moves left = staging distance): its state, mask-table index, and its
 /// path's entry in [`Search1::batch_tree`].
@@ -1092,6 +1175,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             path: Vec::with_capacity(32),
             nodes: 0,
             reads: 0,
+            prof: [0; 48],
             on_endpoint,
             stop: false,
             abort: None,
@@ -1101,7 +1185,106 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             batch_tree: vec![],
             batch_roots: vec![],
             batch_path: Vec::with_capacity(48),
+            soa: *P1_SOA,
+            pend: vec![],
+            wq: Box::new(
+                [WQueue {
+                    k: 0,
+                    rows: [V32::ZERO; 32],
+                    at: [0; 32],
+                    tight: 0,
+                }; 4],
+            ),
         }
+    }
+
+    /// Queue (SoA mode) the child `c` (after move `m`, distance `d`) of batch node `nd`: in
+    /// order after the children not yet queued; those with two moves left await the
+    /// node-parallel wing lookahead.
+    #[inline(always)]
+    fn pend_child(&mut self, nd: &BNode, c: &P1State, m: usize, d: u8) {
+        let node = BNode {
+            centres: c.centres,
+            pos: c.pos,
+            idx: 0,
+            id: nd.id,
+            run: run_after(nd.run, nd.last as usize, m),
+            parity: c.parity,
+            sym: 0,
+            left: nd.left - 1,
+            last: m as u8,
+            d,
+        };
+        if nd.left != 3 {
+            if self.pend.is_empty() {
+                self.queue_node(node);
+            } else {
+                self.pend.push((node, false));
+            }
+            return;
+        }
+        let cls = c.parity as usize + 2 * (d != 2) as usize;
+        let q = &mut self.wq[cls];
+        q.rows[q.k] = c.pos;
+        q.at[q.k] = self.pend.len() as u32;
+        q.tight |= ((d == 2) as u32) << q.k;
+        q.k += 1;
+        let full = q.k == 32;
+        self.pend.push((node, false));
+        if full {
+            self.flush_pend();
+        }
+    }
+
+    /// Queue a child for the next round (its `id` its parent's, `last` its move).
+    #[inline(always)]
+    fn queue_node(&mut self, mut node: BNode) {
+        prof!(self, 14, 1);
+        let g = node.state().centre_flags();
+        let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
+        let idx = self.t.staging.rank24(!nud & MASK24) as u64;
+        let id = self.batch_tree.len() as u32;
+        self.batch_tree.push((node.id, node.last));
+        self.t.mask.as_ref().unwrap().prefetch(self.t, idx);
+        node.idx = idx;
+        node.id = id;
+        self.batch.push(node);
+    }
+
+    /// Run the node-parallel lookahead on the queued children and queue those that pass,
+    /// and the others not yet queued, in order.
+    fn flush_pend(&mut self) {
+        for cls in 0..4 {
+            let q = &mut self.wq[cls];
+            let k = q.k;
+            if k == 0 {
+                continue;
+            }
+            let mut m = q.rows;
+            crate::simd::transpose32(&mut m);
+            let lanes = if k == 32 { !0 } else { (1u32 << k) - 1 };
+            let r = self
+                .t
+                .wing2
+                .possible_soa(&m[..24], cls & 1 == 1, q.tight, lanes);
+            for j in 0..k {
+                if r >> j & 1 == 0 {
+                    self.pend[q.at[j] as usize].1 = true;
+                }
+            }
+            q.k = 0;
+            q.tight = 0;
+            prof!(self, 12, k);
+            prof!(self, 13, r.count_ones());
+        }
+        let mut pend = std::mem::take(&mut self.pend);
+        for &(node, dead) in pend.iter() {
+            if !dead {
+                self.queue_node(node);
+            }
+        }
+        pend.clear();
+        self.pend = pend;
     }
 
     /// Queue a node with `left` moves left (>= 2) at distance `d` (= `left`, or less with the
@@ -1117,9 +1300,16 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         m: Option<u8>,
         d: u8,
     ) {
+        if left == 2 && self.pair == ALL_PAIRS {
+            prof!(self, 12, 1);
+        }
         if !self.wings_possible(&s, left, d) {
             return;
         }
+        if left == 2 && self.pair == ALL_PAIRS {
+            prof!(self, 13, 1);
+        }
+        prof!(self, 21, 1);
         let idx = idx();
         let off = self.batch_roots.len();
         self.batch_roots.push(0);
@@ -1151,9 +1341,16 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     /// queued, distance `d`) of batch node `nd`.
     #[inline(always)]
     fn push_child(&mut self, nd: &BNode, c: &P1State, idx: impl FnOnce() -> u64, m: usize, d: u8) {
+        if nd.left == 3 && self.pair == ALL_PAIRS {
+            prof!(self, 12, 1);
+        }
         if !self.wings_possible(c, nd.left - 1, d) {
             return;
         }
+        if nd.left == 3 && self.pair == ALL_PAIRS {
+            prof!(self, 13, 1);
+        }
+        prof!(self, 14, 1);
         let idx = idx();
         let id = self.batch_tree.len() as u32;
         self.batch_tree.push((nd.id, m as u8));
@@ -1177,7 +1374,12 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     /// moves from the end are tested, in the search over all pairs (where `d` is the staging
     /// distance); a node that fails has no endpoint below it and is not queued.
     #[inline(always)]
-    fn wings_possible(&self, s: &P1State, left: u8, d: u8) -> bool {
+    fn wings_possible(&mut self, s: &P1State, left: u8, d: u8) -> bool {
+        if left == 2 && self.pair == ALL_PAIRS {
+            prof!(self, 42 + 2 * (d != 2) as usize + s.parity as usize, 1);
+            #[cfg(feature = "p1prof")]
+            crate::wing2::capture(&s.pos, s.parity, d == 2);
+        }
         left != 2 || self.pair != ALL_PAIRS || self.t.wing2.possible(&s.pos, s.parity, d == 2)
     }
 
@@ -1204,13 +1406,27 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     fn run_batch(&mut self) {
         // The batch nodes' paths replace the search's path meanwhile.
         std::mem::swap(&mut self.path, &mut self.batch_path);
-        self.run_batch_rounds();
+        let reduced = self
+            .t
+            .mask
+            .as_ref()
+            .is_some_and(|m| m.kind == crate::p1mask::MaskKind::Reduced);
+        if self.soa && reduced && self.pair == ALL_PAIRS {
+            self.run_batch_rounds::<true>();
+            self.pend.clear();
+            for q in self.wq.iter_mut() {
+                q.k = 0;
+                q.tight = 0;
+            }
+        } else {
+            self.run_batch_rounds::<false>();
+        }
         std::mem::swap(&mut self.path, &mut self.batch_path);
         self.batch_tree.clear();
         self.batch_roots.clear();
     }
 
-    fn run_batch_rounds(&mut self) {
+    fn run_batch_rounds<const SOA: bool>(&mut self) {
         let t = self.t;
         let mt = t.mask.as_ref().unwrap();
         let reduced = mt.kind == crate::p1mask::MaskKind::Reduced;
@@ -1230,6 +1446,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 self.batch.clear();
                 return;
             }
+            prof!(self, 0, 1);
+            prof!(self, 1, cur.len());
             if matches!(
                 mt.kind,
                 crate::p1mask::MaskKind::Reduced | crate::p1mask::MaskKind::Pair
@@ -1238,6 +1456,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 for nd in cur.iter_mut() {
                     (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.state(), self.pair);
                 }
+                prof!(self, 25, cur.len());
             }
             for nd in &cur {
                 let s = nd.state();
@@ -1246,12 +1465,20 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     // own entry, as in `dfs_eq`; they are all queued, or with one move left
                     // tested.
                     let (d, left) = (nd.d, nd.left);
+                    prof!(self, 2, 1);
+                    prof!(self, 32 + (left.min(7) - 2) as usize, 1);
                     let allowed = ALLOWED_AFTER[nd.last as usize];
                     let (dec, eq) = mt.get_dec_eq(nd.idx, nd.sym);
                     let (dec, eq) = (dec & allowed, eq & allowed);
                     self.nodes += allowed.count_ones() as u64;
                     self.reads += 1;
                     let mut a = if d + 1 < left { allowed } else { dec | eq };
+                    prof!(self, 3, a.count_ones());
+                    if left == 2 {
+                        prof!(self, 22, a.count_ones());
+                    } else {
+                        prof!(self, 23, a.count_ones());
+                    }
                     let flags = s.centre_flags();
                     while a != 0 {
                         let m = a.trailing_zeros() as usize;
@@ -1265,6 +1492,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                                 self.batch.clear();
                                 return;
                             }
+                        } else if SOA {
+                            self.pend_child(nd, &c, m, dc);
                         } else {
                             let i = || {
                                 let g = unsafe { child_flags(&flags, m, t) };
@@ -1278,15 +1507,25 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 }
                 // A node whose wing parity cannot reach an endpoint in moves left = distance
                 // moves (its entry's viability bit, see `MaskTable::add_viable`) is dropped.
+                prof!(self, 4, 1);
                 if viable && !mt.viable(nd.idx, nd.parity) {
                     self.reads += 1;
+                    prof!(self, 5, 1);
                     continue;
                 }
                 let mut a =
                     mt.get(t, nd.idx, nd.sym, &s, self.pair) & ALLOWED_AFTER[nd.last as usize];
                 self.nodes += a.count_ones() as u64;
                 self.reads += 1;
+                if nd.left >= 3 {
+                    prof!(self, 10, 1);
+                    prof!(self, 11, a.count_ones());
+                    prof!(self, 26 + (nd.left.min(8) - 3) as usize, 1);
+                    prof!(self, 38 + (nd.left.min(6) - 3) as usize, a.count_ones());
+                }
                 if nd.left == 1 {
+                    prof!(self, 6, 1);
+                    prof!(self, 24, a.count_ones());
                     self.leaf(
                         &s,
                         1,
@@ -1312,6 +1551,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         };
                         let mut b = a & even;
                         a &= !even;
+                        prof!(self, 7, 1);
+                        prof!(self, 8, b.count_ones());
+                        prof!(self, 9, a.count_ones());
                         while b != 0 {
                             let m = b.trailing_zeros() as usize;
                             b &= b - 1;
@@ -1342,6 +1584,13 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         let c = s.apply(m, t);
                         self.push_child(nd, &c, i, m, nd.left - 1);
                     }
+                } else if SOA {
+                    while a != 0 {
+                        let m = a.trailing_zeros() as usize;
+                        a &= a - 1;
+                        let c = s.apply(m, t);
+                        self.pend_child(nd, &c, m, nd.left - 1);
+                    }
                 } else {
                     let flags = s.centre_flags();
                     while a != 0 {
@@ -1361,6 +1610,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         self.push_child(nd, &c, i, m, nd.left - 1);
                     }
                 }
+            }
+            if SOA {
+                self.flush_pend();
             }
             cur.clear();
             self.batch_next = cur;
@@ -1460,6 +1712,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         let (dec, eq) = (dec & allowed, eq & allowed);
         self.nodes += allowed.count_ones() as u64;
         self.reads += 1;
+        prof!(self, 20, 1);
         if self
             .abort
             .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
@@ -1601,12 +1854,15 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             test &= WIDE_MOVES;
         }
         let centres = s.centres;
+        prof!(self, 15, 1);
+        prof!(self, 16, test.count_ones());
         while test != 0 {
             let m = test.trailing_zeros() as usize;
             test &= test - 1;
             if check_staged && !t.staged_after(&centres, m) {
                 continue;
             }
+            prof!(self, 17, 1);
             let excl = unsafe { *t.p2_frames.get_unchecked(m) } as u32
                 | run_frames as u32 & 0u32.wrapping_sub(same >> m & 1);
             let p = unsafe { t.wing_dst.get_unchecked(m) }.gather(&pos);
@@ -1619,6 +1875,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             if frames == 0 {
                 continue;
             }
+            prof!(self, 18, 1);
             let c = s.apply(m, self.t);
             if staging.is_none() && !check_staged {
                 self.reads += 1;
@@ -1633,6 +1890,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 }
             }
             if frames != 0 {
+                prof!(self, 19, 1);
                 if let Some((id, mv)) = batch {
                     self.set_batch_path(id);
                     self.path.extend(mv);

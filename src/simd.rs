@@ -78,6 +78,32 @@ mod imp {
         unsafe { st(_mm256_and_si256(ld(a), ld(b))) }
     }
 
+    #[inline(always)]
+    pub fn or(a: &V32, b: &V32) -> V32 {
+        unsafe { st(_mm256_or_si256(ld(a), ld(b))) }
+    }
+
+    /// Bytes 0..16 of `a` and `b`, interleaved.
+    #[inline(always)]
+    pub fn zip_lo(a: &V32, b: &V32) -> V32 {
+        unsafe {
+            // Lane 0: a0..7/b0..7, lane 1: a8..15/b8..15.
+            let x = _mm256_permute4x64_epi64::<0b01_01_00_00>(ld(a));
+            let y = _mm256_permute4x64_epi64::<0b01_01_00_00>(ld(b));
+            st(_mm256_unpacklo_epi8(x, y))
+        }
+    }
+
+    /// Bytes 16..32 of `a` and `b`, interleaved.
+    #[inline(always)]
+    pub fn zip_hi(a: &V32, b: &V32) -> V32 {
+        unsafe {
+            let x = _mm256_permute4x64_epi64::<0b11_11_10_10>(ld(a));
+            let y = _mm256_permute4x64_epi64::<0b11_11_10_10>(ld(b));
+            st(_mm256_unpacklo_epi8(x, y))
+        }
+    }
+
     /// Shift every byte left by N bits (bits leaving a byte may enter the next one; only bit
     /// 7 of the result is meaningful).
     #[inline(always)]
@@ -182,6 +208,29 @@ mod imp {
     }
 
     #[inline(always)]
+    pub fn or(a: &V32, b: &V32) -> V32 {
+        unsafe { map2(a, b, |x, y| vorrq_u8(x, y)) }
+    }
+
+    #[inline(always)]
+    pub fn zip_lo(a: &V32, b: &V32) -> V32 {
+        unsafe {
+            let (a0, _) = ld(a);
+            let (b0, _) = ld(b);
+            st((vzip1q_u8(a0, b0), vzip2q_u8(a0, b0)))
+        }
+    }
+
+    #[inline(always)]
+    pub fn zip_hi(a: &V32, b: &V32) -> V32 {
+        unsafe {
+            let (_, a1) = ld(a);
+            let (_, b1) = ld(b);
+            st((vzip1q_u8(a1, b1), vzip2q_u8(a1, b1)))
+        }
+    }
+
+    #[inline(always)]
     pub fn shl<const N: i32>(a: &V32) -> V32 {
         unsafe {
             let (a0, a1) = ld(a);
@@ -255,12 +304,49 @@ mod imp {
     }
 
     #[inline(always)]
+    pub fn or(a: &V32, b: &V32) -> V32 {
+        zip(a, b, |x, y| x | y)
+    }
+
+    #[inline(always)]
+    pub fn zip_lo(a: &V32, b: &V32) -> V32 {
+        V32(std::array::from_fn(|i| {
+            if i & 1 == 0 { a.0[i / 2] } else { b.0[i / 2] }
+        }))
+    }
+
+    #[inline(always)]
+    pub fn zip_hi(a: &V32, b: &V32) -> V32 {
+        V32(std::array::from_fn(|i| {
+            if i & 1 == 0 {
+                a.0[16 + i / 2]
+            } else {
+                b.0[16 + i / 2]
+            }
+        }))
+    }
+
+    #[inline(always)]
     pub fn shl<const N: i32>(a: &V32) -> V32 {
         V32(a.0.map(|x| x << N))
     }
 }
 
-pub use imp::{add, and, gather, is_zero, min, movemask, shl, shuf, sub, xor};
+pub use imp::{add, and, gather, is_zero, min, movemask, or, shl, shuf, sub, xor, zip_hi, zip_lo};
+
+/// Transpose a 32 x 32 byte matrix in place (`m[i].0[j]` becomes `m[j].0[i]`), by five
+/// rounds of interleaving row i with row i + 16.
+#[inline(always)]
+pub fn transpose32(m: &mut [V32; 32]) {
+    for _ in 0..5 {
+        let mut o = [V32::ZERO; 32];
+        for i in 0..16 {
+            o[2 * i] = zip_lo(&m[i], &m[i + 16]);
+            o[2 * i + 1] = zip_hi(&m[i], &m[i + 16]);
+        }
+        *m = o;
+    }
+}
 
 impl V32 {
     pub const ZERO: V32 = V32([0; 32]);
@@ -340,6 +426,28 @@ mod tests {
             let bm = a.bit_mask(bit);
             for i in 0..32 {
                 assert_eq!(bm >> i & 1, (v[i] >> bit & 1) as u32);
+            }
+        }
+        let (zl, zh) = (zip_lo(&a, &b), zip_hi(&a, &b));
+        let o = or(&a, &b);
+        for i in 0..32 {
+            assert_eq!(zl.0[i], if i % 2 == 0 { v[i / 2] } else { idx[i / 2] });
+            assert_eq!(
+                zh.0[i],
+                if i % 2 == 0 {
+                    v[16 + i / 2]
+                } else {
+                    idx[16 + i / 2]
+                }
+            );
+            assert_eq!(o.0[i], v[i] | idx[i]);
+        }
+        let mut m: [V32; 32] =
+            std::array::from_fn(|i| V32(std::array::from_fn(|j| (i * 32 + j) as u8)));
+        transpose32(&mut m);
+        for i in 0..32 {
+            for j in 0..32 {
+                assert_eq!(m[i].0[j], (j * 32 + i) as u8, "transpose {i} {j}");
             }
         }
         assert!(is_zero(&V32::ZERO));

@@ -24,3 +24,6 @@ opt-level = 3
 [lints.clippy]
 # Index loops over piece slots read better than iterator chains in cube code.
 needless_range_loop = "allow"
+
+[features]
+p1prof = []

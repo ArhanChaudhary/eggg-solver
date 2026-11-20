@@ -49,6 +49,21 @@ pub struct Wing2 {
     /// Per frame (word), all ones if an odd number of dedges have their second wing (2e + 1)
     /// as the frame's high piece.
     high_odd: Row,
+    /// The node-parallel form (see [`Wing2::possible_soa`]), per wing parity.
+    soa: [SoaPlanes; 2],
+}
+
+/// The preimages of one wing parity in bit planes of 8 (the tight ones first, all frames),
+/// for [`Wing2::possible_soa`].
+pub struct SoaPlanes {
+    /// Per plane, per slot: the plane's preimages (bits) that contain the slot.
+    t: Vec<V32>,
+    /// Per plane, the complement of its preimages' frames' `high_odd` bits (splat).
+    nho: Vec<V32>,
+    /// Per plane, its tight preimages (bits).
+    tight: Vec<u8>,
+    /// The planes that hold tight preimages (the first ones).
+    n_tight: usize,
 }
 
 impl Wing2 {
@@ -79,7 +94,57 @@ impl Wing2 {
                 high_odd.0[f] = !0;
             }
         }
-        Wing2 { b, high_odd }
+        let soa = [false, true].map(|odd| {
+            // (preimage, frame, tight), the tight preimages (a subset of the slack ones) first.
+            let mut all = vec![];
+            for (f, fr) in frames.iter().enumerate() {
+                let tight = Self::preimages(fr, wing_dst, true, odd);
+                let slack = Self::preimages(fr, wing_dst, false, odd);
+                assert!(tight.iter().all(|p| slack.contains(p)));
+                all.extend(tight.iter().map(|&p| (p, f, true)));
+                all.extend(
+                    slack
+                        .iter()
+                        .filter(|p| !tight.contains(p))
+                        .map(|&p| (p, f, false)),
+                );
+            }
+            all.sort_by_key(|e| !e.2);
+            // The slack-only preimages start a new plane (empty bits never pass).
+            let n_tight = all.iter().filter(|e| e.2).count().div_ceil(8);
+            while all.len() < 8 * n_tight || !all[..8 * n_tight].iter().all(|e| e.2) {
+                all.insert(all.iter().filter(|e| e.2).count(), (0, 0, true));
+            }
+            let mut planes = SoaPlanes {
+                t: vec![],
+                nho: vec![],
+                tight: vec![],
+                n_tight,
+            };
+            for chunk in all.chunks(8) {
+                let mut t = V32::ZERO;
+                let mut ho = 0u8;
+                let mut ti = 0u8;
+                for (j, &(p, f, tight)) in chunk.iter().enumerate() {
+                    for x in 0..24 {
+                        if p >> x & 1 == 1 {
+                            t.0[x] |= 1 << j;
+                        }
+                    }
+                    if high_odd.0[f] != 0 {
+                        ho |= 1 << j;
+                    }
+                    if tight {
+                        ti |= 1 << j;
+                    }
+                }
+                planes.t.push(t);
+                planes.nho.push(V32([!ho; 32]));
+                planes.tight.push(ti);
+            }
+            planes
+        });
+        Wing2 { b, high_odd, soa }
     }
 
     /// The distinct preimages (24-bit slot masks) of frame `fr`'s low slots under the move
@@ -115,6 +180,76 @@ impl Wing2 {
         }
         assert!(pre.len() <= 64, "{} preimages", pre.len());
         pre
+    }
+
+    /// [`Wing2::possible`] without bounds checks on the slots (each < 24).
+    #[inline(always)]
+    pub fn possible_unchecked(&self, pos: &V32, odd: bool, tight: bool) -> bool {
+        let b = &self.b[!tight as usize][odd as usize];
+        let mut ok = [!0u64; 3];
+        let mut h = [0u64; 3];
+        for e in 0..12 {
+            // SAFETY: wing slots are < 24.
+            let (x, y) = unsafe {
+                debug_assert!(pos.0[2 * e] < 24 && pos.0[2 * e + 1] < 24);
+                (
+                    &b.get_unchecked(pos.0[2 * e] as usize).0,
+                    &b.get_unchecked(pos.0[2 * e + 1] as usize).0,
+                )
+            };
+            for w in 0..3 {
+                ok[w] &= x[w] ^ y[w];
+                h[w] ^= x[w];
+            }
+        }
+        let mut any = 0;
+        for w in 0..3 {
+            any |= ok[w] & !(h[w] ^ self.high_odd.0[w]);
+        }
+        any != 0
+    }
+
+    /// [`Wing2::possible`] for up to 32 nodes of wing parity `odd` at once: `p[w]` holds the
+    /// slot of wing w of node i in byte i (the nodes' `pos` transposed, see
+    /// [`crate::simd::transpose32`]); bit i of `tight` (of `lanes`, the nodes present) says
+    /// whether node i is tight. Returns the nodes that pass (bits). The preimages are in bit
+    /// planes of 8: per plane, a node's 24 wings are looked up in the plane's slot table (one
+    /// byte gather per wing for all nodes), and the dedge-split and high-parity tests run on
+    /// the 8 preimages of each byte at once.
+    #[inline(always)]
+    pub fn possible_soa(&self, p: &[V32], odd: bool, tight: u32, lanes: u32) -> u32 {
+        use crate::simd::{and, gather, or, xor};
+        let pl = &self.soa[odd as usize];
+        let all_tight = tight & lanes == lanes;
+        let n = if all_tight { pl.n_tight } else { pl.t.len() };
+        // 0xff at the tight nodes.
+        let tl = V32(std::array::from_fn(|i| {
+            0u8.wrapping_sub((tight >> i & 1) as u8)
+        }));
+        let ones = V32([0xff; 32]);
+        let mut any = V32::ZERO;
+        for k in 0..n {
+            let t = &pl.t[k];
+            let mut ok = ones;
+            let mut h = V32::ZERO;
+            for e in 0..12 {
+                let x = gather(t, &p[2 * e]);
+                let y = gather(t, &p[2 * e + 1]);
+                ok = and(&ok, &xor(&x, &y));
+                h = xor(&h, &x);
+            }
+            let mut r = and(&ok, &xor(&h, &pl.nho[k]));
+            if !all_tight {
+                // A tight node counts only the plane's tight preimages.
+                let ti = V32([pl.tight[k]; 32]);
+                let m = or(&and(&tl, &ti), &xor(&tl, &ones));
+                r = and(&r, &m);
+            }
+            any = or(&any, &r);
+        }
+        // Bit 7 set exactly at the nonzero bytes.
+        let nz = crate::simd::add(&crate::simd::min(&any, &V32([1; 32])), &V32([0x7f; 32]));
+        crate::simd::movemask(&nz) & lanes
     }
 
     /// Can a node with wing positions `pos` (the slot of each wing) and wing parity `odd`, two
@@ -183,6 +318,58 @@ mod tests {
     }
 
     #[test]
+    fn soa_matches_scalar() {
+        let t = P1Tables::with_table(Staging::new(), Mod3Table::from_depths(&[0]));
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(11);
+        let quarters: Vec<usize> = (0..N_MOVES)
+            .filter(|&m| (WIDE_QUARTER | OUTER_QUARTER) >> m & 1 == 1)
+            .collect();
+        let mut passes = 0;
+        for round in 0..3000 {
+            let odd = round % 2 == 1;
+            let n = 1 + round % 32;
+            let mut m = [V32::ZERO; 32];
+            let mut tight = 0u32;
+            for (i, row) in m.iter_mut().enumerate().take(n) {
+                let mut q = V32::from_slice(&std::array::from_fn::<u8, 24, _>(|k| k as u8));
+                if i % 3 == 0 {
+                    let mut p: Vec<u8> = (0..24).collect();
+                    p.shuffle(&mut rng);
+                    q = V32::from_slice(&p);
+                } else {
+                    for _ in 0..2 {
+                        let mv = quarters[rand::Rng::gen_range(&mut rng, 0..quarters.len())];
+                        q = t.wing_dst[crate::moves::inverse_move(mv)].gather(&q);
+                    }
+                    for _ in 0..(i % 4) {
+                        let mv = rand::Rng::gen_range(&mut rng, 0..N_MOVES);
+                        q = t.wing_dst[mv].gather(&q);
+                    }
+                }
+                *row = q;
+                if rand::Rng::gen_range(&mut rng, 0..3) != 0 {
+                    tight |= 1 << i;
+                }
+            }
+            let rows = m;
+            crate::simd::transpose32(&mut m);
+            let lanes = if n == 32 { !0 } else { (1u32 << n) - 1 };
+            let got = t.wing2.possible_soa(&m[..24], odd, tight, lanes);
+            for i in 0..n {
+                let want = t.wing2.possible(&rows[i], odd, tight >> i & 1 == 1);
+                assert_eq!(got >> i & 1 == 1, want, "round {round} node {i}");
+                assert_eq!(
+                    t.wing2
+                        .possible_unchecked(&rows[i], odd, tight >> i & 1 == 1),
+                    want
+                );
+                passes += want as usize;
+            }
+        }
+        assert!(passes > 1000, "{passes}");
+    }
+
+    #[test]
     fn preimage_counts() {
         let t = P1Tables::with_table(Staging::new(), Mod3Table::from_depths(&[0]));
         for (tight, odd, want) in [
@@ -237,4 +424,31 @@ mod tests {
         assert!(pass[0][1] < 1500 && pass[0][0] < 2500, "{pass:?}");
         assert!(pass[1][0] > 15000, "{pass:?}");
     }
+}
+
+#[cfg(feature = "p1prof")]
+thread_local! {
+    static CAP: std::cell::RefCell<(usize, Vec<(V32, bool, bool)>)> =
+        std::cell::RefCell::new((
+            std::env::var("EGGG_W2_CAPTURE").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+            vec![],
+        ));
+}
+
+/// Profiling (feature `p1prof`): record the inputs of the lookahead tests, up to
+/// `EGGG_W2_CAPTURE` of them, per thread (see [`take_capture`]).
+#[cfg(feature = "p1prof")]
+pub fn capture(pos: &V32, odd: bool, tight: bool) {
+    CAP.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.1.len() < c.0 {
+            c.1.push((*pos, odd, tight));
+        }
+    });
+}
+
+/// The inputs recorded by [`capture`] on this thread.
+#[cfg(feature = "p1prof")]
+pub fn take_capture() -> Vec<(V32, bool, bool)> {
+    CAP.with(|c| std::mem::take(&mut c.borrow_mut().1))
 }
