@@ -51,7 +51,7 @@ the time (one thread: first solution after 6.2 s with `huge`, 1.4 s with `xl`, 0
 `xxl`, on average); with many threads phase 1 dominates.
 
 Phase-1 move masks (same phase-1 endpoints, fewer table reads; see `src/p1mask.rs`): the
-reduced move-mask table (`p1-mask2.tab`, 1.6 GB, generated in ~10 s; on by default
+reduced move-mask table (`p1-mask3.tab`, 1.6 GB, generated in ~10 s; on by default
 in the large and larger tiers, `--p1-mask none` to turn it off) stores, per staging state,
 the moves that decrease the staging distance: deep in the tree almost every node is at
 distance = moves left, and then one read of its mask replaces ~20 reads of its children; such
@@ -72,7 +72,15 @@ per frame (`src/wing2.rs`, no table). About 90% of these nodes, and of the last-
 below them, go (same endpoints; p1check 1.25x faster on the M2, 1 thread). On the M2 (8 threads), 20 random positions (seed 6060), current version: 39.45
 moves on average after 10 s, 39.10 after 30 s, 38.80 after 60 s (before the parity and
 equal-distance bits, the round cut and the cheaper candidates: 39.65 / 39.30 / 39.15, and
-38.80 only after 2 minutes, 38.60 after 10 minutes). `--p1-mask big` is the same without the symmetry reduction (18.9 GB).
+38.80 only after 2 minutes, 38.60 after 10 minutes). The mask entries' spare bits also hold
+*successors*: a child's reduced index is its symmetry class's (which, with the class's
+symmetry, depends only on the parent's class and the move: a small lookup) and a 13-bit
+split of the other 16 centre positions, so an entry holds the children of up to 4 of its
+decreasing (and equal) moves, enough for over 95% of the nodes at distance = moves left; their
+children then need no class-info read, index or symmetry computation (p1check on the M2, 1 thread: the 16-byte table is still 1.5% slower than without successors on master, the wide one 2.3% faster; see the opt/p1-succ commits).
+`--p1-mask wide` (`p1-succ.tab`, 3.2 GB) has room for 12 successors per entry, which covers
+the children of most nodes with slack too. `--p1-mask big` is the same without the symmetry
+reduction (18.9 GB).
 Experimental (see `src/p1pat.rs`): `--p1-pat small|big` (0.9 / 41 GB) runs one phase-1 search
 per colour pair, pruned by the distance to staged centres with that pair in a pattern phase
 2 can solve (0.53x reads, 1.4x faster on the M2); with `--p1-mask` too, the pair searches use
