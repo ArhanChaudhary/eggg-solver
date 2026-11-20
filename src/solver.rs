@@ -258,7 +258,9 @@ impl Close {
 /// moves), expanding the first `split` levels here so that the job can be cut short: once
 /// `close` is raised, each subtree not yet started at those levels is pushed to `spill` (as
 /// its move prefix) instead of being searched. The subtrees visited, and the endpoints found,
-/// are exactly those of `srch.dfs`.
+/// are exactly those of `srch.dfs`. The nodes of each subtree whose path reaches 4 moves here
+/// are added to `per4` (by that 4-move prefix; see [`Run::yields`]): as many as a job of that
+/// prefix counts.
 #[allow(clippy::too_many_arguments)]
 fn p1_run<F: FnMut(&[u8], u8) -> bool>(
     srch: &mut Search1<'_, F>,
@@ -269,6 +271,7 @@ fn p1_run<F: FnMut(&[u8], u8) -> bool>(
     split: u8,
     close: &Close,
     spill: &mut Vec<Vec<u8>>,
+    per4: &mut Vec<([u8; 4], u64)>,
 ) {
     if split == 0 || left <= 3 {
         srch.dfs(st, d, left, last);
@@ -285,11 +288,15 @@ fn p1_run<F: FnMut(&[u8], u8) -> bool>(
         if dc >= left {
             continue;
         }
+        let n0 = srch.nodes;
         srch.path.push(m as u8);
         if close.is_raised() {
             spill.push(srch.path.clone());
         } else {
-            p1_run(srch, &c, dc, left - 1, m, split - 1, close, spill);
+            p1_run(srch, &c, dc, left - 1, m, split - 1, close, spill, per4);
+        }
+        if let Some(k) = prefix4(&srch.path).filter(|_| srch.path.len() == 4) {
+            per4.push((k, srch.nodes - n0));
         }
         srch.path.pop();
     }
@@ -409,35 +416,56 @@ pub fn candidate_bounds(
         .collect()
 }
 
-/// The first three moves of a phase-1 path (the driver's job prefixes at lengths >= 7).
-fn prefix3(moves: &[u8]) -> Option<[u8; 3]> {
-    moves.get(..3).map(|p| [p[0], p[1], p[2]])
+/// The first four moves of a phase-1 path (the key of the driver's yield statistics).
+fn prefix4(moves: &[u8]) -> Option<[u8; 4]> {
+    moves.get(..4).map(|p| [p[0], p[1], p[2], p[3]])
 }
 
-/// Reorder a new phase-1 level's jobs best first, by the yield of their 3-move prefix at the
-/// previous length (`yields`: kept candidates and phase-1 nodes per prefix): kept candidates
-/// per node, smoothed towards the mean over all prefixes by one mean-sized job's worth of
-/// nodes (unknown prefixes get the mean); ties keep their order. The jobs are only permuted.
+/// Reorder a new phase-1 level's jobs best first, by the yield of their prefix at the previous
+/// length (`yields`: kept candidates and phase-1 nodes per 4-move prefix): kept candidates per
+/// node, estimated hierarchically. A 3-move prefix's rate is smoothed towards the mean over
+/// all prefixes by one mean-sized 3-move prefix's worth of nodes, and a 4-move prefix's
+/// towards its 3-move prefix's estimate by one mean-sized 4-move prefix's worth (unknown
+/// prefixes get their parent's estimate); a job is ranked by the estimate of its prefix's
+/// first 4 moves (3 if it has only 3). Ties keep their order. The jobs are only permuted.
 ///
-/// A job's yield at one length predicts its yield at the next (its 3-move prefix fixes much
-/// of the centres' and wings' structure): sampled on 4 cubes, the quarter of the length-16
+/// A job's yield at one length predicts its yield at the next (its first moves fix much of
+/// the centres' and wings' structure): sampled on 4 cubes, the quarter of the length-16
 /// jobs with the best length-15 yield held 60% of the length-16 kept candidates in 45% of the
 /// nodes. Only the last length a run reaches is searched partly, so only there does the
-/// order matter: its best jobs come first.
-fn order_by_yield(jobs: &mut Vec<(u8, Vec<u8>)>, yields: &HashMap<[u8; 3], (u64, u64)>) {
+/// order matter: its best jobs come first. On 20 bench positions (examples/p1yield, each
+/// cube's length cut short by the time limit, predicted from the length before), ranking
+/// 4-move prefixes instead of 3-move ones puts 0.47 instead of 0.42 of the kept candidates in
+/// the first 20% of the nodes (0.34 instead of 0.28 in the first 10%).
+fn order_by_yield(jobs: &mut Vec<(u8, Vec<u8>)>, yields: &HashMap<[u8; 4], (u64, u64)>) {
     if yields.is_empty() {
         return;
     }
-    let (kept, nodes) = yields
+    let mut y3: HashMap<[u8; 3], (u64, u64)> = HashMap::new();
+    for (k, v) in yields {
+        let e = y3.entry([k[0], k[1], k[2]]).or_default();
+        e.0 += v.0;
+        e.1 += v.1;
+    }
+    let (kept, nodes) = y3
         .values()
         .fold((0u64, 0u64), |a, v| (a.0 + v.0, a.1 + v.1));
-    let mean_nodes = (nodes as f64 / yields.len() as f64).max(1.0);
+    let mean3 = (nodes as f64 / y3.len() as f64).max(1.0);
+    let mean4 = (nodes as f64 / yields.len() as f64).max(1.0);
     let rate = kept as f64 / (nodes as f64).max(1.0);
     let score = |p: &[u8]| {
-        let (k, n) = prefix3(p)
-            .and_then(|key| yields.get(&key).copied())
-            .unwrap_or((0, 0));
-        (k as f64 + rate * mean_nodes) / (n as f64 + mean_nodes)
+        if p.len() < 3 {
+            return rate;
+        }
+        let (k, n) = y3.get(&[p[0], p[1], p[2]]).copied().unwrap_or((0, 0));
+        let s3 = (k as f64 + rate * mean3) / (n as f64 + mean3);
+        match prefix4(p) {
+            None => s3,
+            Some(key) => {
+                let (k, n) = yields.get(&key).copied().unwrap_or((0, 0));
+                (k as f64 + s3 * mean4) / (n as f64 + mean4)
+            }
+        }
     };
     let mut order: Vec<(f64, usize)> = jobs
         .iter()
@@ -509,10 +537,10 @@ struct Run<'a, 'r> {
     red_index: HashMap<(usize, Cube3), usize>,
     /// See [`Options::order_jobs`].
     order_jobs: bool,
-    /// Per 3-move job prefix, (kept candidates, phase-1 nodes) at the current length so far
-    /// and at the previous length.
-    yields: HashMap<[u8; 3], (u64, u64)>,
-    prev_yields: HashMap<[u8; 3], (u64, u64)>,
+    /// Per 4-move prefix of the phase-1 paths, (kept candidates, phase-1 nodes) at the
+    /// current length so far and at the previous length (see [`order_by_yield`]).
+    yields: HashMap<[u8; 4], (u64, u64)>,
+    prev_yields: HashMap<[u8; 4], (u64, u64)>,
 }
 
 impl<'a> Solver<'a> {
@@ -586,7 +614,7 @@ impl<'a> Solver<'a> {
             yields: HashMap::new(),
             prev_yields: HashMap::new(),
         };
-        run.level.jobs = run.level_jobs(len0);
+        run.level.jobs = run.level_jobs(len0, false);
         std::thread::scope(|scope| {
             // Watchdog that raises the stop flag at the deadline.
             let (stop_ref, done_ref, have_ref) = (&stop, &done, &have);
@@ -731,11 +759,15 @@ impl<'a, 'r> Run<'a, 'r> {
         }
     }
 
-    fn level_jobs(&self, len: u8) -> Vec<(u8, Vec<u8>)> {
+    /// The jobs of phase-1 length `len`: move prefixes (3 moves at lengths >= 7, or 4 if
+    /// `fine` and the length is >= 8, for the order by yield: see [`order_by_yield`]).
+    fn level_jobs(&self, len: u8, fine: bool) -> Vec<(u8, Vec<u8>)> {
         let depth = if len < 3 {
             0
         } else if len < 7 {
             2
+        } else if fine && len >= 8 {
+            4
         } else {
             3
         };
@@ -783,7 +815,7 @@ impl<'a, 'r> Run<'a, 'r> {
     }
 
     /// With EGGG_DEBUG: a phase-1 level's nodes and kept candidates (from its yields).
-    fn debug_level(&self, what: &str, yields: &HashMap<[u8; 3], (u64, u64)>, len: u8) {
+    fn debug_level(&self, what: &str, yields: &HashMap<[u8; 4], (u64, u64)>, len: u8) {
         if std::env::var_os("EGGG_DEBUG").is_none() {
             return;
         }
@@ -816,8 +848,9 @@ impl<'a, 'r> Run<'a, 'r> {
                 let len = self.level.len + 1;
                 self.prev_yields = std::mem::take(&mut self.yields);
                 self.debug_level("complete", &self.prev_yields, self.level.len);
-                let mut jobs = self.level_jobs(len);
-                if self.order_jobs && self.best.is_some() {
+                let order = self.order_jobs && self.best.is_some();
+                let mut jobs = self.level_jobs(len, order);
+                if order {
                     order_by_yield(&mut jobs, &self.prev_yields);
                 }
                 self.level = Level1 { len, jobs, next: 0 };
@@ -859,6 +892,7 @@ impl<'a, 'r> Run<'a, 'r> {
                             let (st, d) = root.after_pair(prefix, d0[pair], t, pair);
                             let mut eps = vec![];
                             let mut spill = vec![];
+                            let mut per4 = vec![];
                             let mut srch = Search1::new(t, |p: &[u8], f| {
                                 eps.push((p.to_vec(), f));
                                 true
@@ -868,15 +902,22 @@ impl<'a, 'r> Run<'a, 'r> {
                             srch.path.extend_from_slice(prefix);
                             let last = prefix.last().map(|&m| m as usize).unwrap_or(N_MOVES);
                             let left = len - prefix.len() as u8;
-                            p1_run(&mut srch, &st, d, left, last, 2, &close, &mut spill);
+                            p1_run(
+                                &mut srch, &st, d, left, last, 2, &close, &mut spill, &mut per4,
+                            );
                             let job_nodes = srch.nodes;
                             drop(srch);
                             n += job_nodes;
+                            // A job of 4 moves or more counts all its nodes for its 4-move
+                            // prefix (shorter ones count their subtrees', in `p1_run`).
+                            if let Some(k) = prefix4(prefix) {
+                                per4.push((k, job_nodes));
+                            }
                             let k: usize = eps.iter().map(|e| e.1.count_ones() as usize).sum();
                             if found.fetch_add(k, Ordering::Relaxed) + k >= need {
                                 close.raise();
                             }
-                            local.push((j, eps, spill, job_nodes));
+                            local.push((j, eps, spill, per4));
                         }
                         nodes.fetch_add(n, Ordering::Relaxed);
                         out.lock().unwrap().extend(local);
@@ -894,10 +935,8 @@ impl<'a, 'r> Run<'a, 'r> {
             results.sort_by_key(|r| r.0);
             // Subtrees handed back go first, then the jobs not yet claimed.
             let mut rest: Vec<(u8, Vec<u8>)> = vec![];
-            for r in &results {
-                if let Some(k) = prefix3(&jobs[r.0].1) {
-                    self.yields.entry(k).or_default().1 += r.3;
-                }
+            for &(k, n) in results.iter().flat_map(|r| &r.3) {
+                self.yields.entry(k).or_default().1 += n;
             }
             for r in &mut results {
                 let pair = jobs[r.0].0;
@@ -928,7 +967,7 @@ impl<'a, 'r> Run<'a, 'r> {
             made.sort_unstable_by_key(|m| m.0);
             self.made_cands += eps.iter().map(|e| e.1.count_ones() as usize).sum::<usize>();
             for c in made.iter().flat_map(|m| &m.1) {
-                if let Some(k) = prefix3(&c.moves1) {
+                if let Some(k) = prefix4(&c.moves1) {
                     self.yields.entry(k).or_default().0 += 1;
                 }
             }
@@ -2165,29 +2204,37 @@ mod tests {
         assert!(total > 1000, "too few solutions to test ({total})");
     }
 
-    /// [`order_by_yield`] permutes the jobs, best smoothed yield first, unknown prefixes at
-    /// the mean, ties in their order.
+    /// [`order_by_yield`] permutes the jobs, best smoothed yield first (4-move prefixes
+    /// towards their 3-move prefix's estimate, those towards the mean; unknown prefixes at
+    /// their parent's estimate), ties in their order.
     #[test]
     fn job_order_is_a_permutation_by_yield() {
         let jobs: Vec<(u8, Vec<u8>)> = vec![
             (3, vec![0, 3, 6]),
-            (3, vec![0, 3, 7]),
+            (3, vec![0, 3, 7, 1]),
             (3, vec![1, 4]),
             (3, vec![2, 5, 8, 1]),
             (3, vec![0, 3, 6, 9]),
+            (3, vec![0, 3, 6, 10, 2]),
+            (3, vec![1, 5]),
         ];
         let mut o = jobs.clone();
         order_by_yield(&mut o, &HashMap::new());
         assert_eq!(o, jobs);
-        // Rates 0, 0.05, 0.01; mean 0.02: scores 0.01, 0.035, 0.015, unknown 0.02.
+        // Mean rate 80 / 4000 = 0.02, mean nodes 4000 / 3 per 3-move prefix, 1000 per
+        // 4-move prefix. 3-move estimates: [0, 3, 6] (20 + 0.02 * 4000 / 3) / (2000 + 4000 / 3)
+        // = 0.014, [0, 3, 7] 0.03286, [2, 5, 8] 0.01571. 4-move: [0, 3, 7, 1] (50 + 32.86) /
+        // 2000 = 0.04143, [2, 5, 8, 1] (unknown) 0.01571, [0, 3, 6, 9] 14 / 2000 = 0.007,
+        // [0, 3, 6, 10] 34 / 2000 = 0.017; [1, 4] and [1, 5]: the mean, 0.02.
         let y = HashMap::from([
-            ([0, 3, 6], (0, 1000)),
-            ([0, 3, 7], (50, 1000)),
-            ([2, 5, 8], (10, 1000)),
+            ([0, 3, 6, 9], (0, 1000)),
+            ([0, 3, 6, 10], (20, 1000)),
+            ([0, 3, 7, 1], (50, 1000)),
+            ([2, 5, 8, 0], (10, 1000)),
         ]);
         order_by_yield(&mut o, &y);
         let at = |i: usize| jobs[i].clone();
-        assert_eq!(o, vec![at(1), at(2), at(3), at(0), at(4)]);
+        assert_eq!(o, vec![at(1), at(2), at(6), at(5), at(3), at(0), at(4)]);
     }
 
     /// With the jobs of each new length ordered by yield, phase 1 finds exactly the
@@ -2205,6 +2252,7 @@ mod tests {
             d0[pairs[0]] = t.p1.distance_pair(&root, pairs[0]);
             let last = d0[pairs[0]] + 4;
             let mut found = vec![];
+            let mut ys = vec![];
             for order_jobs in [false, true] {
                 let (stop, have) = (AtomicBool::new(false), AtomicBool::new(false));
                 let mut report = |_: &Solution| {};
@@ -2242,7 +2290,7 @@ mod tests {
                     yields: HashMap::new(),
                     prev_yields: HashMap::new(),
                 };
-                run.level.jobs = run.level_jobs(run.level.len);
+                run.level.jobs = run.level_jobs(run.level.len, false);
                 // The order applies once a solution exists (a 60-move one keeps every
                 // candidate).
                 run.best = Some(Solution {
@@ -2263,8 +2311,12 @@ mod tests {
                     .collect();
                 c.sort();
                 found.push(c);
+                // The yields of length `last` (4-move jobs when ordered, else 3-move ones
+                // counting their 4-move subtrees) are the same.
+                ys.push(run.prev_yields.clone());
                 if order_jobs {
-                    let plain = run.level_jobs(last + 1);
+                    let plain = run.level_jobs(last + 1, true);
+                    assert!(plain.iter().all(|j| j.1.len() == 4));
                     let mut o = plain.clone();
                     order_by_yield(&mut o, &run.prev_yields);
                     assert_ne!(o, plain);
@@ -2280,6 +2332,8 @@ mod tests {
                 found[0].len()
             );
             assert_eq!(found[0], found[1]);
+            assert!(ys[0].len() > 1000, "too few prefixes ({})", ys[0].len());
+            assert_eq!(ys[0], ys[1]);
         }
     }
 
@@ -2333,7 +2387,7 @@ mod tests {
                 yields: HashMap::new(),
                 prev_yields: HashMap::new(),
             };
-            run.level.jobs = run.level_jobs(run.level.len);
+            run.level.jobs = run.level_jobs(run.level.len, false);
             run.phase1(1000);
             // As if a 60-move solution existed: phase 2 keeps every solution of a search.
             run.best = Some(Solution {
@@ -2422,6 +2476,7 @@ mod tests {
                         2,
                         &close,
                         &mut spill,
+                        &mut vec![],
                     );
                     drop(srch);
                     queue.extend(spill);
