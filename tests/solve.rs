@@ -97,3 +97,41 @@ fn facelet_input_and_output_notations() {
         assert!(end.is_solved(), "{style:?}: {text}");
     }
 }
+
+/// With `ties`, every reported solution solves the cube, none is longer than the best before
+/// it, the same move sequence is never reported twice, and the best solution returned is the
+/// first one of the shortest length (the improvements are those without ties). (Whether ties
+/// show up within a short run depends on phase 3 reaching the best length in a round.)
+#[test]
+fn ties_reports_equal_solutions_once() {
+    let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(7);
+    for _ in 0..2 {
+        let f = Cube::random(&mut rng).to_facelets();
+        let (cube, _) = f.to_cube().unwrap();
+        let opts = Options {
+            time_limit: Duration::from_secs_f64(3.0),
+            threads: 4,
+            ties: true,
+            ..Default::default()
+        };
+        let mut s = Solver::new(tables(), opts);
+        let mut seen: Vec<Vec<u8>> = vec![];
+        let best = s
+            .solve(&cube, &mut |sol| seen.push(sol.moves.clone()))
+            .expect("no solution found");
+        assert!(!seen.is_empty());
+        let mut shortest = usize::MAX;
+        for (i, m) in seen.iter().enumerate() {
+            assert!(verify(&f, m), "a reported solution does not solve the cube");
+            assert!(
+                m.len() <= shortest,
+                "a reported solution is longer than the best"
+            );
+            shortest = shortest.min(m.len());
+            assert!(!seen[..i].contains(m), "a solution was reported twice");
+        }
+        assert_eq!(best.len(), shortest);
+        let first = seen.iter().find(|m| m.len() == shortest).unwrap();
+        assert_eq!(&best.moves, first);
+    }
+}
