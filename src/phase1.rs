@@ -1422,14 +1422,15 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         let mt = self.t.mask.as_ref().unwrap();
         let bits = mt.child_bits(nd.idx, nd.parity);
         let stored = mt.stored_moves(nd.sym);
+        let anyway = MaskTable::live_anyway(pre);
         let mut x = a & tight;
         let mut out = a;
         while x != 0 {
             let m = x.trailing_zeros() as usize;
             x &= x - 1;
-            if !MaskTable::child_live(bits, stored, m, pre) {
-                out &= !(1 << m);
-            }
+            // (Branch-free: a dropped child is not predictable.)
+            let dead = !MaskTable::child_live(bits, stored, m, anyway) as u32;
+            out &= !(dead << m);
         }
         out
     }

@@ -121,7 +121,9 @@ const fn fold(j: usize) -> usize {
 }
 
 /// Per move, the moves on its axis on later faces (in the order U R F D L B Uw Rw Fw): those
-/// the canonical order allows after it on its axis.
+/// the canonical order allows after it on its axis (the definition behind
+/// [`MaskTable::live_anyway`]).
+#[cfg(test)]
 const LATER_SAME_AXIS: [u32; N_MOVES] = {
     let mut t = [0u32; N_MOVES];
     let mut m = 0;
@@ -446,14 +448,24 @@ impl MaskTable {
     /// (y commutes with `m`, so the node after y and `m` is the node after `m` and y, one move
     /// further from staged centres than the node after y can be: for a child one closer than
     /// the node, y must decrease the node's distance; one as far, keep or decrease it).
+    /// `anyway`: [`MaskTable::live_anyway`] of `pre` (branch-free: no mispredictions).
     #[inline(always)]
-    pub fn child_live(bits: (u64, u64), stored: &[u8; 32], m: usize, pre: u32) -> bool {
+    pub fn child_live(bits: (u64, u64), stored: &[u8; 32], m: usize, anyway: u32) -> bool {
         debug_assert!(m < N_MOVES);
         let j = unsafe { *stored.get_unchecked(m) } as u32;
-        bits.0 >> j & 1 == 1
-            && (m >= N_OUTER
-                || bits.1 >> j & 1 == 1
-                || pre & unsafe { *LATER_SAME_AXIS.get_unchecked(m) } != 0)
+        (bits.0 >> j & (bits.1 >> j | (anyway >> m) as u64)) & 1 == 1
+    }
+
+    /// The moves whose children [`MaskTable::child_live`] does not need the live bits of:
+    /// the wide moves, and the outer moves with a move of `pre` on a later face of their
+    /// axis (by face: the faces with a move in `pre`, shifted from the faces three and six
+    /// later, spread back over the three powers).
+    #[inline(always)]
+    pub fn live_anyway(pre: u32) -> u32 {
+        const OUTER_FACES: u32 = 0b1001_0010_0100_1001;
+        let faces = pre | pre >> 1 | pre >> 2;
+        let later = (faces >> 9 | faces >> 18) & OUTER_FACES;
+        (later * 7) | ((1 << N_MOVES) - (1 << N_OUTER))
     }
 
     /// The 27-move masks of the moves that decrease and that keep the staging distance, of
@@ -932,6 +944,34 @@ mod tests {
         }
     }
 
+    /// [`MaskTable::live_anyway`]: the wide moves, and the outer moves with a move of the
+    /// given set on a later face of their axis (random sets, single moves, all moves).
+    #[test]
+    fn live_anyway_matches_definition() {
+        let mut rng = rand::thread_rng();
+        let sets = (0..2000)
+            .map(|_| {
+                rand::Rng::r#gen::<u32>(&mut rng) & (rand::Rng::r#gen::<u32>(&mut rng) | 1 << 31)
+            })
+            .chain((0..N_MOVES).map(|y| 1 << y))
+            .chain([0, MASK27 as u32, u32::MAX]);
+        for pre in sets {
+            let pre = if pre == u32::MAX {
+                pre
+            } else {
+                pre & MASK27 as u32
+            };
+            for m in 0..N_MOVES {
+                let want = m >= N_OUTER || pre & LATER_SAME_AXIS[m] != 0;
+                assert_eq!(
+                    MaskTable::live_anyway(pre) >> m & 1 == 1,
+                    want,
+                    "{pre:x} {m}"
+                );
+            }
+        }
+    }
+
     /// The wide quarter turns among the 36 moves are exactly the moves with an odd wing
     /// permutation.
     #[test]
@@ -1047,7 +1087,10 @@ mod tests {
                     } else {
                         u32::MAX
                     };
-                    let live = MaskTable::child_live(bits, stored, m, pre);
+                    let live = MaskTable::child_live(bits, stored, m, MaskTable::live_anyway(pre));
+                    // (The definition, for the branch-free form.)
+                    let anyway = m >= N_OUTER || pre & LATER_SAME_AXIS[m] != 0;
+                    assert_eq!(MaskTable::live_anyway(pre) >> m & 1 == 1, anyway);
                     let exact = v && cdec & ALLOWED_AFTER[m] != 0;
                     assert!(live || !exact, "a live child dropped");
                     if m >= N_OUTER {
