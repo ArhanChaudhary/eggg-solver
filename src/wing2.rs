@@ -49,6 +49,10 @@ pub struct Wing2 {
     /// Per frame (word), all ones if an odd number of dedges have their second wing (2e + 1)
     /// as the frame's high piece.
     high_odd: Row,
+    /// Tight nodes of even wing parity have only 12 preimages per frame: per slot, those of
+    /// the three frames in one word (bits 16 f..), and `high_odd` likewise.
+    te: [u64; 24],
+    te_high_odd: u64,
 }
 
 impl Wing2 {
@@ -79,7 +83,28 @@ impl Wing2 {
                 high_odd.0[f] = !0;
             }
         }
-        Wing2 { b, high_odd }
+        let mut te = [0u64; 24];
+        let mut te_high_odd = 0u64;
+        for (f, fr) in frames.iter().enumerate() {
+            let pre = Self::preimages(fr, wing_dst, true, false);
+            assert!(pre.len() <= 16);
+            for (j, p) in pre.iter().enumerate() {
+                for (x, w) in te.iter_mut().enumerate() {
+                    if p >> x & 1 == 1 {
+                        *w |= 1 << (16 * f + j);
+                    }
+                }
+            }
+            if high_odd.0[f] != 0 {
+                te_high_odd |= 0xffff << (16 * f);
+            }
+        }
+        Wing2 {
+            b,
+            high_odd,
+            te,
+            te_high_odd,
+        }
     }
 
     /// The distinct preimages (24-bit slot masks) of frame `fr`'s low slots under the move
@@ -122,18 +147,43 @@ impl Wing2 {
     /// node is at staging distance 2 (its last move is then a wide quarter turn).
     #[inline(always)]
     pub fn possible(&self, pos: &V32, odd: bool, tight: bool) -> bool {
+        // (The wing slots are < 24: no bounds checks on the rows, which cost as much as the
+        // test on aarch64.)
+        debug_assert!(pos.0[..24].iter().all(|&x| x < 24));
+        if tight && !odd {
+            // The 36 preimages of the three frames in one word.
+            let mut ok = !0u64;
+            let mut h = 0u64;
+            for e in 0..12 {
+                // SAFETY: wing slots are < 24.
+                let (x, y) = unsafe {
+                    (
+                        *self.te.get_unchecked(pos.0[2 * e] as usize),
+                        *self.te.get_unchecked(pos.0[2 * e + 1] as usize),
+                    )
+                };
+                ok &= x ^ y;
+                h ^= x;
+            }
+            return ok & !(h ^ self.te_high_odd) != 0;
+        }
         let b = &self.b[!tight as usize][odd as usize];
         // Per preimage (bit): does it split every dedge (ok), and the parity h of the number
         // of dedges whose first wing (2e) is in it. Where every dedge is split, a dedge's high
         // piece is in the preimage exactly when its first wing is, flipped if the high piece
         // is the second wing; so the high pieces in it number h plus the frame's count of
         // second-wing high pieces, mod 2, which must be even.
-        let mut ok = [!0u64; 4];
-        let mut h = [0u64; 4];
+        let mut ok = [!0u64; 3];
+        let mut h = [0u64; 3];
         for e in 0..12 {
-            let x = &b[pos.0[2 * e] as usize].0;
-            let y = &b[pos.0[2 * e + 1] as usize].0;
-            for w in 0..4 {
+            // SAFETY: wing slots are < 24.
+            let (x, y) = unsafe {
+                (
+                    &b.get_unchecked(pos.0[2 * e] as usize).0,
+                    &b.get_unchecked(pos.0[2 * e + 1] as usize).0,
+                )
+            };
+            for w in 0..3 {
                 ok[w] &= x[w] ^ y[w];
                 h[w] ^= x[w];
             }
