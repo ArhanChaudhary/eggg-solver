@@ -1001,7 +1001,16 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     batch_tree: Vec<(u32, u8)>,
     batch_roots: Vec<u8>,
     batch_path: Vec<u8>,
+    /// Per node of the current round, its decreasing moves and the children that can still
+    /// reach an endpoint, if computed ahead (u32::MAX: not), to prefetch the children's
+    /// wing-path table entries (see [`Search1::run_batch_rounds`]).
+    pre: Vec<(u32, u32)>,
 }
+
+/// Prefetch the wing-path entries of the tight batch nodes' children a pass ahead
+/// (`EGGG_P1_WKPF=0`: no).
+static WK_PREFETCH: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("EGGG_P1_WKPF").map_or(true, |v| v != "0"));
 
 /// See [`Search1::batch_tree`].
 const ROOT: u32 = 1 << 31;
@@ -1107,6 +1116,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             batch_tree: vec![],
             batch_roots: vec![],
             batch_path: Vec::with_capacity(48),
+            pre: vec![],
         }
     }
 
@@ -1267,7 +1277,37 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.state(), self.pair);
                 }
             }
-            for nd in &cur {
+            // The tight nodes whose children get the wing-path test: their masks and live
+            // children now, and the children's table entries prefetched for the pass below.
+            let mut pre = std::mem::take(&mut self.pre);
+            pre.clear();
+            if let Some(w) = t.wingk.as_deref().filter(|_| viable && *WK_PREFETCH) {
+                for nd in &cur {
+                    let mut e = (u32::MAX, 0);
+                    if nd.d == nd.left
+                        && nd.left >= 3
+                        && nd.left - 1 <= w.kmax
+                        && mt.viable(nd.idx, nd.parity)
+                    {
+                        let s = nd.state();
+                        let dec = mt.get(t, nd.idx, nd.sym, &s, self.pair);
+                        let a = dec & ALLOWED_AFTER[nd.last as usize];
+                        let a = self.live_children(nd, a, nd.d, nd.left, dec, 0);
+                        let flags = s.centre_flags();
+                        let mut b = a;
+                        while b != 0 {
+                            let m = b.trailing_zeros() as usize;
+                            b &= b - 1;
+                            let (ud, _, rl) = flag_masks(&unsafe { child_flags(&flags, m, t) });
+                            w.prefetch(ud, rl);
+                        }
+                        e = (dec, a);
+                    }
+                    pre.push(e);
+                }
+            }
+            self.pre = pre;
+            for (ix, nd) in cur.iter().enumerate() {
                 let s = nd.state();
                 if nd.d < nd.left {
                     // A node with slack (reduced table): its children's distances from its
@@ -1325,7 +1365,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     self.reads += 1;
                     continue;
                 }
-                let dec = mt.get(t, nd.idx, nd.sym, &s, self.pair);
+                let (dec, live) = match self.pre.get(ix) {
+                    Some(&(dec, a)) if dec != u32::MAX => (dec, Some(a)),
+                    _ => (mt.get(t, nd.idx, nd.sym, &s, self.pair), None),
+                };
                 let mut a = dec & ALLOWED_AFTER[nd.last as usize];
                 self.nodes += a.count_ones() as u64;
                 self.reads += 1;
@@ -1400,7 +1443,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     if viable {
                         // The children that cannot reach an endpoint are not queued (the
                         // reduced table's child bits; they are still counted as nodes).
-                        a = self.live_children(nd, a, nd.d, nd.left, dec, 0);
+                        a = match live {
+                            Some(a) => a,
+                            None => self.live_children(nd, a, nd.d, nd.left, dec, 0),
+                        };
                     }
                     let flags = s.centre_flags();
                     while a != 0 {

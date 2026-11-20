@@ -437,6 +437,13 @@ impl WingPaths {
         self.any_pairable(off, n, pos)
     }
 
+    /// Prefetch the entry of the state with colour masks `ud` and `rl`.
+    #[inline(always)]
+    pub fn prefetch(&self, ud: u32, rl: u32) {
+        let h = self.slot_of(Self::key(ud, rl));
+        crate::table::prefetch(unsafe { self.slots.as_ptr().add(h) });
+    }
+
     /// [`WingPaths::possible`] for a node at distance = moves left - 1 (<= `smax`): its paths
     /// have one move that keeps the distance (at the end: an outer quarter turn of the
     /// frame's special axis from staged centres).
