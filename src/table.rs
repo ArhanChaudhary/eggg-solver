@@ -54,6 +54,48 @@ impl<T: Copy> HugeBuf<T> {
         self.ptr
     }
 
+    /// Grow the buffer to `len` elements (the new ones zeroed). The mapping grows by half at
+    /// least, and moves if it must without copying (Linux mremap); its untouched part takes
+    /// no memory.
+    pub fn grow(&mut self, len: usize) {
+        assert!(len >= self.len);
+        let need = (len * std::mem::size_of::<T>()).next_multiple_of(1 << 21);
+        if need > self.bytes {
+            let bytes = need.max((self.bytes + self.bytes / 2).next_multiple_of(1 << 21));
+            unsafe {
+                let p = libc::mremap(
+                    self.ptr as *mut libc::c_void,
+                    self.bytes,
+                    bytes,
+                    libc::MREMAP_MAYMOVE,
+                );
+                assert!(p != libc::MAP_FAILED, "mremap to {bytes} bytes failed");
+                libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+                self.ptr = p as *mut T;
+                self.bytes = bytes;
+            }
+        }
+        self.len = len;
+    }
+
+    /// Shrink the buffer to `len` elements, unmapping what is left beyond them.
+    pub fn truncate(&mut self, len: usize) {
+        assert!(len <= self.len);
+        let bytes = (len * std::mem::size_of::<T>())
+            .max(1)
+            .next_multiple_of(1 << 21);
+        if bytes < self.bytes {
+            unsafe {
+                libc::munmap(
+                    (self.ptr as *mut u8).add(bytes) as *mut libc::c_void,
+                    self.bytes - bytes,
+                );
+            }
+            self.bytes = bytes;
+        }
+        self.len = len;
+    }
+
     /// Ask the kernel to back the buffer with huge pages now (MADV_COLLAPSE, Linux 6.1+);
     /// tables are read at random, and 4 KiB pages make every lookup a TLB miss.
     pub fn collapse(&self) {
@@ -307,10 +349,16 @@ fn checksum_tail(mut h: u64, rest: &[u8]) -> u64 {
     h
 }
 
-/// Read `out.len()` bytes of `f` at offset `off` into `out` and return their [`checksum`]. The
-/// reads are spread over a few threads in chunks; the checksum (one sequential chain) follows
-/// them chunk by chunk on this thread, so a load takes about as long as the checksum alone.
-fn read_checksummed(f: &std::fs::File, off: u64, out: &mut [u8]) -> std::io::Result<u64> {
+/// Read `out.len()` bytes of `f` at offset `off` into `out` and return the [`checksum`] state
+/// `h` carried over them (a tail of fewer than 8 bytes ends it). The reads are spread over a
+/// few threads in chunks; the checksum (one sequential chain) follows them chunk by chunk on
+/// this thread, so a load takes about as long as the checksum alone.
+fn read_checksummed(
+    f: &std::fs::File,
+    off: u64,
+    out: &mut [u8],
+    mut h: u64,
+) -> std::io::Result<u64> {
     use std::os::unix::fs::FileExt;
     use std::sync::atomic::AtomicBool;
     const CHUNK: usize = 4 << 20;
@@ -344,7 +392,6 @@ fn read_checksummed(f: &std::fs::File, off: u64, out: &mut [u8]) -> std::io::Res
                 }
             }));
         }
-        let mut h = CHECKSUM_INIT;
         for (i, r) in ready.iter().enumerate() {
             while !r.load(Ordering::Acquire) {
                 if failed.load(Ordering::Relaxed) {
@@ -375,6 +422,12 @@ const MAGIC: &[u8; 8] = b"EGGGTAB1";
 
 /// Save raw table bytes with a header: magic, name length + name, byte length, checksum.
 pub fn save(path: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    save_parts(path, name, &[bytes])
+}
+
+/// [`save`] the concatenation of `parts` (each but the last a multiple of 8 bytes), without
+/// concatenating them in memory.
+pub fn save_parts(path: &Path, name: &str, parts: &[&[u8]]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -391,9 +444,21 @@ pub fn save(path: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
         f.write_all(MAGIC)?;
         f.write_all(&(name.len() as u64).to_le_bytes())?;
         f.write_all(name.as_bytes())?;
-        f.write_all(&(bytes.len() as u64).to_le_bytes())?;
-        f.write_all(&checksum(bytes).to_le_bytes())?;
-        f.write_all(bytes)?;
+        let mut h = CHECKSUM_INIT;
+        for (i, p) in parts.iter().enumerate() {
+            let words = p.len() / 8 * 8;
+            assert!(
+                words == p.len() || i + 1 == parts.len(),
+                "part not 8-byte sized"
+            );
+            h = checksum_tail(checksum_words(h, &p[..words]), &p[words..]);
+        }
+        let len: usize = parts.iter().map(|p| p.len()).sum();
+        f.write_all(&(len as u64).to_le_bytes())?;
+        f.write_all(&h.to_le_bytes())?;
+        for p in parts {
+            f.write_all(p)?;
+        }
         f.flush()?;
     }
     std::fs::rename(tmp, path)
@@ -411,6 +476,83 @@ pub fn load(path: &Path, name: &str, out: &mut [u8]) -> Result<(), String> {
 }
 
 fn load_checked(path: &Path, name: &str, out: &mut [u8]) -> Result<(), String> {
+    let mut r = Reader::open(path, name)?;
+    if r.len() != out.len() {
+        return Err(format!("length mismatch: {} vs {}", r.len(), out.len()));
+    }
+    r.read(out)?;
+    r.finish()
+}
+
+/// Reads a table saved by [`save_parts`] part by part (each but the last a multiple of 8
+/// bytes); [`Reader::finish`] checks the checksum. After a failed load (in a [`LoadGroup`],
+/// before the caller generates the table) call [`load_failed`].
+pub struct Reader {
+    f: std::fs::File,
+    off: u64,
+    left: usize,
+    len: usize,
+    sum: u64,
+    h: u64,
+}
+
+impl Reader {
+    /// Open the table `name` at `path` (its header).
+    pub fn open(path: &Path, name: &str) -> Result<Reader, String> {
+        let (f, off, len, sum) = open_checked(path, name)?;
+        Ok(Reader {
+            f,
+            off,
+            left: len,
+            len,
+            sum,
+            h: CHECKSUM_INIT,
+        })
+    }
+
+    /// The table's length in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Read the next `out.len()` bytes.
+    pub fn read(&mut self, out: &mut [u8]) -> Result<(), String> {
+        if out.len() > self.left {
+            return Err(format!("table too short: {} bytes", self.len));
+        }
+        if (self.len - self.left) & 7 != 0 {
+            return Err("part after a part not 8-byte sized".into());
+        }
+        self.h = read_checksummed(&self.f, self.off, out, self.h).map_err(|e| e.to_string())?;
+        self.off += out.len() as u64;
+        self.left -= out.len();
+        Ok(())
+    }
+
+    /// Check that the whole table was read and its checksum.
+    pub fn finish(self) -> Result<(), String> {
+        if self.left != 0 {
+            return Err(format!("length mismatch: {} bytes left", self.left));
+        }
+        if self.h != self.sum {
+            return Err("checksum mismatch".into());
+        }
+        Ok(())
+    }
+}
+
+/// Note a failed [`Reader`] load (see [`load`]): in a [`LoadGroup`], wait for the generation
+/// token before generating.
+pub fn load_failed() {
+    LoadGroup::before_generating();
+}
+
+/// Open a table saved by [`save_parts`]: the file, the data's offset, length and checksum.
+fn open_checked(path: &Path, name: &str) -> Result<(std::fs::File, u64, usize, u64), String> {
     let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut hdr = [0u8; 16];
     f.read_exact(&mut hdr).map_err(|e| e.to_string())?;
@@ -430,14 +572,8 @@ fn load_checked(path: &Path, name: &str, out: &mut [u8]) -> Result<(), String> {
     f.read_exact(&mut lc).map_err(|e| e.to_string())?;
     let len = u64::from_le_bytes(lc[..8].try_into().unwrap()) as usize;
     let sum = u64::from_le_bytes(lc[8..].try_into().unwrap());
-    if len != out.len() {
-        return Err(format!("length mismatch: {len} vs {}", out.len()));
-    }
     let off = (8 + 8 + nl + 16) as u64;
-    if read_checksummed(&f, off, out).map_err(|e| e.to_string())? != sum {
-        return Err("checksum mismatch".into());
-    }
-    Ok(())
+    Ok((f, off, len, sum))
 }
 
 /// Marks the current thread as one of several loading tables concurrently, until dropped.
@@ -536,6 +672,34 @@ mod tests {
                 assert!(load(&path, "t", &mut out).is_err());
             }
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A table saved in parts loads as their concatenation, whole or part by part (in other
+    /// 8-byte sized parts); reading past its end or not to its end fails.
+    #[test]
+    fn saved_parts_load_whole_or_in_parts() {
+        let dir = std::env::temp_dir().join(format!("eggg-parts-test-{}", std::process::id()));
+        let path = dir.join("p.tab");
+        let all: Vec<u8> = (0..(5usize << 20) + 29)
+            .map(|i| (i * 7 % 251) as u8)
+            .collect();
+        let (a, b) = (24, (4 << 20) + 40);
+        save_parts(&path, "p", &[&all[..a], &all[a..b], &all[b..]]).unwrap();
+        let mut out = vec![0u8; all.len()];
+        load(&path, "p", &mut out).unwrap();
+        assert_eq!(out, all);
+        let mut r = Reader::open(&path, "p").unwrap();
+        let (x, y) = out.split_at_mut(1 << 20);
+        r.read(x).unwrap();
+        r.read(y).unwrap();
+        r.finish().unwrap();
+        assert_eq!(out, all);
+        let mut r = Reader::open(&path, "p").unwrap();
+        r.read(&mut out[..8]).unwrap();
+        assert!(r.finish().is_err());
+        let mut r = Reader::open(&path, "p").unwrap();
+        assert!(r.read(&mut vec![0u8; all.len() + 1]).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

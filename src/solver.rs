@@ -1299,7 +1299,7 @@ pub fn load_pat(
 /// one (`big`, 18.9 GB; needs the large staging table) or the reduced one (1.6 GB).
 pub fn load_mask(p1: &mut P1Tables, dir: &std::path::Path, big: bool, wing_k: u8, verbose: bool) {
     p1.mask = Some(crate::p1mask::load(dir, p1, big, verbose));
-    p1.wingk = wing_paths(wing_k, verbose);
+    p1.wingk = wing_paths(dir, wing_k, verbose);
 }
 
 /// The optional phase-1 tables of [`load_tables_with`]: the pattern table and the move-mask
@@ -1321,11 +1321,18 @@ impl P1Extra {
     };
 }
 
-/// The wing-path lookahead for the batched nodes, built with largest distance `k` for tight
-/// nodes (0: none; the tiers' defaults are [`WINGK`] and 6 for the large tier) and, for
-/// nodes with one move of slack, `EGGG_P1_WINGS` (default [`WINGS`], at most `k`); see
-/// [`crate::wingpath`].
-pub fn wing_paths(k: u8, verbose: bool) -> Option<Box<crate::wingpath::WingPaths>> {
+/// The wing-path lookahead for the batched nodes, with largest distance `k` for tight nodes
+/// (0: none; the tiers' defaults are [`WINGK`] and 6 for the large tier) and, for nodes with
+/// one move of slack, `EGGG_P1_WINGS` (default [`WINGS`], at most `k`); see
+/// [`crate::wingpath`]. Built (in ~1 s up to distance 7), or from distance [`WING_FILE_K`] on
+/// loaded from `dir` (e.g. `p1-wing-k8s5.tab`; built and saved if missing or invalid: 14.6 GB
+/// and about a minute for distance 8).
+pub fn wing_paths(
+    dir: &std::path::Path,
+    k: u8,
+    verbose: bool,
+) -> Option<Box<crate::wingpath::WingPaths>> {
+    use crate::wingpath::WingPaths;
     let env = |k: &str, d: u8| std::env::var(k).ok().map_or(d, |v| v.parse().expect(k));
     if k == 0 {
         return None;
@@ -1334,10 +1341,27 @@ pub fn wing_paths(k: u8, verbose: bool) -> Option<Box<crate::wingpath::WingPaths
     let t0 = Instant::now();
     let frames = [0, 1, 2].map(crate::phase1::Frame::new);
     let red = env("EGGG_P1_WINGR", WINGR as u8) != 0;
-    let w = crate::wingpath::WingPaths::new(&frames, k, sk, red);
+    let (w, how) = if k >= WING_FILE_K {
+        let path = dir.join(WingPaths::file_name(k, sk));
+        match WingPaths::load(&path, &frames, k, sk, red) {
+            Ok(w) => (w, "loaded"),
+            Err(_) => {
+                crate::table::load_failed();
+                if verbose {
+                    eprintln!("generating the wing-path table (distance <= {k})...");
+                }
+                let w = WingPaths::new(&frames, k, sk, red);
+                w.save(&path).expect("saving table");
+                (w, "built and saved")
+            }
+        }
+    } else {
+        (WingPaths::new(&frames, k, sk, red), "built")
+    };
+    w.collapse();
     if verbose {
         eprintln!(
-            "wing-path table (distance <= {k}, slack <= {sk}, reduced {}): {:.1} MB, {:.2} s",
+            "wing-path table (distance <= {k}, slack <= {sk}, reduced {}): {:.1} MB, {how} in {:.2} s",
             if red { k + 1 } else { 0 },
             w.bytes() as f64 / 1e6,
             t0.elapsed().as_secs_f64()
@@ -1345,6 +1369,10 @@ pub fn wing_paths(k: u8, verbose: bool) -> Option<Box<crate::wingpath::WingPaths
     }
     Some(Box::new(w))
 }
+
+/// The smallest largest distance of the wing-path tables that are saved (and loaded) rather
+/// than built each time (distance 7: built in ~1 s; 8: a minute or so).
+pub const WING_FILE_K: u8 = 8;
 
 /// The default largest distances of the wing-path lookahead for tight nodes and for nodes
 /// with one move of slack (see [`crate::wingpath`]).
@@ -1425,11 +1453,15 @@ pub fn load_tables_with(
             P3Tables::load_or_build(&dir, h48_k, threads, verbose)
         })
     };
-    // The wing-path table (with the move masks) is built meanwhile too.
+    // The wing-path table (with the move masks) is built (or loaded) meanwhile too.
     let wing_k = p1_extra.wing_k;
-    let wk = p1_extra
-        .mask
-        .map(|_| std::thread::spawn(move || wing_paths(wing_k, verbose)));
+    let wk = p1_extra.mask.map(|_| {
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || {
+            let _g = crate::table::LoadGroup::enter();
+            wing_paths(&dir, wing_k, verbose)
+        })
+    });
     let g = crate::table::LoadGroup::enter();
     let mut p1 = load_p1(dir, p1_big, threads, verbose);
     if let Some(big) = p1_extra.pat {
@@ -1442,10 +1474,12 @@ pub fn load_tables_with(
         );
         p1.mask = Some(crate::p1mask::load(dir, &p1, big, verbose));
     }
+    // (Joined after this group ends: generating a missing table waits for the groups that
+    // generate.)
+    drop(g);
     if let Some(wk) = wk {
         p1.wingk = wk.join().expect("building the wing-path table");
     }
-    drop(g);
     let p2 = p2.join().expect("loading the phase-2 tables");
     let p3 = p3.join().expect("loading the phase-3 tables");
     // Huge pages for the big tables, in parallel.

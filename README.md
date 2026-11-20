@@ -81,7 +81,8 @@ sets) the distinct (frame, preimage of the frame's low slots under the path) pai
 whether its wings can still be paired: 3 to 8 pairs per state, and 99.5% to 99.8% of the
 nodes 3 to 8 moves from the end fail them all (the two-move test passes 5%). The wing-path
 table (`src/wingpath.rs`, built at start-up in about a second: 9 MB up to distance 5,
-144 MB up to 6 (the large tier), 1.24 GB up to 7 (huge and larger); `--p1-wing K`
+144 MB up to 6 (the large tier), 1.24 GB up to 7 (huge and larger); 14.6 GB up to 8, built
+once in about a minute with a peak of 14.7 GB and saved as `p1-wing-k8s5.tab`; `--p1-wing K`
 overrides it, `EGGG_P1_WINGS` sets the slack-1 lists' distance, `EGGG_P1_WINGR=1` adds the
 next distance stored once per symmetry class) tests a node's tight and slack-1 children
 before they are queued: same endpoints, 9x fewer mask reads, p1check 2.55x faster on the M2

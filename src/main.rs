@@ -180,7 +180,8 @@ struct TableArgs {
     p1_mask: Option<PatArg>,
     /// Phase-1 wing-path lookahead (with the move masks): per centre state, the wing slot
     /// sets its staging paths need, up to this distance (0: none; 6: 0.14 GB, 7: 1.24 GB,
-    /// built in ~1 s; default: the tier's).
+    /// built in ~1 s; 8: 14.6 GB, built once in about a minute (peak 14.7 GB) and saved as
+    /// p1-wing-k8s5.tab; default: the tier's).
     #[arg(long, value_name = "K")]
     p1_wing: Option<u8>,
 }
