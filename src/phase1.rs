@@ -1234,7 +1234,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         q.at[q.k] = self.pend.len() as u32;
         q.tight |= ((d == 2) as u32) << q.k;
         q.k += 1;
-        let full = q.k == 32;
+        // Mode 4: groups of at most 16.
+        let full = q.k == if self.soa == 4 { 16 } else { 32 };
         self.pend.push((node, false));
         if full {
             self.flush_pend();
@@ -1265,13 +1266,20 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             if k == 0 {
                 continue;
             }
-            let mut m = q.rows;
-            crate::simd::transpose32(&mut m);
             let lanes = if k == 32 { !0 } else { (1u32 << k) - 1 };
-            let r = self
-                .t
-                .wing2
-                .possible_soa(&m[..24], cls & 1 == 1, q.tight, lanes);
+            let r = if k <= 16 {
+                let r16: &[V32; 16] = q.rows[..16].try_into().unwrap();
+                let d = crate::simd::transpose16(r16);
+                self.t
+                    .wing2
+                    .possible_soa16(&d, cls & 1 == 1, q.tight, lanes)
+            } else {
+                let mut m = q.rows;
+                crate::simd::transpose32(&mut m);
+                self.t
+                    .wing2
+                    .possible_soa(&m[..24], cls & 1 == 1, q.tight, lanes)
+            };
             for j in 0..k {
                 if r >> j & 1 == 0 {
                     self.pend[q.at[j] as usize].1 = true;
@@ -1424,7 +1432,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             .mask
             .as_ref()
             .is_some_and(|m| m.kind == crate::p1mask::MaskKind::Reduced);
-        if self.soa == 1 && reduced && self.pair == ALL_PAIRS {
+        if (self.soa == 1 || self.soa == 4) && reduced && self.pair == ALL_PAIRS {
             self.run_batch_rounds::<true>();
             self.pend.clear();
             for q in self.wq.iter_mut() {

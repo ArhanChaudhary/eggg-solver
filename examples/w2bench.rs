@@ -83,11 +83,11 @@ fn main() {
     });
     // Node-parallel: the tests in order, queued by class (parity, and tight or not, or
     // parity only); a full queue (32) is transposed and tested.
-    for by_tight in [true, false] {
-        let name = if by_tight {
-            "SoA x32, by parity+tight"
-        } else {
-            "SoA x32, by parity"
+    for (by_tight, cap) in [(true, 32), (false, 32), (true, 16)] {
+        let name = match (by_tight, cap) {
+            (true, 32) => "SoA x32, by parity+tight",
+            (false, _) => "SoA x32, by parity",
+            _ => "SoA x16, by parity+tight",
         };
         run(name, &mut || {
             let mut out = vec![false; n];
@@ -99,10 +99,16 @@ fn main() {
                     if k == 0 {
                         return;
                     }
-                    let mut m = q.1;
-                    eggg_solver::simd::transpose32(&mut m);
                     let lanes = if k == 32 { !0 } else { (1u32 << k) - 1 };
-                    let r = w.possible_soa(&m[..24], odd, q.2, lanes);
+                    let r = if k <= 16 {
+                        let r16: &[V32; 16] = q.1[..16].try_into().unwrap();
+                        let d = eggg_solver::simd::transpose16(r16);
+                        w.possible_soa16(&d, odd, q.2, lanes)
+                    } else {
+                        let mut m = q.1;
+                        eggg_solver::simd::transpose32(&mut m);
+                        w.possible_soa(&m[..24], odd, q.2, lanes)
+                    };
                     for j in 0..k {
                         out[qi[j] as usize] = r >> j & 1 == 1;
                     }
@@ -116,7 +122,7 @@ fn main() {
                 qq.2 |= (tight as u32) << qq.0;
                 qi[c][qq.0] = i as u32;
                 qq.0 += 1;
-                if qq.0 == 32 {
+                if qq.0 == cap {
                     flush(qq, &qi[c], odd, &mut out);
                 }
             }

@@ -300,6 +300,40 @@ impl Wing2 {
         crate::simd::movemask(&nz) & lanes
     }
 
+    /// [`Wing2::possible_soa`] for up to 16 nodes, from their positions in dedge-major form
+    /// (`d[e]`: wing 2e of node i in byte i, wing 2e + 1 in byte 16 + i; see
+    /// [`crate::simd::transpose16`]); the dedge tests on 16-byte halves.
+    #[inline(always)]
+    pub fn possible_soa16(&self, d: &[V32; 12], odd: bool, tight: u32, lanes: u32) -> u32 {
+        use crate::simd::{V16, and16, gather, halves, or16, xor16};
+        let pl = &self.soa[odd as usize];
+        let all_tight = tight & lanes == lanes;
+        let n = if all_tight { pl.n_tight } else { pl.t.len() };
+        let tl = V16(std::array::from_fn(|i| {
+            0u8.wrapping_sub((tight >> i & 1) as u8)
+        }));
+        let ones = V16([0xff; 16]);
+        let mut any = V16([0; 16]);
+        for k in 0..n {
+            let t = &pl.t[k];
+            let mut ok = ones;
+            let mut h = V16([0; 16]);
+            for de in d {
+                let (x, y) = halves(&gather(t, de));
+                ok = and16(&ok, &xor16(&x, &y));
+                h = xor16(&h, &x);
+            }
+            let mut r = and16(&ok, &xor16(&h, &V16([pl.nho[k].0[0]; 16])));
+            if !all_tight {
+                let ti = V16([pl.tight[k]; 16]);
+                let m = or16(&and16(&tl, &ti), &xor16(&tl, &ones));
+                r = and16(&r, &m);
+            }
+            any = or16(&any, &r);
+        }
+        crate::simd::nonzero16(&any) & lanes
+    }
+
     /// Can a node with wing positions `pos` (the slot of each wing) and wing parity `odd`, two
     /// moves from the end of phase 1, reach an endpoint as far as its wings tell? `tight`: the
     /// node is at staging distance 2 (its last move is then a wide quarter turn).
@@ -403,6 +437,11 @@ mod tests {
             crate::simd::transpose32(&mut m);
             let lanes = if n == 32 { !0 } else { (1u32 << n) - 1 };
             let got = t.wing2.possible_soa(&m[..24], odd, tight, lanes);
+            if n <= 16 {
+                let r16: [V32; 16] = std::array::from_fn(|i| rows[i]);
+                let d = crate::simd::transpose16(&r16);
+                assert_eq!(t.wing2.possible_soa16(&d, odd, tight, lanes), got, "soa16");
+            }
             for i in 0..n {
                 let want = t.wing2.possible(&rows[i], odd, tight >> i & 1 == 1);
                 assert_eq!(got >> i & 1 == 1, want, "round {round} node {i}");

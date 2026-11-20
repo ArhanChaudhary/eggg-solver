@@ -5,6 +5,11 @@
 #[repr(C, align(32))]
 pub struct V32(pub [u8; 32]);
 
+/// 16-byte vectors (a few operations, for node-parallel code).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[repr(C, align(16))]
+pub struct V16(pub [u8; 16]);
+
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 mod imp {
     use super::V32;
@@ -109,6 +114,54 @@ mod imp {
     #[inline(always)]
     pub fn shl<const N: i32>(a: &V32) -> V32 {
         unsafe { st(_mm256_slli_epi16::<N>(ld(a))) }
+    }
+
+    use super::V16;
+
+    #[inline(always)]
+    fn ld16(a: &V16) -> __m128i {
+        unsafe { _mm_load_si128(a.0.as_ptr() as *const __m128i) }
+    }
+
+    #[inline(always)]
+    fn st16(v: __m128i) -> V16 {
+        let mut o = V16([0; 16]);
+        unsafe { _mm_store_si128(o.0.as_mut_ptr() as *mut __m128i, v) };
+        o
+    }
+
+    #[inline(always)]
+    pub fn halves(a: &V32) -> (V16, V16) {
+        unsafe {
+            let v = ld(a);
+            (
+                st16(_mm256_castsi256_si128(v)),
+                st16(_mm256_extracti128_si256::<1>(v)),
+            )
+        }
+    }
+
+    #[inline(always)]
+    pub fn xor16(a: &V16, b: &V16) -> V16 {
+        unsafe { st16(_mm_xor_si128(ld16(a), ld16(b))) }
+    }
+
+    #[inline(always)]
+    pub fn and16(a: &V16, b: &V16) -> V16 {
+        unsafe { st16(_mm_and_si128(ld16(a), ld16(b))) }
+    }
+
+    #[inline(always)]
+    pub fn or16(a: &V16, b: &V16) -> V16 {
+        unsafe { st16(_mm_or_si128(ld16(a), ld16(b))) }
+    }
+
+    /// Bit i set if byte i is not zero.
+    #[inline(always)]
+    pub fn nonzero16(a: &V16) -> u32 {
+        unsafe {
+            !(_mm_movemask_epi8(_mm_cmpeq_epi8(ld16(a), _mm_setzero_si128())) as u32) & 0xffff
+        }
     }
 }
 
@@ -237,6 +290,54 @@ mod imp {
             st((vshlq_n_u8::<N>(a0), vshlq_n_u8::<N>(a1)))
         }
     }
+
+    use super::V16;
+
+    #[inline(always)]
+    fn ld16(a: &V16) -> uint8x16_t {
+        unsafe { vld1q_u8(a.0.as_ptr()) }
+    }
+
+    #[inline(always)]
+    fn st16(v: uint8x16_t) -> V16 {
+        let mut o = V16([0; 16]);
+        unsafe { vst1q_u8(o.0.as_mut_ptr(), v) };
+        o
+    }
+
+    #[inline(always)]
+    pub fn halves(a: &V32) -> (V16, V16) {
+        let (a0, a1) = ld(a);
+        (st16(a0), st16(a1))
+    }
+
+    #[inline(always)]
+    pub fn xor16(a: &V16, b: &V16) -> V16 {
+        unsafe { st16(veorq_u8(ld16(a), ld16(b))) }
+    }
+
+    #[inline(always)]
+    pub fn and16(a: &V16, b: &V16) -> V16 {
+        unsafe { st16(vandq_u8(ld16(a), ld16(b))) }
+    }
+
+    #[inline(always)]
+    pub fn or16(a: &V16, b: &V16) -> V16 {
+        unsafe { st16(vorrq_u8(ld16(a), ld16(b))) }
+    }
+
+    #[inline(always)]
+    pub fn nonzero16(a: &V16) -> u32 {
+        unsafe {
+            const W: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+            let a = ld16(a);
+            let m = vandq_u8(vtstq_u8(a, a), vld1q_u8(W.as_ptr()));
+            let m = vpaddq_u8(m, m);
+            let m = vpaddq_u8(m, m);
+            let m = vpaddq_u8(m, m);
+            vgetq_lane_u16::<0>(vreinterpretq_u16_u8(m)) as u32
+        }
+    }
 }
 
 #[cfg(not(any(
@@ -330,9 +431,64 @@ mod imp {
     pub fn shl<const N: i32>(a: &V32) -> V32 {
         V32(a.0.map(|x| x << N))
     }
+
+    use super::V16;
+
+    #[inline(always)]
+    pub fn halves(a: &V32) -> (V16, V16) {
+        (
+            V16(std::array::from_fn(|i| a.0[i])),
+            V16(std::array::from_fn(|i| a.0[16 + i])),
+        )
+    }
+
+    #[inline(always)]
+    pub fn xor16(a: &V16, b: &V16) -> V16 {
+        V16(std::array::from_fn(|i| a.0[i] ^ b.0[i]))
+    }
+
+    #[inline(always)]
+    pub fn and16(a: &V16, b: &V16) -> V16 {
+        V16(std::array::from_fn(|i| a.0[i] & b.0[i]))
+    }
+
+    #[inline(always)]
+    pub fn or16(a: &V16, b: &V16) -> V16 {
+        V16(std::array::from_fn(|i| a.0[i] | b.0[i]))
+    }
+
+    #[inline(always)]
+    pub fn nonzero16(a: &V16) -> u32 {
+        (0..16).fold(0, |m, i| m | ((a.0[i] != 0) as u32) << i)
+    }
 }
 
-pub use imp::{add, and, gather, is_zero, min, movemask, or, shl, shuf, sub, xor, zip_hi, zip_lo};
+pub use imp::{
+    add, and, and16, gather, halves, is_zero, min, movemask, nonzero16, or, or16, shl, shuf, sub,
+    xor, xor16, zip_hi, zip_lo,
+};
+
+/// The wing-major form of 16 rows (row i: byte w = item w of node i, w < 24): row e of the
+/// result holds item 2e of node i in byte i and item 2e + 1 in byte 16 + i (e < 12), by
+/// four rounds of interleaving row i with row i + 8.
+#[inline(always)]
+pub fn transpose16(m: &[V32; 16]) -> [V32; 12] {
+    let mut m = *m;
+    for _ in 0..3 {
+        let mut o = [V32::ZERO; 16];
+        for i in 0..8 {
+            o[2 * i] = zip_lo(&m[i], &m[i + 8]);
+            o[2 * i + 1] = zip_hi(&m[i], &m[i + 8]);
+        }
+        m = o;
+    }
+    let mut o = [V32::ZERO; 12];
+    for i in 0..6 {
+        o[2 * i] = zip_lo(&m[i], &m[i + 8]);
+        o[2 * i + 1] = zip_hi(&m[i], &m[i + 8]);
+    }
+    o
+}
 
 /// Transpose a 32 x 32 byte matrix in place (`m[i].0[j]` becomes `m[j].0[i]`), by five
 /// rounds of interleaving row i with row i + 16.
@@ -450,6 +606,34 @@ mod tests {
                 assert_eq!(m[i].0[j], (j * 32 + i) as u8, "transpose {i} {j}");
             }
         }
+        let rows: [V32; 16] =
+            std::array::from_fn(|i| V32(std::array::from_fn(|j| (i * 32 + j) as u8)));
+        let t16 = transpose16(&rows);
+        for e in 0..12 {
+            for i in 0..16 {
+                assert_eq!(t16[e].0[i], rows[i].0[2 * e], "transpose16 {e} {i}");
+                assert_eq!(
+                    t16[e].0[16 + i],
+                    rows[i].0[2 * e + 1],
+                    "transpose16 {e} {i}"
+                );
+            }
+        }
+        let (h0, h1) = halves(&a);
+        let (g0, g1) = halves(&b);
+        let (x16, a16, o16) = (xor16(&h0, &g0), and16(&h1, &g1), or16(&h0, &g1));
+        for i in 0..16 {
+            assert_eq!(x16.0[i], v[i] ^ idx[i]);
+            assert_eq!(a16.0[i], v[16 + i] & idx[16 + i]);
+            assert_eq!(o16.0[i], v[i] | idx[16 + i]);
+        }
+        let z = V16(std::array::from_fn(|i| {
+            if i % 3 == 0 { 0 } else { 1 << (i % 8) }
+        }));
+        assert_eq!(
+            nonzero16(&z),
+            (0..16).filter(|i| i % 3 != 0).fold(0, |m, i| m | 1 << i)
+        );
         assert!(is_zero(&V32::ZERO));
         for i in 0..32 {
             let mut z = V32::ZERO;
