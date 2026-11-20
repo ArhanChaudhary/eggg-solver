@@ -2326,7 +2326,17 @@ mod tests {
     /// exactly the endpoints of one uninterrupted search.
     #[test]
     fn split_jobs_find_the_same_endpoints() {
-        let t = load_p1(std::path::Path::new("tables"), false, 8, false);
+        let dir = std::path::Path::new("tables");
+        let mut t = load_p1(dir, false, 8, false);
+        // Without and with the reduced move-mask table and its successors.
+        let masks = [None, Some(crate::p1mask::load(dir, &t, false, false))];
+        for mask in masks {
+            t.mask = mask;
+            split_jobs_endpoints(&t);
+        }
+    }
+
+    fn split_jobs_endpoints(t: &P1Tables) {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(7);
         for scramble in 0..6 {
             let mut cube = Cube::SOLVED;
@@ -2338,7 +2348,7 @@ mod tests {
             let d0 = t.distance(&root);
             for len in d0.max(4)..d0.max(4) + 2 {
                 let mut want = vec![];
-                let mut srch = Search1::new(&t, |p: &[u8], f| {
+                let mut srch = Search1::new(t, |p: &[u8], f| {
                     want.push((p.to_vec(), f));
                     true
                 });
@@ -2351,9 +2361,9 @@ mod tests {
                 let mut count = 0usize;
                 while let Some(prefix) = queue.pop() {
                     let close = Close::new(None);
-                    let (st, d) = root.after(&prefix, d0, &t);
+                    let (st, d) = root.after(&prefix, d0, t);
                     let mut spill = vec![];
-                    let mut srch = Search1::new(&t, |p: &[u8], f| {
+                    let mut srch = Search1::new(t, |p: &[u8], f| {
                         got.push((p.to_vec(), f));
                         count += 1;
                         if count % 3 == scramble % 3 {
