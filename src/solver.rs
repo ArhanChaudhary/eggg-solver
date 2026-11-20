@@ -1327,8 +1327,8 @@ pub fn wing_paths(verbose: bool) -> Option<Box<crate::wingpath::WingPaths>> {
 
 /// The default largest distances of the wing-path lookahead for tight nodes and for nodes
 /// with one move of slack (see [`crate::wingpath`]).
-pub const WINGK: u8 = 5;
-pub const WINGS: u8 = 4;
+pub const WINGK: u8 = 7;
+pub const WINGS: u8 = 5;
 
 /// Load or build the phase-2 tables in `dir`; `joint`: also the joint table (1.05 GB).
 pub fn load_p2(dir: &std::path::Path, joint: bool, threads: usize, verbose: bool) -> P2Tables {
