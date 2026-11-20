@@ -1211,6 +1211,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 let (ud, rl) = c.masks();
                 return w.possible(ud, rl, &c.pos, c.parity);
             }
+            if d == left && left == w.kmax + 1 && w.red.is_some() {
+                let (ud, rl) = c.masks();
+                return w.possible_red(ud, rl, &c.pos, c.parity);
+            }
             if d + 1 == left && d <= w.smax {
                 let (ud, rl) = c.masks();
                 return w.possible_slack(ud, rl, &c.pos, c.parity);
@@ -1289,7 +1293,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     let mut tested = 0;
                     if left < 3 {
                     } else if d == left {
-                        if left - 1 <= w.kmax && mt.viable(nd.idx, nd.parity) {
+                        let red = w.red.is_some() && left - 1 == w.kmax + 1;
+                        if (left - 1 <= w.kmax || red) && mt.viable(nd.idx, nd.parity) {
                             let dec = mt.get(t, nd.idx, nd.sym, &nd.state(), self.pair);
                             let a = dec & ALLOWED_AFTER[nd.last as usize];
                             e = self.live_children(nd, a, d, left, dec, 0);
@@ -1321,7 +1326,11 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                             let m = b.trailing_zeros() as usize;
                             b &= b - 1;
                             let (ud, _, rl) = flag_masks(&unsafe { child_flags(&flags, m, t) });
-                            w.prefetch(ud, rl);
+                            if d == left && left - 1 == w.kmax + 1 {
+                                w.red.as_ref().unwrap().prefetch(ud, rl);
+                            } else {
+                                w.prefetch(ud, rl);
+                            }
                         }
                     }
                     pre.push(e);
@@ -2117,7 +2126,8 @@ mod tests {
     /// [`P1Tables::staged_after`] agrees with the definition (and with the staging table's
     /// goal, distance 0, where the large table is in ./tables).
     /// The masked search over all pairs finds the same endpoints, in the same order, with and
-    /// without the wing-path lookahead (largest distance 3 to 5), on random roots and on roots
+    /// without the wing-path lookahead (largest distance 3 to 5, the last with the reduced
+    /// lists at 6), on random roots and on roots
     /// a few moves from endpoints, at their distance and up to 3 moves more (needs the reduced
     /// mask table in ./tables, loaded or made; the small staging table likewise).
     #[test]
@@ -2131,6 +2141,7 @@ mod tests {
                     &t.frames,
                     k,
                     k - 1,
+                    k == 5,
                 )))
             })
             .collect();

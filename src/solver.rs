@@ -1314,10 +1314,12 @@ pub fn wing_paths(verbose: bool) -> Option<Box<crate::wingpath::WingPaths>> {
     let sk = env("EGGG_P1_WINGS", WINGS).min(k);
     let t0 = Instant::now();
     let frames = [0, 1, 2].map(crate::phase1::Frame::new);
-    let w = crate::wingpath::WingPaths::new(&frames, k, sk);
+    let red = env("EGGG_P1_WINGR", WINGR as u8) != 0;
+    let w = crate::wingpath::WingPaths::new(&frames, k, sk, red);
     if verbose {
         eprintln!(
-            "wing-path table (distance <= {k}, slack <= {sk}): {:.1} MB, {:.2} s",
+            "wing-path table (distance <= {k}, slack <= {sk}, reduced {}): {:.1} MB, {:.2} s",
+            if red { k + 1 } else { 0 },
             w.bytes() as f64 / 1e6,
             t0.elapsed().as_secs_f64()
         );
@@ -1329,6 +1331,9 @@ pub fn wing_paths(verbose: bool) -> Option<Box<crate::wingpath::WingPaths>> {
 /// with one move of slack (see [`crate::wingpath`]).
 pub const WINGK: u8 = 7;
 pub const WINGS: u8 = 5;
+/// Whether the wing-path lookahead also has the symmetry-reduced lists one move further
+/// (`EGGG_P1_WINGR`, see [`crate::wingpath::Reduced`]).
+pub const WINGR: bool = false;
 
 /// Load or build the phase-2 tables in `dir`; `joint`: also the joint table (1.05 GB).
 pub fn load_p2(dir: &std::path::Path, joint: bool, threads: usize, verbose: bool) -> P2Tables {

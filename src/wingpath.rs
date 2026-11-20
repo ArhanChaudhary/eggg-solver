@@ -65,6 +65,120 @@ pub struct WingPaths {
     pairs: Vec<u32>,
     /// Per frame, its high pieces.
     high: [u32; 4],
+    /// The pairs of the states at distance `kmax` + 1, reduced by symmetry, if built.
+    pub red: Option<Reduced>,
+}
+
+/// A symmetry of the cube that maps the solver's 27 moves onto themselves (one of the 6 that
+/// fix the corner the moves never turn, D L B): its map of centre-position masks, and its
+/// wing-slot permutation and inverse as gathers.
+struct Sym {
+    centre: [[u32; 256]; 3],
+    q: V32,
+    qinv: V32,
+}
+
+/// The symmetries that map the 27 moves onto themselves (by conjugation, centres and wings).
+fn move_set_syms() -> Vec<Sym> {
+    let g = &*crate::cube::GEO;
+    let mut out = vec![];
+    for inv in [1i8, -1] {
+        for r in crate::cube::ROTATIONS.iter() {
+            let img = |v: crate::cube::V3| crate::cube::mat_apply(r, v).map(|c| c * inv);
+            let p: [usize; 24] =
+                std::array::from_fn(|i| crate::cube::centre_slot(img(g.centre_pos[i])));
+            let q: [usize; 24] =
+                std::array::from_fn(|i| crate::cube::wing_slot(img(g.wing_pos[i])));
+            // Conjugated move m': src_m'[p[t]] = p[src_m[t]] (centres; wings likewise).
+            let keeps = (0..N_MOVES).all(|m| {
+                let (cs, ws) = (&MOVE_PERMS[m].centre_src, &MOVE_PERMS[m].wing_src);
+                (0..N_MOVES).any(|m2| {
+                    let (cs2, ws2) = (&MOVE_PERMS[m2].centre_src, &MOVE_PERMS[m2].wing_src);
+                    (0..24).all(|t| {
+                        cs2[p[t]] as usize == p[cs[t] as usize]
+                            && ws2[q[t]] as usize == q[ws[t] as usize]
+                    })
+                })
+            });
+            if keeps {
+                let mut qv = V32(std::array::from_fn(|i| i as u8));
+                let mut qi = qv;
+                for i in 0..24 {
+                    qv.0[i] = q[i] as u8;
+                    qi.0[q[i]] = i as u8;
+                }
+                out.push(Sym {
+                    centre: byte_tables(|i| p[i]),
+                    q: qv,
+                    qinv: qi,
+                });
+            }
+        }
+    }
+    assert_eq!(out.len(), 6, "symmetries keeping the move set");
+    out
+}
+
+/// The pair lists of the states at one distance, one per class under the symmetries that
+/// keep the move set (its member with the least key, in that member's coordinates).
+pub struct Reduced {
+    shift: u32,
+    mask: usize,
+    slots: Vec<Slot>,
+    pairs: Vec<u32>,
+    syms: Vec<Sym>,
+}
+
+impl Reduced {
+    /// The least key of the class of the state with colour masks `ud` and `rl`, and the
+    /// symmetry that takes the state to that member.
+    #[inline(always)]
+    fn canon(&self, ud: u32, rl: u32) -> (u64, usize) {
+        canon(&self.syms, ud, rl)
+    }
+
+    #[inline(always)]
+    fn find(&self, key: u64) -> usize {
+        find_slot(&self.slots, self.shift, self.mask, key)
+    }
+
+    /// Prefetch the entry of the state with colour masks `ud` and `rl`.
+    #[inline(always)]
+    pub fn prefetch(&self, ud: u32, rl: u32) {
+        let h = slot_of(self.canon(ud, rl).0, self.shift);
+        crate::table::prefetch(unsafe { self.slots.as_ptr().add(h) });
+    }
+}
+
+/// See [`Reduced::canon`].
+#[inline(always)]
+fn canon(syms: &[Sym], ud: u32, rl: u32) -> (u64, usize) {
+    let mut best = (u64::MAX, 0);
+    for (i, s) in syms.iter().enumerate() {
+        let k = WingPaths::key(apply_bytes(&s.centre, ud), apply_bytes(&s.centre, rl));
+        if k < best.0 {
+            best = (k, i);
+        }
+    }
+    best
+}
+
+#[inline(always)]
+fn slot_of(key: u64, shift: u32) -> usize {
+    (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> shift) as usize
+}
+
+/// The slot holding `key`, or the empty slot where it would go.
+#[inline(always)]
+fn find_slot(slots: &[Slot], shift: u32, mask: usize, key: u64) -> usize {
+    let mut h = slot_of(key, shift);
+    loop {
+        let k = unsafe { slots.get_unchecked(h) }.key;
+        if k == key || k == 0 {
+            return h;
+        }
+        h = (h + 1) & mask;
+    }
 }
 
 /// Per slot (and 24..32), the byte of a 24-bit set that holds its bit.
@@ -128,12 +242,12 @@ impl Lists {
         [&self.pairs[o..o + e], &self.pairs[o + e..o + e + d]]
     }
 
-    /// The lists of the states `keys` (at `slots`), `f(i, out)` collecting state i's pairs
-    /// (with repeats) per parity; in parallel.
+    /// The lists of the states `keys` (at `slots`), `f(i, key, out)` collecting state i's
+    /// pairs (with repeats) per parity; in parallel.
     fn build(
         keys: Vec<u64>,
         slots: Vec<u32>,
-        f: impl Fn(usize, &mut [Vec<u32>; 2]) + Sync,
+        f: impl Fn(usize, u64, &mut [Vec<u32>; 2]) + Sync,
     ) -> Lists {
         type Part = (usize, Vec<u32>, Vec<[u16; 2]>, Vec<u32>);
         let parts: std::sync::Mutex<Vec<Part>> = std::sync::Mutex::new(vec![]);
@@ -143,7 +257,7 @@ impl Lists {
             for i in r.clone() {
                 out[0].clear();
                 out[1].clear();
-                f(i, &mut out);
+                f(i, keys[i], &mut out);
                 off.push(pairs.len() as u32);
                 let mut c = [0u16; 2];
                 for (p, v) in out.iter_mut().enumerate() {
@@ -191,25 +305,20 @@ impl WingPaths {
 
     #[inline(always)]
     fn slot_of(&self, key: u64) -> usize {
-        (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> self.shift) as usize
+        slot_of(key, self.shift)
     }
 
     /// The slot holding `key`, or the empty slot where it would go.
     #[inline(always)]
     fn find(&self, key: u64) -> usize {
-        let mut h = self.slot_of(key);
-        loop {
-            let k = unsafe { self.slots.get_unchecked(h) }.key;
-            if k == key || k == 0 {
-                return h;
-            }
-            h = (h + 1) & self.mask;
-        }
+        find_slot(&self.slots, self.shift, self.mask, key)
     }
 
     /// The pairs of the staging paths of every state up to distance `kmax` (<= 7), and of
-    /// the slack-1 paths of every state up to distance `smax` (<= `kmax`), for `frames`.
-    pub fn new(frames: &[Frame; 3], kmax: u8, smax: u8) -> WingPaths {
+    /// the slack-1 paths of every state up to distance `smax` (<= `kmax`), for `frames`;
+    /// `red`: also of the states at distance `kmax` + 1, reduced by symmetry (see
+    /// [`Reduced`]).
+    pub fn new(frames: &[Frame; 3], kmax: u8, smax: u8, red: bool) -> WingPaths {
         assert!((1..=7).contains(&kmax) && smax <= kmax);
         // States per distance (unlabelled colour pairs: about a sixth of the U/D x R/L mask
         // pairs; 7: an estimate).
@@ -229,6 +338,7 @@ impl WingPaths {
                 frames[2].high_pieces,
                 0,
             ],
+            red: None,
         };
         // Per move: the centre-mask map, and the wing-slot preimage map.
         let centre: Vec<[[u32; 256]; 3]> = (0..N_MOVES)
@@ -331,7 +441,7 @@ impl WingPaths {
             for i in 0..keys.len() {
                 first[i + 1] += first[i];
             }
-            let lists = Lists::build(keys, slots, |i, out| {
+            let lists = Lists::build(keys, slots, |i, _, out| {
                 for &l in &links[first[i] as usize..first[i + 1] as usize] {
                     let (ci, mi) = ((l >> 5) as usize & ((1 << 22) - 1), (l & 31) as usize);
                     if mi < N_MOVES {
@@ -348,7 +458,7 @@ impl WingPaths {
         let mut slack: Vec<Lists> = vec![];
         for k in 0..=smax as usize {
             let l = &tight[k];
-            let lists = Lists::build(l.keys.clone(), vec![], |i, out| {
+            let lists = Lists::build(l.keys.clone(), vec![], |_, key, out| {
                 if k == 0 {
                     for (f, fr) in frames.iter().enumerate() {
                         for m in 0..18 {
@@ -360,7 +470,7 @@ impl WingPaths {
                     return;
                 }
                 for m in 0..N_MOVES {
-                    match at(&w, apply(l.keys[i], m)) {
+                    match at(&w, apply(key, m)) {
                         Some((d, j)) if d as usize + 1 == k => extend(out, slack[k - 1].list(j), m),
                         Some((d, j)) if d as usize == k => extend(out, tight[k].list(j), m),
                         _ => {}
@@ -411,12 +521,99 @@ impl WingPaths {
             }
         }
         w.pairs.shrink_to_fit();
+        if red {
+            let keys = std::mem::take(&mut tight[kmax as usize].keys);
+            w.red = Some(w.reduced_layer(&keys, &apply, &extend));
+        }
         w
+    }
+
+    /// The reduced lists of the states at distance `kmax` + 1 (`last`: the states at `kmax`;
+    /// `apply` and `extend` as in [`WingPaths::new`]).
+    fn reduced_layer(
+        &self,
+        last: &[u64],
+        apply: &(impl Fn(u64, usize) -> u64 + Sync),
+        extend: &(impl Fn(&mut [Vec<u32>; 2], [&[u32]; 2], usize) + Sync),
+    ) -> Reduced {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        // Classes per distance (about a sixth of the states; 8: an estimate).
+        const COUNT: [usize; 9] = [1, 1, 12, 130, 1_520, 19_500, 252_000, 3_200_000, 33_000_000];
+        let n = COUNT[self.kmax as usize + 1];
+        let bits = (n * 2).next_power_of_two().trailing_zeros().max(4);
+        let (shift, mask) = (64 - bits, (1usize << bits) - 1);
+        let syms = move_set_syms();
+        let mut slots = vec![Slot::default(); 1 << bits];
+        // The classes: the children of the states at `kmax` not in the table, inserted by
+        // their least key (in parallel, the keys by compare-and-swap).
+        let base = slots.as_mut_ptr() as usize;
+        let count = AtomicU64::new(0);
+        crate::par::for_chunks(last.len(), 1 << 12, |range| {
+            for &c in &last[range] {
+                for m in 0..N_MOVES {
+                    let x = apply(c, m);
+                    if self.slots[self.find(x)].key != 0 {
+                        continue;
+                    }
+                    let (k, _) = canon(&syms, (x >> 24) as u32 & MASK24, x as u32 & MASK24);
+                    let mut h = slot_of(k, shift);
+                    loop {
+                        // SAFETY: h < the slot count; a slot's key is its first word.
+                        let a = unsafe { &*((base as *const Slot).add(h) as *const AtomicU64) };
+                        match a.compare_exchange(0, k, Relaxed, Relaxed) {
+                            Ok(_) => {
+                                count.fetch_add(1, Relaxed);
+                                break;
+                            }
+                            Err(v) if v == k => break,
+                            Err(_) => h = (h + 1) & mask,
+                        }
+                    }
+                }
+            }
+        });
+        let n = count.into_inner() as usize;
+        assert!(n * 10 < slots.len() * 9, "reduced wing-path table too full");
+        let (keys, at): (Vec<u64>, Vec<u32>) = slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.key != 0)
+            .map(|(h, s)| (s.key, h as u32))
+            .unzip();
+        // Each class member's pairs, from its children at `kmax` (via its decreasing moves).
+        let lists = Lists::build(keys, at, |_, key, out| {
+            for m in 0..N_MOVES {
+                let s = &self.slots[self.find(apply(key, m))];
+                if s.key != 0 {
+                    let (o, e, d) = (s.off as usize, s.n[0] as usize, s.n[1] as usize);
+                    extend(
+                        out,
+                        [&self.pairs[o..o + e], &self.pairs[o + e..o + e + d]],
+                        m,
+                    );
+                }
+            }
+        });
+        for i in 0..lists.keys.len() {
+            let s = &mut slots[lists.slots[i] as usize];
+            s.off = lists.off[i];
+            s.n = lists.n[i];
+        }
+        Reduced {
+            shift,
+            mask,
+            slots,
+            pairs: lists.pairs,
+            syms,
+        }
     }
 
     /// Bytes used.
     pub fn bytes(&self) -> usize {
-        self.slots.len() * std::mem::size_of::<Slot>() + self.pairs.len() * 4
+        let red = self.red.as_ref().map_or(0, |r| {
+            r.slots.len() * std::mem::size_of::<Slot>() + r.pairs.len() * 4
+        });
+        self.slots.len() * std::mem::size_of::<Slot>() + self.pairs.len() * 4 + red
     }
 
     /// Can a node at staging distance = moves left (<= `kmax`) with U/D and R/L colour masks
@@ -467,26 +664,53 @@ impl WingPaths {
     /// Are the wings `pos` pairable w.r.t. one of the `n` pairs from `off`?
     #[inline(always)]
     fn any_pairable(&self, off: usize, n: usize, pos: &V32) -> bool {
-        use crate::simd::{add, and, gather, movemask, shuf};
-        if n == 0 {
-            return false;
-        }
-        // Per wing, the byte of a slot set with its slot's bit, and the bit.
-        let hi = gather(&HI, pos);
-        let bit = gather(&BIT, pos);
-        for &x in unsafe { self.pairs.get_unchecked(off..off + n) } {
-            // The wings whose slot is in the preimage (bit 7 of each byte after the add).
-            let v = V32(unsafe { std::mem::transmute::<[u32; 8], [u8; 32]>([x; 8]) });
-            let m = movemask(&add(&and(&shuf(&v, &hi), &bit), &C7F)) & MASK24;
-            if (m ^ (m >> 1)) & 0x55_5555 == 0x55_5555
-                && (m & unsafe { self.high.get_unchecked((x >> 24) as usize) }).count_ones() & 1
-                    == 0
-            {
-                return true;
-            }
-        }
-        false
+        any_pairable(&self.pairs, &self.high, off, n, pos)
     }
+
+    /// [`WingPaths::possible`] for a node at distance `kmax` + 1, by the reduced lists.
+    #[inline(always)]
+    pub fn possible_red(&self, ud: u32, rl: u32, pos: &V32, odd: bool) -> bool {
+        let r = self.red.as_ref().unwrap();
+        let (k, si) = r.canon(ud, rl);
+        let s = unsafe { r.slots.get_unchecked(r.find(k)) };
+        if s.key == 0 {
+            debug_assert!(false, "state not in the reduced table");
+            return true;
+        }
+        let (off, n) = if odd {
+            (s.off as usize + s.n[0] as usize, s.n[1] as usize)
+        } else {
+            (s.off as usize, s.n[0] as usize)
+        };
+        // The wings of the class member: piece q(w) at slot q(pos(w)).
+        let sym = unsafe { r.syms.get_unchecked(si) };
+        let p = crate::simd::gather(&sym.q, &crate::simd::gather(pos, &sym.qinv));
+        any_pairable(&r.pairs, &self.high, off, n, &p)
+    }
+}
+
+/// Are the wings `pos` pairable w.r.t. one of the `n` pairs of `pairs` from `off` (frames'
+/// high pieces `high`)?
+#[inline(always)]
+fn any_pairable(pairs: &[u32], high: &[u32; 4], off: usize, n: usize, pos: &V32) -> bool {
+    use crate::simd::{add, and, gather, movemask, shuf};
+    if n == 0 {
+        return false;
+    }
+    // Per wing, the byte of a slot set with its slot's bit, and the bit.
+    let hi = gather(&HI, pos);
+    let bit = gather(&BIT, pos);
+    for &x in unsafe { pairs.get_unchecked(off..off + n) } {
+        // The wings whose slot is in the preimage (bit 7 of each byte after the add).
+        let v = V32(unsafe { std::mem::transmute::<[u32; 8], [u8; 32]>([x; 8]) });
+        let m = movemask(&add(&and(&shuf(&v, &hi), &bit), &C7F)) & MASK24;
+        if (m ^ (m >> 1)) & 0x55_5555 == 0x55_5555
+            && (m & unsafe { high.get_unchecked((x >> 24) as usize) }).count_ones() & 1 == 0
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -578,7 +802,7 @@ mod tests {
     #[test]
     fn matches_brute_force() {
         let t = tables();
-        let w = WingPaths::new(&t.frames, 5, 4);
+        let w = WingPaths::new(&t.frames, 5, 4, false);
         let dist = distances(&t, 5);
         let keys: std::collections::HashSet<u64> = dist
             .keys()
@@ -648,6 +872,52 @@ mod tests {
                     "slack {slack} left {left}: {passed:?}"
                 );
             }
+        }
+    }
+
+    /// The symmetry-reduced lists one move beyond the table (distance 4 after a table up to
+    /// 3, and 5 after 4) agree with the full table's on states at that distance (random
+    /// walks back from the solved cube) with their wings or random ones.
+    #[test]
+    fn reduced_layer_matches_full_table() {
+        let t = tables();
+        let full = WingPaths::new(&t.frames, 5, 0, false);
+        let dist = distances(&t, 5);
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(12);
+        let solved = P1State::from_cube(&crate::cube::Cube::SOLVED);
+        for k in [4u8, 5] {
+            let w = WingPaths::new(&t.frames, k - 1, 0, true);
+            let r = w.red.as_ref().unwrap();
+            let classes = r.slots.iter().filter(|s| s.key != 0).count();
+            let states = full.slots.iter().filter(|s| s.key != 0).count();
+            assert!(classes * 5 < states, "{classes} classes");
+            let (mut n, mut pass) = (0, [0usize; 2]);
+            while n < 3000 {
+                let mut s = solved;
+                for _ in 0..k {
+                    s = s.apply(rng.gen_range(0..N_MOVES), &t);
+                }
+                if dist[&s.masks()] != k {
+                    continue;
+                }
+                let random = n % 2 == 1;
+                if random {
+                    let mut p: Vec<u8> = (0..24).collect();
+                    p.shuffle(&mut rng);
+                    s.pos = V32::from_slice(&p);
+                    s.parity = crate::cube::Cube::parity(&p) == 1;
+                }
+                let (ud, rl) = s.masks();
+                let want = full.possible(ud, rl, &s.pos, s.parity);
+                assert_eq!(
+                    w.possible_red(ud, rl, &s.pos, s.parity),
+                    want,
+                    "k {k} case {n}"
+                );
+                pass[random as usize] += want as usize;
+                n += 1;
+            }
+            assert!(pass[0] > 100, "{pass:?}");
         }
     }
 }
