@@ -1299,24 +1299,30 @@ pub fn load_pat(
 /// one (`big`, 18.9 GB; needs the large staging table) or the reduced one (1.6 GB).
 pub fn load_mask(p1: &mut P1Tables, dir: &std::path::Path, big: bool, verbose: bool) {
     p1.mask = Some(crate::p1mask::load(dir, p1, big, verbose));
-    // The wing-path lookahead for the batched nodes (`EGGG_P1_WINGK`: its largest distance
-    // for tight nodes, default [`WINGK`], 0: none; `EGGG_P1_WINGS`: for nodes with one move
-    // of slack, default [`WINGS`], at most the former).
+    p1.wingk = wing_paths(verbose);
+}
+
+/// The wing-path lookahead for the batched nodes, built (`EGGG_P1_WINGK`: its largest
+/// distance for tight nodes, default [`WINGK`], 0: none; `EGGG_P1_WINGS`: for nodes with one
+/// move of slack, default [`WINGS`], at most the former; see [`crate::wingpath`]).
+pub fn wing_paths(verbose: bool) -> Option<Box<crate::wingpath::WingPaths>> {
     let env = |k: &str, d: u8| std::env::var(k).ok().map_or(d, |v| v.parse().expect(k));
     let k = env("EGGG_P1_WINGK", WINGK);
-    if k > 0 {
-        let sk = env("EGGG_P1_WINGS", WINGS).min(k);
-        let t0 = Instant::now();
-        let w = crate::wingpath::WingPaths::new(&p1.frames, k, sk);
-        if verbose {
-            eprintln!(
-                "wing-path table (distance <= {k}, slack <= {sk}): {:.1} MB, {:.2} s",
-                w.bytes() as f64 / 1e6,
-                t0.elapsed().as_secs_f64()
-            );
-        }
-        p1.wingk = Some(Box::new(w));
+    if k == 0 {
+        return None;
     }
+    let sk = env("EGGG_P1_WINGS", WINGS).min(k);
+    let t0 = Instant::now();
+    let frames = [0, 1, 2].map(crate::phase1::Frame::new);
+    let w = crate::wingpath::WingPaths::new(&frames, k, sk);
+    if verbose {
+        eprintln!(
+            "wing-path table (distance <= {k}, slack <= {sk}): {:.1} MB, {:.2} s",
+            w.bytes() as f64 / 1e6,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    Some(Box::new(w))
 }
 
 /// The default largest distances of the wing-path lookahead for tight nodes and for nodes
@@ -1395,6 +1401,10 @@ pub fn load_tables_with(
             P3Tables::load_or_build(&dir, h48_k, threads, verbose)
         })
     };
+    // The wing-path table (with the move masks) is built meanwhile too.
+    let wk = p1_extra
+        .1
+        .map(|_| std::thread::spawn(move || wing_paths(verbose)));
     let g = crate::table::LoadGroup::enter();
     let mut p1 = load_p1(dir, p1_big, threads, verbose);
     if let Some(big) = p1_extra.0 {
@@ -1405,7 +1415,10 @@ pub fn load_tables_with(
             p1_big || !big || p1.pat.is_some(),
             "the large move-mask table needs the large staging table"
         );
-        load_mask(&mut p1, dir, big, verbose);
+        p1.mask = Some(crate::p1mask::load(dir, &p1, big, verbose));
+    }
+    if let Some(wk) = wk {
+        p1.wingk = wk.join().expect("building the wing-path table");
     }
     drop(g);
     let p2 = p2.join().expect("loading the phase-2 tables");

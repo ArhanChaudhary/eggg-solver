@@ -111,6 +111,70 @@ fn apply_bytes(t: &[[u32; 256]; 3], x: u32) -> u32 {
     t[0][(x & 255) as usize] | t[1][(x >> 8 & 255) as usize] | t[2][(x >> 16) as usize]
 }
 
+/// The pair lists of the states at one distance (building a [`WingPaths`]): their keys,
+/// slots, and per state its pairs for even then odd wing parity, from `off` in `pairs`.
+struct Lists {
+    keys: Vec<u64>,
+    slots: Vec<u32>,
+    off: Vec<u32>,
+    n: Vec<[u16; 2]>,
+    pairs: Vec<u32>,
+}
+
+impl Lists {
+    fn list(&self, i: usize) -> [&[u32]; 2] {
+        let (o, [e, d]) = (self.off[i] as usize, self.n[i]);
+        let (e, d) = (e as usize, d as usize);
+        [&self.pairs[o..o + e], &self.pairs[o + e..o + e + d]]
+    }
+
+    /// The lists of the states `keys` (at `slots`), `f(i, out)` collecting state i's pairs
+    /// (with repeats) per parity; in parallel.
+    fn build(
+        keys: Vec<u64>,
+        slots: Vec<u32>,
+        f: impl Fn(usize, &mut [Vec<u32>; 2]) + Sync,
+    ) -> Lists {
+        type Part = (usize, Vec<u32>, Vec<[u16; 2]>, Vec<u32>);
+        let parts: std::sync::Mutex<Vec<Part>> = std::sync::Mutex::new(vec![]);
+        crate::par::for_chunks(keys.len(), 1 << 14, |r| {
+            let (mut off, mut n, mut pairs) = (vec![], vec![], vec![]);
+            let mut out: [Vec<u32>; 2] = [vec![], vec![]];
+            for i in r.clone() {
+                out[0].clear();
+                out[1].clear();
+                f(i, &mut out);
+                off.push(pairs.len() as u32);
+                let mut c = [0u16; 2];
+                for (p, v) in out.iter_mut().enumerate() {
+                    v.sort_unstable();
+                    v.dedup();
+                    c[p] = v.len() as u16;
+                    pairs.extend_from_slice(v);
+                }
+                n.push(c);
+            }
+            parts.lock().unwrap().push((r.start, off, n, pairs));
+        });
+        let mut parts = parts.into_inner().unwrap();
+        parts.sort_by_key(|p| p.0);
+        let mut l = Lists {
+            off: Vec::with_capacity(keys.len()),
+            n: Vec::with_capacity(keys.len()),
+            pairs: Vec::with_capacity(parts.iter().map(|p| p.3.len()).sum()),
+            keys,
+            slots,
+        };
+        for (_, off, n, pairs) in parts {
+            let base = l.pairs.len() as u32;
+            l.off.extend(off.iter().map(|&o| o + base));
+            l.n.extend(n);
+            l.pairs.extend(pairs);
+        }
+        l
+    }
+}
+
 impl WingPaths {
     /// The key of a centre state with U/D and R/L colour masks `ud` and `rl` (either two of
     /// the three colour-pair masks): the two smallest of the three masks. Staging distances
@@ -147,8 +211,8 @@ impl WingPaths {
     /// the slack-1 paths of every state up to distance `smax` (<= `kmax`), for `frames`.
     pub fn new(frames: &[Frame; 3], kmax: u8, smax: u8) -> WingPaths {
         assert!((1..=7).contains(&kmax) && smax <= kmax);
-        // States per distance (see the module documentation; 7: an estimate).
-        // (Unlabelled colour pairs: about a sixth of the U/D x R/L mask pairs.)
+        // States per distance (unlabelled colour pairs: about a sixth of the U/D x R/L mask
+        // pairs; 7: an estimate).
         const COUNT: [usize; 8] = [1, 3, 54, 717, 8955, 116_301, 1_506_114, 19_200_000];
         let total: usize = COUNT[..=kmax as usize].iter().sum();
         let bits = (total * 3 / 2).next_power_of_two().trailing_zeros().max(4);
@@ -186,7 +250,7 @@ impl WingPaths {
         };
         // A list's pairs under a move: their preimages, the parity flipped by a wide quarter
         // turn.
-        let extend = |out: &mut [Vec<u32>; 2], l: &[Vec<u32>; 2], m: usize| {
+        let extend = |out: &mut [Vec<u32>; 2], l: [&[u32]; 2], m: usize| {
             let flip = (WIDE_QUARTER >> m & 1) as usize;
             for (p, lp) in l.iter().enumerate() {
                 out[p ^ flip].extend(
@@ -195,95 +259,96 @@ impl WingPaths {
                 );
             }
         };
-        let finish = |mut l: [Vec<u32>; 2]| {
-            for v in l.iter_mut() {
-                v.sort_unstable();
-                v.dedup();
-                v.shrink_to_fit();
-            }
-            l
-        };
-        // Per distance, the states' keys (in the order found) and pair lists (tight, slack
-        // 1). While building, a slot's `off` holds its state's distance and `n` its index.
-        let ax = Staging::axis_masks();
         let low: Vec<u32> = frames
             .iter()
             .map(|f| f.low_slots.iter().fold(0, |a, &s| a | 1 << s))
             .collect();
-        let mut keys: Vec<Vec<u64>> = vec![vec![]];
-        let mut tight: Vec<Vec<[Vec<u32>; 2]>> = vec![vec![]];
-        let set = |w: &mut WingPaths, key: u64, k: u32, i: usize| {
-            let h = w.find(key);
-            w.slots[h] = Slot {
-                key,
-                off: k,
-                n: [i as u16, (i >> 16) as u16],
-            };
-        };
-        let key = Self::key(ax[0], ax[1]);
-        set(&mut w, key, 0, 0);
-        keys[0].push(key);
-        tight[0].push([(0..3).map(|f| low[f] | (f as u32) << 24).collect(), vec![]]);
-        // (distance, index) of a state in the table.
+        // While building, a slot's `off` holds its state's distance and `n` its index there.
         let at = |w: &WingPaths, key: u64| -> Option<(u32, usize)> {
             let s = &w.slots[w.find(key)];
             (s.key != 0).then(|| (s.off, s.n[0] as usize | (s.n[1] as usize) << 16))
         };
+        let ax = Staging::axis_masks();
+        let key0 = Self::key(ax[0], ax[1]);
+        let h0 = w.find(key0);
+        w.slots[h0] = Slot {
+            key: key0,
+            off: 0,
+            n: [0; 2],
+        };
+        let mut tight = vec![Lists {
+            keys: vec![key0],
+            slots: vec![h0 as u32],
+            off: vec![0],
+            n: vec![[3, 0]],
+            pairs: (0..3).map(|f| low[f] | (f as u32) << 24).collect(),
+        }];
         for k in 1..=kmax as u32 {
-            // (state's index, child's index, the state's move to the child, or N_MOVES if
-            // it cannot be a staging path's move: the last move is a wide quarter turn).
-            let mut links: Vec<(u32, u32, u8)> = vec![];
-            let mut found: Vec<u64> = vec![];
-            for (ci, &c) in keys[k as usize - 1].iter().enumerate() {
+            // The states at distance k (found from those at k - 1), and their links: the
+            // state's index << 27 | the child's index << 5 | the state's move to the child,
+            // or N_MOVES if it cannot be a staging path's move (the last move is a wide
+            // quarter turn).
+            let prev = &tight[k as usize - 1];
+            assert!(prev.keys.len() < 1 << 22);
+            let mut links: Vec<u64> = vec![];
+            let (mut keys, mut slots) = (vec![], vec![]);
+            for (ci, &c) in prev.keys.iter().enumerate() {
                 for m in 0..N_MOVES {
                     let key = apply(c, m);
-                    let i = match at(&w, key) {
-                        None => {
-                            set(&mut w, key, k, found.len());
-                            found.push(key);
-                            found.len() - 1
-                        }
-                        Some((d, i)) if d == k => i,
-                        _ => continue,
+                    let h = w.find(key);
+                    let s = &mut w.slots[h];
+                    let i = if s.key == 0 {
+                        let i = keys.len();
+                        *s = Slot {
+                            key,
+                            off: k,
+                            n: [i as u16, (i >> 16) as u16],
+                        };
+                        keys.push(key);
+                        slots.push(h as u32);
+                        i
+                    } else if s.off == k {
+                        s.n[0] as usize | (s.n[1] as usize) << 16
+                    } else {
+                        continue;
                     };
                     let mi = inverse_move(m);
-                    let ok = k > 1 || WIDE_QUARTER >> mi & 1 == 1;
-                    links.push((
-                        i as u32,
-                        ci as u32,
-                        if ok { mi as u8 } else { N_MOVES as u8 },
-                    ));
+                    let mi = if k > 1 || WIDE_QUARTER >> mi & 1 == 1 {
+                        mi
+                    } else {
+                        N_MOVES
+                    };
+                    links.push((i as u64) << 27 | (ci as u64) << 5 | mi as u64);
                 }
             }
-            let states: usize = keys.iter().map(|v| v.len()).sum::<usize>() + found.len();
+            let states: usize = tight.iter().map(|l| l.keys.len()).sum::<usize>() + keys.len();
             assert!(states * 10 < w.slots.len() * 9, "wing-path table too full");
             links.sort_unstable();
-            let prev = &tight[k as usize - 1];
-            let mut cur: Vec<[Vec<u32>; 2]> = Vec::with_capacity(found.len());
-            let mut j = 0;
-            for i in 0..found.len() {
-                let mut out: [Vec<u32>; 2] = [vec![], vec![]];
-                while j < links.len() && links[j].0 == i as u32 {
-                    let (_, ci, mi) = links[j];
-                    j += 1;
-                    if (mi as usize) < N_MOVES {
-                        extend(&mut out, &prev[ci as usize], mi as usize);
+            let mut first = vec![0u32; keys.len() + 1];
+            for &l in &links {
+                first[(l >> 27) as usize + 1] += 1;
+            }
+            for i in 0..keys.len() {
+                first[i + 1] += first[i];
+            }
+            let lists = Lists::build(keys, slots, |i, out| {
+                for &l in &links[first[i] as usize..first[i + 1] as usize] {
+                    let (ci, mi) = ((l >> 5) as usize & ((1 << 22) - 1), (l & 31) as usize);
+                    if mi < N_MOVES {
+                        extend(out, prev.list(ci), mi);
                     }
                 }
-                cur.push(finish(out));
-            }
-            keys.push(found);
-            tight.push(cur);
+            });
+            tight.push(lists);
         }
         // Slack-1 lists: from a staged state, one outer quarter turn of the frame's special
         // axis (the moves that keep the centres staged and are not phase-2 moves in the
         // frame); from distance k >= 1, a decreasing move to a slack-1 list or a keeping move
         // to a tight one.
-        let mut slack: Vec<Vec<[Vec<u32>; 2]>> = vec![];
+        let mut slack: Vec<Lists> = vec![];
         for k in 0..=smax as usize {
-            let mut cur = vec![];
-            for &x in &keys[k] {
-                let mut out: [Vec<u32>; 2] = [vec![], vec![]];
+            let l = &tight[k];
+            let lists = Lists::build(l.keys.clone(), vec![], |i, out| {
                 if k == 0 {
                     for (f, fr) in frames.iter().enumerate() {
                         for m in 0..18 {
@@ -292,39 +357,57 @@ impl WingPaths {
                             }
                         }
                     }
-                } else {
-                    for m in 0..N_MOVES {
-                        match at(&w, apply(x, m)) {
-                            Some((d, i)) if d as usize + 1 == k => {
-                                extend(&mut out, &slack[k - 1][i], m)
-                            }
-                            Some((d, i)) if d as usize == k => extend(&mut out, &tight[k][i], m),
-                            _ => {}
-                        }
+                    return;
+                }
+                for m in 0..N_MOVES {
+                    match at(&w, apply(l.keys[i], m)) {
+                        Some((d, j)) if d as usize + 1 == k => extend(out, slack[k - 1].list(j), m),
+                        Some((d, j)) if d as usize == k => extend(out, tight[k].list(j), m),
+                        _ => {}
                     }
                 }
-                cur.push(finish(out));
-            }
-            slack.push(cur);
+            });
+            slack.push(lists);
         }
         // The pairs of a state: tight even, tight odd, and (up to `smax`) a header (the
-        // slack-1 counts, even | odd << 16), slack-1 even, slack-1 odd.
-        for (k, ks) in keys.iter().enumerate() {
-            for (i, &key) in ks.iter().enumerate() {
-                let off = w.pairs.len() as u32;
-                let t = &tight[k][i];
-                w.pairs.extend_from_slice(&t[0]);
-                w.pairs.extend_from_slice(&t[1]);
-                if k <= smax as usize {
-                    let sl = &slack[k][i];
-                    w.pairs
-                        .push(sl[0].len() as u32 | (sl[1].len() as u32) << 16);
-                    w.pairs.extend_from_slice(&sl[0]);
-                    w.pairs.extend_from_slice(&sl[1]);
-                }
-                let h = w.find(key);
-                w.slots[h].off = off;
-                w.slots[h].n = [t[0].len() as u16, t[1].len() as u16];
+        // slack-1 counts, even | odd << 16), slack-1 even, slack-1 odd. The largest distance
+        // without slack-1 lists comes first, as built.
+        let last = tight.len() - 1;
+        let mut order: Vec<usize> = (0..tight.len()).collect();
+        if last > smax as usize {
+            order.rotate_right(1);
+            w.pairs = std::mem::take(&mut tight[last].pairs);
+            w.pairs.reserve(
+                tight[..last].iter().map(|l| l.pairs.len()).sum::<usize>()
+                    + slack
+                        .iter()
+                        .map(|l| l.pairs.len() + l.keys.len())
+                        .sum::<usize>(),
+            );
+        }
+        for k in order {
+            let l = &tight[k];
+            for i in 0..l.keys.len() {
+                let off = if k == last && last > smax as usize {
+                    l.off[i]
+                } else {
+                    let off = w.pairs.len() as u32;
+                    let [e, o] = l.list(i);
+                    w.pairs.extend_from_slice(e);
+                    w.pairs.extend_from_slice(o);
+                    if k <= smax as usize {
+                        let sl = &slack[k];
+                        let [e, o] = sl.list(i);
+                        w.pairs.push(e.len() as u32 | (o.len() as u32) << 16);
+                        w.pairs.extend_from_slice(e);
+                        w.pairs.extend_from_slice(o);
+                    }
+                    off
+                };
+                let s = &mut w.slots[l.slots[i] as usize];
+                debug_assert_eq!(s.key, l.keys[i]);
+                s.off = off;
+                s.n = l.n[i];
             }
         }
         w.pairs.shrink_to_fit();
