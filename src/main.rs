@@ -63,9 +63,10 @@ struct InputArgs {
 #[derive(Args, Clone)]
 #[command(next_help_heading = "Limits")]
 struct LimitArgs {
-    /// Search for at most this many seconds per position.
-    #[arg(short = 't', long, value_name = "SECONDS", default_value_t = 5.0)]
-    time: f64,
+    /// Search for at most this many seconds per position (default: `solve` runs until it is
+    /// stopped or `-l` is reached, printing each improvement; `bench` 5 seconds).
+    #[arg(short = 't', long, value_name = "SECONDS")]
+    time: Option<f64>,
     /// Stop as soon as a solution of at most this many moves is found.
     #[arg(short = 'l', long, value_name = "MOVES")]
     max_length: Option<usize>,
@@ -432,9 +433,15 @@ fn setup_threads(j: Option<usize>) -> usize {
     eggg_solver::par::threads()
 }
 
+/// No time limit: about a century.
+const FOREVER: Duration = Duration::from_secs(100 * 365 * 86_400);
+
+/// The default time limit of `bench`, in seconds.
+const BENCH_TIME: f64 = 5.0;
+
 fn options(limits: &LimitArgs, search: &SearchArgs, threads: usize) -> Options {
     Options {
-        time_limit: Duration::from_secs_f64(limits.time),
+        time_limit: limits.time.map_or(FOREVER, Duration::from_secs_f64),
         target_length: limits.max_length,
         hard_limit: limits.hard_limit.map(Duration::from_secs_f64),
         threads,
@@ -526,17 +533,18 @@ fn cmd_gen(a: GenArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_bench(a: BenchArgs) -> Result<(), String> {
+fn cmd_bench(mut a: BenchArgs) -> Result<(), String> {
     let threads = setup_threads(a.search.threads);
     let tables = a.tables.load(threads, true);
+    let time = *a.limits.time.get_or_insert(BENCH_TIME);
     let mut opts = options(&a.limits, &a.search, threads);
     opts.hard_limit
-        .get_or_insert(Duration::from_secs_f64(a.limits.time * 4.0));
+        .get_or_insert(Duration::from_secs_f64(time * 4.0));
     let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(a.seed);
     let checkpoints = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0];
     let checkpoints: Vec<f64> = checkpoints
         .into_iter()
-        .filter(|&c| c <= a.limits.time + 1e-9)
+        .filter(|&c| c <= time + 1e-9)
         .collect();
     let mut rows = vec![];
     for i in 0..a.count {
@@ -569,7 +577,7 @@ fn cmd_bench(a: BenchArgs) -> Result<(), String> {
         "positions: {}  threads: {}  time limit: {} s",
         rows.len(),
         threads,
-        a.limits.time
+        time
     );
     let at = |h: &Vec<(f64, usize)>, t: f64| h.iter().filter(|x| x.0 <= t).map(|x| x.1).min();
     for &c in &checkpoints {
@@ -651,7 +659,7 @@ fn cmd_bench(a: BenchArgs) -> Result<(), String> {
         }
         s.push_str(&format!(
             "],\"threads\":{},\"time\":{},\"seed\":{}}}",
-            threads, a.limits.time, a.seed
+            threads, time, a.seed
         ));
         std::fs::write(path, s).map_err(|e| e.to_string())?;
     }

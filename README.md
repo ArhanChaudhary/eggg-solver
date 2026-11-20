@@ -14,8 +14,9 @@ target/release/eggg-solver solve "Rw U2 x Rw2 F' Bw D Lw' 2R B2 u'" -t 5
 target/release/eggg-solver solve UUUU...BBBB
 # SiGN output, all cores, stop at the first solution of at most 40 moves:
 target/release/eggg-solver solve "..." -n sign -l 40
-# Ten random positions, solutions only (scrambles can also come one per line on stdin):
-target/release/eggg-solver solve --random 10 -q
+# Ten random positions, 5 seconds each, solutions only (scrambles can also come one per
+# line on stdin):
+target/release/eggg-solver solve --random 10 -t 5 -q
 # Also print every other solution as short as the best so far (equally short alternatives):
 target/release/eggg-solver solve "..." -t 30 --ties
 # Generate the tables up front, or benchmark:
@@ -24,7 +25,8 @@ target/release/eggg-solver bench -N 10 -t 5
 ```
 
 Each improvement is printed as it is found (`time, length, phase lengths, moves`), then the
-best solution. With `--ties`, solutions as long as the best so far are printed too (one per
+best solution. Without `-t`, `solve` searches until it is stopped (Ctrl-C) or `-l` is reached;
+`bench` defaults to 5 seconds per position. With `--ties`, solutions as long as the best so far are printed too (one per
 reduction, each move sequence once; phase 3 then also searches the best length, so they
 mostly appear in longer runs). The time limit is soft until a first solution exists (`--hard-limit` to cap it).
 
