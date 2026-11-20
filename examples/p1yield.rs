@@ -1,12 +1,15 @@
 //! Phase-1 job yields at a fine granularity, for job-ordering studies (opt/p1-order2).
 //!
 //! For the bench positions of seed SEED (POS: comma-separated 0-based indices, default the
-//! first CUBES) and the phase-1 lengths LENS, every job the driver makes at that length (a
+//! first CUBES) and the phase-1 lengths LENS (with REL=1, offsets from the cube's staging
+//! distance), every job the driver makes at that length (a
 //! 3-move prefix over all pairs, kept while its staging distance allows the length) whose
 //! prefix is sampled (1 in FRAC, by a hash of the prefix: the same prefixes at every length
 //! and cube) is searched as the driver's `p1_run` does (its two levels below the prefix
 //! expanded here), each 5-move sub-prefix by its own `Search1`. Each endpoint's candidates
 //! (frames with L1 + h2 <= LIMIT + 2) get their exact phase-2 bound h2.
+//!
+//! MAXN: a cube's lengths stop after the first whose nodes (times FRAC) exceed MAXN.
 //!
 //! Output (OUT, binary, 32-byte little-endian records), one per (cube, length, prefix):
 //! u8 cube, u8 len, u8 prefix length (3: the job's own expansion nodes; 5: a sub-prefix),
@@ -87,7 +90,10 @@ fn main() {
         .split(',')
         .map(|x| x.parse().unwrap())
         .collect();
+    // REL=1: LENS are offsets from each cube's staging distance.
+    let rel = env("REL", 0u8) == 1;
     let frac: u64 = env("FRAC", 8);
+    let maxn: f64 = env("MAXN", f64::INFINITY);
     let threads: usize = env("THREADS", 8);
     let limit: usize = env("LIMIT", 26);
     let out_path = std::env::var("OUT").unwrap_or("p1yield.bin".into());
@@ -115,7 +121,8 @@ fn main() {
         let cube = all[ci];
         let root = P1State::from_cube(&cube);
         let d0 = p1.distance(&root);
-        for &len in &lens {
+        for &l in &lens {
+            let len = if rel { d0 + l } else { l };
             let t0 = std::time::Instant::now();
             // The driver's jobs at this length (`Run::level_jobs`), sampled.
             let mut items = vec![];
@@ -249,6 +256,10 @@ fn main() {
                 t0.elapsed().as_secs_f64()
             );
             std::io::stdout().flush().unwrap();
+            // MAXN: a cube's lengths stop after the first whose nodes (scaled by FRAC) exceed it.
+            if tn as f64 * frac as f64 > maxn {
+                break;
+            }
         }
     }
 }

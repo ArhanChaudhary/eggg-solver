@@ -616,6 +616,22 @@ impl<'a> Solver<'a> {
                     *h12.entry(r.moves12.len()).or_insert(0usize) += 1;
                 }
                 eprintln!("candidates by (L1, L1+h2): {h1:?}");
+                // Per (L1, L1 + h2): candidates whose phase 2 has searched every level up to
+                // the cap (best - DEEPEST_MARGIN), of all.
+                let cap = run.useful_l12();
+                let mut hd = std::collections::BTreeMap::new();
+                for c in &run.cands {
+                    let l1 = c.moves1.len();
+                    let e = hd
+                        .entry((l1, l1 + c.h2 as usize))
+                        .or_insert((0usize, 0usize));
+                    e.0 += (l1 + c.done2 as usize > cap) as usize;
+                    e.1 += 1;
+                }
+                eprintln!("searched to the cap {cap} (done, of): {hd:?}");
+                if let Some(b) = &run.best {
+                    eprintln!("best: {} moves, phases {:?}", b.len(), b.phases);
+                }
                 eprintln!("reductions by L12: {h12:?}");
             }
             done.store(true, Ordering::Relaxed);
