@@ -1299,7 +1299,27 @@ pub fn load_pat(
 /// one (`big`, 18.9 GB; needs the large staging table) or the reduced one (1.6 GB).
 pub fn load_mask(p1: &mut P1Tables, dir: &std::path::Path, big: bool, verbose: bool) {
     p1.mask = Some(crate::p1mask::load(dir, p1, big, verbose));
+    // The wing-path lookahead for the batched tight nodes (`EGGG_P1_WINGK`: its largest
+    // distance, default [`WINGK`]; 0: none).
+    let k = std::env::var("EGGG_P1_WINGK")
+        .ok()
+        .map_or(WINGK, |v| v.parse().expect("EGGG_P1_WINGK"));
+    if k > 0 {
+        let t0 = Instant::now();
+        let w = crate::wingpath::WingPaths::new(&p1.frames, k);
+        if verbose {
+            eprintln!(
+                "wing-path table (distance <= {k}): {:.1} MB, {:.2} s",
+                w.bytes() as f64 / 1e6,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        p1.wingk = Some(Box::new(w));
+    }
 }
+
+/// The default largest distance of the wing-path lookahead (see [`crate::wingpath`]).
+pub const WINGK: u8 = 5;
 
 /// Load or build the phase-2 tables in `dir`; `joint`: also the joint table (1.05 GB).
 pub fn load_p2(dir: &std::path::Path, joint: bool, threads: usize, verbose: bool) -> P2Tables {

@@ -808,6 +808,9 @@ pub struct P1Tables {
     pub mask: Option<crate::p1mask::MaskTable>,
     /// The wing lookahead of the batched nodes two moves from the end (see [`crate::wing2`]).
     pub wing2: Box<crate::wing2::Wing2>,
+    /// The wing lookahead along the staging paths of tight nodes (see [`crate::wingpath`]),
+    /// for the batched nodes at most its `kmax` moves from the end.
+    pub wingk: Option<Box<crate::wingpath::WingPaths>>,
 }
 
 /// [`Search1::pair`] for the search over all pairs, pruned by the staging table only.
@@ -860,6 +863,7 @@ impl P1Tables {
             pat: None,
             mask: None,
             wing2,
+            wingk: None,
         }
     }
 
@@ -1153,7 +1157,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     /// queued, distance `d`) of batch node `nd`.
     #[inline(always)]
     fn push_child(&mut self, nd: &BNode, c: &P1State, idx: impl FnOnce() -> u64, m: usize, d: u8) {
-        if !self.wings_possible(c, nd.left - 1, d) {
+        if !self.child_possible(c, nd.left - 1, d) {
             return;
         }
         let idx = idx();
@@ -1181,6 +1185,23 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     #[inline(always)]
     fn wings_possible(&self, s: &P1State, left: u8, d: u8) -> bool {
         left != 2 || self.pair != ALL_PAIRS || self.t.wing2.possible(&s.pos, s.parity, d == 2)
+    }
+
+    /// Can a batch node's child (state `c`, `left` moves left, staging distance `d`) still
+    /// reach an endpoint as far as its wings tell? A tight child (`d` = `left`) at most the
+    /// wing-path table's `kmax` moves from the end gets its test (see [`crate::wingpath`]),
+    /// stronger than [`Search1::wings_possible`]; others that one.
+    #[inline(always)]
+    fn child_possible(&self, c: &P1State, left: u8, d: u8) -> bool {
+        if d == left
+            && self.pair == ALL_PAIRS
+            && let Some(w) = self.t.wingk.as_deref()
+            && left <= w.kmax
+        {
+            let (ud, rl) = c.masks();
+            return w.possible(ud, rl, &c.pos, c.parity);
+        }
+        self.wings_possible(c, left, d)
     }
 
     /// Set `self.path` to the path of batch node `id` (see [`Search1::batch_tree`]).
@@ -2022,6 +2043,59 @@ mod tests {
 
     /// [`P1Tables::staged_after`] agrees with the definition (and with the staging table's
     /// goal, distance 0, where the large table is in ./tables).
+    /// The masked search over all pairs finds the same endpoints, in the same order, with and
+    /// without the wing-path lookahead (largest distance 3 to 5), on random roots and on roots
+    /// a few moves from endpoints, at their distance and up to 3 moves more (needs the reduced
+    /// mask table in ./tables, loaded or made; the small staging table likewise).
+    #[test]
+    fn wing_paths_keep_the_endpoints() {
+        let dir = std::path::Path::new("tables");
+        let mut t = crate::solver::load_p1(dir, false, 8, false);
+        t.mask = Some(crate::p1mask::load(dir, &t, false, false));
+        let mut ws: Vec<_> = (3..=5)
+            .map(|k| Some(Box::new(crate::wingpath::WingPaths::new(&t.frames, k))))
+            .collect();
+        let run = |t: &P1Tables, root: &P1State, len: u8| {
+            let mut found = vec![];
+            let mut s = Search1::new(t, |p: &[u8], f| {
+                found.push((p.to_vec(), f));
+                true
+            });
+            s.dfs(root, t.distance(root), len, N_MOVES);
+            let nodes = s.nodes;
+            drop(s);
+            (found, nodes)
+        };
+        let mut rng = <rand_xoshiro::Xoshiro256PlusPlus as rand::SeedableRng>::seed_from_u64(5);
+        let mut found = 0;
+        for i in 0..8 {
+            let root = if i < 4 {
+                P1State::from_cube(&Cube::random(&mut rng))
+            } else {
+                // An endpoint (solved cube) undone by 8 random moves.
+                let mut s = P1State::from_cube(&Cube::SOLVED);
+                for _ in 0..8 {
+                    s = s.apply(rand::Rng::gen_range(&mut rng, 0..N_MOVES), &t);
+                }
+                s
+            };
+            let d0 = t.distance(&root);
+            for len in d0..=d0 + 3 {
+                t.wingk = None;
+                let (want, nodes) = run(&t, &root, len);
+                found += want.len();
+                for w in ws.iter_mut() {
+                    std::mem::swap(&mut t.wingk, w);
+                    let (got, n) = run(&t, &root, len);
+                    std::mem::swap(&mut t.wingk, w);
+                    assert_eq!(got, want, "root {i} len {len}");
+                    assert!(n <= nodes);
+                }
+            }
+        }
+        assert!(found > 0);
+    }
+
     #[test]
     fn staged_after_matches_definition() {
         let t = P1Tables::with_table(Staging::new(), Mod3Table::from_depths(&[0]));
