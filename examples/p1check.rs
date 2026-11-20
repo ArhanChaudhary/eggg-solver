@@ -11,6 +11,9 @@ use rand::SeedableRng;
 use std::hash::{Hash, Hasher};
 use std::time::Instant;
 
+#[path = "common/perfc.rs"]
+mod perf;
+
 fn main() {
     let mask = std::env::var("EGGG_P1_MASK").ok();
     let big = std::env::var_os("EGGG_P1_BIG").is_some() || mask.as_deref() == Some("big");
@@ -27,6 +30,14 @@ fn main() {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let (mut nodes, mut reads, mut eps) = (0u64, 0u64, 0usize);
     let mut prof = [0u64; 48];
+    let (ins, cyc) = (
+        perf::Counter::new("instructions"),
+        perf::Counter::new("cycles"),
+    );
+    if let (Some(i), Some(c)) = (&ins, &cyc) {
+        i.start();
+        c.start();
+    }
     let t0 = Instant::now();
     for _ in 0..cubes {
         let cube = Cube::random(&mut rng);
@@ -48,11 +59,22 @@ fn main() {
             found.hash(&mut h);
         }
     }
+    let dt = t0.elapsed().as_secs_f64();
+    let (ni, nc) = match (&ins, &cyc) {
+        (Some(i), Some(c)) => (i.stop(), c.stop()),
+        _ => (0, 0),
+    };
     println!(
-        "endpoints {eps}, hash {:016x}, nodes {nodes}, reads {reads}, {:.3} s",
+        "endpoints {eps}, hash {:016x}, nodes {nodes}, reads {reads}, {dt:.3} s",
         h.finish(),
-        t0.elapsed().as_secs_f64()
     );
+    if ni > 0 {
+        println!(
+            "user instructions {ni} ({:.2}/node), cycles {nc}, IPC {:.2}",
+            ni as f64 / nodes as f64,
+            ni as f64 / nc.max(1) as f64
+        );
+    }
     #[cfg(feature = "p1prof")]
     if let Ok(path) = std::env::var("EGGG_W2_FILE") {
         // The captured lookahead inputs: 24 slot bytes, then odd | tight << 1.

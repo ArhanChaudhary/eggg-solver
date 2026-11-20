@@ -8,36 +8,8 @@ use eggg_solver::simd::V32;
 use eggg_solver::table::Mod3Table;
 use std::time::Instant;
 
-mod perf {
-    /// A user-space hardware counter (perf_event_open), if available.
-    pub struct Counter(i32);
-    impl Counter {
-        pub fn new(config: u64) -> Option<Counter> {
-            let mut attr = [0u64; 16];
-            attr[0] = 128 << 32; // type PERF_TYPE_HARDWARE (0), size 128
-            attr[1] = config;
-            attr[5] = 1 | 1 << 5 | 1 << 6; // disabled, exclude_kernel, exclude_hv
-            let fd =
-                unsafe { libc::syscall(libc::SYS_perf_event_open, attr.as_ptr(), 0, -1, -1, 0u64) }
-                    as i32;
-            (fd >= 0).then_some(Counter(fd))
-        }
-        pub fn start(&self) {
-            unsafe {
-                libc::ioctl(self.0, 0x2403, 0); // reset
-                libc::ioctl(self.0, 0x2400, 0); // enable
-            }
-        }
-        pub fn stop(&self) -> u64 {
-            let mut v = 0u64;
-            unsafe {
-                libc::ioctl(self.0, 0x2401, 0);
-                libc::read(self.0, &mut v as *mut u64 as *mut libc::c_void, 8);
-            }
-            v
-        }
-    }
-}
+#[path = "common/perfc.rs"]
+mod perf;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -60,7 +32,10 @@ fn main() {
         .map(|(p, o, ti)| w.possible(p, *o, *ti))
         .collect();
     println!("pass {}", want.iter().filter(|&&x| x).count());
-    let (ins, cyc) = (perf::Counter::new(1), perf::Counter::new(0));
+    let (ins, cyc) = (
+        perf::Counter::new("instructions"),
+        perf::Counter::new("cycles"),
+    );
     let run = |name: &str, f: &mut dyn FnMut() -> Vec<bool>| {
         let mut best = (f64::MAX, 0u64, 0u64);
         for _ in 0..reps {
