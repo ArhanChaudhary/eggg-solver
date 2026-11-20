@@ -43,14 +43,19 @@ const N36: usize = 36;
 const MASK36: u64 = (1 << N36) - 1;
 /// The first of a reduced entry's two viability bits (see [`MaskTable::add_viable`]).
 const VIABLE_SHIFT: u32 = 36;
-/// A reduced entry's successors (see [`MaskTable::add_succ`]): at most [`SUCC_MAX`], of
-/// [`SUCC_BITS`] bits each, the first two from bit [`SUCC_SHIFT0`] of the entry's first word
-/// (above the viability bits), the others from bit 36 of its second word (above the equal
-/// moves' mask); bit [`SUCC_FLAG`] of the second word is set where they are stored.
+/// A reduced entry's successors (see [`MaskTable::add_succ`]), [`SUCC_BITS`] bits each: the
+/// first two from bit [`SUCC_SHIFT0`] of the entry's first word (above the viability bits),
+/// the next two from bit 36 of its second word (above the equal moves' mask), and in the
+/// wide table's entries four more in each of their two extra words. Bit [`SUCC_FLAG`] of the
+/// second word is set where they are stored, and bit [`SUCC_EQ`] where they are those of the
+/// decreasing and the equal moves (else of the decreasing moves only).
 const SUCC_BITS: u32 = 13;
-const SUCC_MAX: u32 = 4;
 const SUCC_SHIFT0: u32 = 38;
 const SUCC_FLAG: u32 = 62;
+const SUCC_EQ: u32 = 63;
+/// The most successors of an entry: of the reduced table (16 bytes), of the wide one (32).
+const SUCC_MAX: u32 = 4;
+const SUCC_MAX_WIDE: u32 = 12;
 /// Marks a batch node whose reduced index is not resolved yet (see `MaskTable::resolve`).
 pub const UNRESOLVED: u8 = 0xff;
 /// The wide quarter turns among the 36 moves: Uw, Rw, Fw, Dw, Lw, Bw and their inverses (the
@@ -89,8 +94,11 @@ pub struct MaskTable {
     pub slack_batch: u8,
     big: HugeBuf<u32>,
     /// The reduced table's entries: the decreasing moves' 36-bit mask with the viability bits
-    /// above it, and the equal moves' mask (16 bytes, aligned: one cache line).
+    /// above it, and the equal moves' mask (16 bytes, aligned: one cache line); in the wide
+    /// table, each followed by 16 bytes of further successors.
     red: HugeBuf<[u64; 2]>,
+    /// log2 of the 16-byte units per entry of `red` (1: the wide table).
+    shift: u32,
     /// The pair table: 5 bytes per entry (and 3 bytes of padding).
     pair: HugeBuf<u8>,
     /// The pair table's entries are computed when read, from the pattern table (tests).
@@ -113,12 +121,15 @@ pub struct MaskTable {
 /// A batch node's successors (see [`MaskTable::succ`]).
 #[derive(Clone, Copy)]
 pub struct Succ {
-    /// The entry's first word (the decreasing moves' mask).
-    w0: u64,
-    /// The successors, [`SUCC_BITS`] bits each, in the order of their moves.
-    ch: u64,
+    /// The moves (of the 36) whose successors are stored: the decreasing ones, and the equal
+    /// ones if `eq`.
+    list: u64,
+    /// The successors in the order of their moves, four per word ([`SUCC_BITS`] each).
+    ch: [u64; 3],
     /// The node's class times 36: its row of `succ_class`.
     row: usize,
+    /// The equal moves' successors are stored too.
+    pub eq: bool,
 }
 
 /// Centre gathers (positions 24.. fixed) of the 36 outer block moves.
@@ -200,6 +211,7 @@ impl MaskTable {
                 .unwrap_or(SLACK_BATCH),
             big: HugeBuf::zeroed(1),
             red: HugeBuf::zeroed(1),
+            shift: 0,
             pair: HugeBuf::zeroed(1),
             lazy: false,
             conj: vec![],
@@ -353,10 +365,16 @@ impl MaskTable {
         (j, info as u8)
     }
 
+    /// The reduced table's entry `i` (its first 16 bytes).
+    #[inline(always)]
+    fn ent(&self, i: u64) -> [u64; 2] {
+        self.red[(i as usize) << self.shift]
+    }
+
     /// Prefetch the reduced table's entry `j`.
     #[inline(always)]
     pub fn prefetch_entry(&self, j: u64) {
-        crate::table::prefetch(unsafe { self.red.as_ptr().add(j as usize) });
+        crate::table::prefetch(unsafe { self.red.as_ptr().add((j as usize) << self.shift) });
     }
 
     /// The successors of the node with reduced index `i`, if its entry holds them (reduced
@@ -366,38 +384,50 @@ impl MaskTable {
         if !self.use_succ {
             return None;
         }
-        Self::succ_of(self.red[i as usize], i)
+        let ext = if self.shift == 1 {
+            self.red[2 * i as usize + 1]
+        } else {
+            [0; 2]
+        };
+        Self::succ_of(self.ent(i), ext, i)
     }
 
-    /// [`MaskTable::succ`] of entry `i` holding `e`.
+    /// [`MaskTable::succ`] of entry `i` holding `e` (and in the wide table `ext`).
     #[inline(always)]
-    fn succ_of(e: [u64; 2], i: u64) -> Option<Succ> {
+    fn succ_of(e: [u64; 2], ext: [u64; 2], i: u64) -> Option<Succ> {
         let [w0, w1] = e;
         if w1 >> SUCC_FLAG & 1 == 0 {
             return None;
         }
         let half = (1u64 << (2 * SUCC_BITS)) - 1;
+        let eq = w1 >> SUCC_EQ & 1 == 1;
         Some(Succ {
-            w0,
-            ch: w0 >> SUCC_SHIFT0 | (w1 >> N36 & half) << (2 * SUCC_BITS),
+            list: (w0 | if eq { w1 } else { 0 }) & MASK36,
+            ch: [
+                w0 >> SUCC_SHIFT0 | (w1 >> N36 & half) << (2 * SUCC_BITS),
+                ext[0],
+                ext[1],
+            ],
             row: (i / N_SPLIT as u64) as usize * N36,
+            eq,
         })
     }
 
-    /// The reduced index and symmetry of the child after (searched) move `m`, one of its
-    /// decreasing moves, of the node with symmetry `sym` and successors `sc`: the stored
+    /// The reduced index and symmetry of the child after (searched) move `m`, one of the
+    /// moves whose successors `sc` holds, of the node with symmetry `sym`: the stored
     /// successor of its representative after the conjugate move k, the child's symmetry
     /// that of the successor's class times the node's.
     #[inline(always)]
     pub fn succ_child(&self, sc: &Succ, sym: u8, m: usize) -> (u64, u8) {
         debug_assert!(m < N_MOVES && (sym as usize) < 48);
         // SAFETY: sym < 48 (a resolved node's), m < N_MOVES, k < 36, and so is the info's
-        // symmetry.
+        // symmetry; a slot is below the number of stored successors (at most 12).
         unsafe {
             let k = *self.conj_move.get_unchecked(sym as usize).get_unchecked(m) as u32;
-            debug_assert!(sc.w0 >> k & 1 == 1);
-            let slot = (sc.w0 & ((1u64 << k) - 1)).count_ones();
-            let u = sc.ch >> (SUCC_BITS * slot) & ((1 << SUCC_BITS) - 1);
+            debug_assert!(sc.list >> k & 1 == 1);
+            let slot = (sc.list & ((1u64 << k) - 1)).count_ones();
+            let u = sc.ch.get_unchecked(slot as usize / 4) >> (SUCC_BITS * (slot % 4))
+                & ((1 << SUCC_BITS) - 1);
             let info = *self.succ_class.get_unchecked(sc.row + k as usize);
             let j = (info >> 8) as u64 * N_SPLIT as u64 + u;
             let t = *self
@@ -412,7 +442,7 @@ impl MaskTable {
     /// viability bit (see [`MaskTable::add_viable`]; reduced table only).
     #[inline(always)]
     pub fn viable(&self, i: u64, odd: bool) -> bool {
-        self.red[i as usize][0] >> (VIABLE_SHIFT + odd as u32) & 1 == 1
+        self.ent(i)[0] >> (VIABLE_SHIFT + odd as u32) & 1 == 1
     }
 
     /// The 27-move masks of the moves that decrease and that keep the staging distance, of
@@ -420,7 +450,7 @@ impl MaskTable {
     /// reduced table only).
     #[inline(always)]
     pub fn get_dec_eq(&self, i: u64, sym: u8) -> (u32, u32) {
-        let [d, e] = self.red[i as usize];
+        let [d, e] = self.ent(i);
         let c = unsafe { self.conj.get_unchecked(sym as usize) };
         let f = |x: u64| {
             c[0][(x & 255) as usize]
@@ -449,7 +479,7 @@ impl MaskTable {
                         (self.pair.as_ptr().add(5 * i as usize) as *const u64).read_unaligned()
                     }
                 } else {
-                    self.red[i as usize][0]
+                    self.ent(i)[0]
                 };
                 // (The conjugation lookups of the fifth byte read only its four mask bits,
                 // not the reduced entries' viability bits.)
@@ -623,17 +653,18 @@ impl MaskTable {
         .with_lookups(&t.staging)
     }
 
-    /// Store the successors of the reduced table's entries with at most [`SUCC_MAX`]
-    /// decreasing moves (of the 36) in their spare bits (after [`MaskTable::add_viable`]), and
-    /// return the number of such entries.
+    /// Store the successors of the reduced table's entries in their spare bits (after
+    /// [`MaskTable::add_viable`]): those of the decreasing and equal moves (of the 36) where
+    /// there are at most [`SUCC_MAX`] of them, else of the decreasing moves where there are
+    /// at most [`SUCC_MAX`]. Returns the number of entries with successors.
     ///
     /// The successor after move k of an entry is the reduced index of its representative's
     /// child after k: that child's class (and the symmetry that takes its U/D mask to the
     /// class representative) depends only on the entry's class and k (see `succ_class`), so
-    /// the entry stores only the child's split of the other 16 positions (13 bits; one per
-    /// decreasing move, in move order). In the search, the child after move m of a node with
-    /// symmetry s (which takes the node to its entry's representative, up to swapping the
-    /// R/L and F/B colours, which leaves the masks unchanged) is the image under s^-1 of the
+    /// the entry stores only the child's split of the other 16 positions (13 bits; in the
+    /// order of the moves). In the search, the child after move m of a node with symmetry s
+    /// (which takes the node to its entry's representative, up to swapping the R/L and F/B
+    /// colours, which leaves the masks unchanged) is the image under s^-1 of the
     /// representative's child after the conjugate move pi_s(m), so it takes the successor's
     /// index and the symmetry s' s, s' the successor's class symmetry. Where the successor's
     /// class has a non-trivial stabiliser this may be another stabiliser variant of the index
@@ -643,6 +674,7 @@ impl MaskTable {
     /// info, index or symmetry computation.
     pub fn add_succ(&mut self, st: &Staging) -> u64 {
         use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        assert_eq!(self.shift, 0);
         let n = N_CLASSES_A * N_SPLIT;
         let ptr = self.red.as_mut_slice().as_mut_ptr() as usize;
         let mv = moves36();
@@ -652,25 +684,61 @@ impl MaskTable {
             for i in r {
                 // SAFETY: each entry is written by one thread only, within the buffer.
                 let e = unsafe { &mut *(ptr as *mut [u64; 2]).add(i) };
-                *e = with_succ(st, &mv, i as u64, *e);
+                *e = with_succ(st, &mv, i as u64, *e, SUCC_MAX)[0];
                 local += e[1] >> SUCC_FLAG & 1;
             }
             count.fetch_add(local, Relaxed);
         });
         count.into_inner()
     }
+
+    /// The wide table (32-byte entries: up to [`SUCC_MAX_WIDE`] successors, see
+    /// [`MaskTable::add_succ`]) from the reduced one (its masks and viability bits), and the
+    /// number of entries with successors.
+    pub fn widen(&self, st: &Staging) -> (MaskTable, u64) {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        assert_eq!((self.kind, self.shift), (MaskKind::Reduced, 0));
+        let n = N_CLASSES_A * N_SPLIT;
+        let mut red = HugeBuf::<[u64; 2]>::zeroed(2 * n);
+        let ptr = red.as_mut_slice().as_mut_ptr() as usize;
+        let mv = moves36();
+        let count = AtomicU64::new(0);
+        crate::par::for_chunks(n, 1 << 12, |r| {
+            let mut local = 0;
+            for i in r {
+                let w = with_succ(st, &mv, i as u64, self.red[i], SUCC_MAX_WIDE);
+                local += w[0][1] >> SUCC_FLAG & 1;
+                // SAFETY: each entry is written by one thread only, within the buffer.
+                unsafe { (ptr as *mut [[u64; 2]; 2]).add(i).write(w) };
+            }
+            count.fetch_add(local, Relaxed);
+        });
+        let m = MaskTable {
+            red,
+            shift: 1,
+            ..Self::empty(MaskKind::Reduced)
+        };
+        (m.with_lookups(st), count.into_inner())
+    }
 }
 
-/// Reduced entry `i` (holding `e`: its masks and viability bits) with its successors, if it
-/// has at most [`SUCC_MAX`] decreasing moves (see [`MaskTable::add_succ`]).
-fn with_succ(st: &Staging, mv: &[V32; N36], i: u64, e: [u64; 2]) -> [u64; 2] {
-    let dec = e[0] & MASK36;
-    if dec == 0 || dec.count_ones() > SUCC_MAX {
-        return e;
+/// Reduced entry `i` (`e`: its masks and viability bits; any successors in it are ignored)
+/// with at most `max` successors (see [`MaskTable::add_succ`]), and the further successors
+/// of a wide entry (`max` > 4).
+fn with_succ(st: &Staging, mv: &[V32; N36], i: u64, e: [u64; 2], max: u32) -> [[u64; 2]; 2] {
+    let (dec, eq) = (e[0] & MASK36, e[1] & MASK36);
+    let e = [e[0] & ((1 << SUCC_SHIFT0) - 1), eq];
+    let list = if (dec | eq).count_ones() <= max {
+        dec | eq
+    } else {
+        dec
+    };
+    if dec == 0 || list.count_ones() > max {
+        return [e, [0; 2]];
     }
     let (ud, rl) = st.rep_of(i);
     let flags = flags_of(ud, rl);
-    let (mut ch, mut slot, mut d) = (0u64, 0, dec);
+    let (mut ch, mut slot, mut d) = ([0u64; 3], 0, list);
     while d != 0 {
         let k = d.trailing_zeros() as usize;
         d &= d - 1;
@@ -678,44 +746,104 @@ fn with_succ(st: &Staging, mv: &[V32; N36], i: u64, e: [u64; 2]) -> [u64; 2] {
         let info = unsafe { *st.info(flag_masks(&g).0) };
         let j = st.fast_index_flags(info, &g);
         debug_assert_eq!(j as usize / N_SPLIT, (info >> 8) as usize);
-        ch |= (j % N_SPLIT as u64) << (SUCC_BITS * slot);
+        ch[slot / 4] |= (j % N_SPLIT as u64) << (SUCC_BITS as usize * (slot % 4));
         slot += 1;
     }
     let half = (1u64 << (2 * SUCC_BITS)) - 1;
     [
-        e[0] & ((1 << SUCC_SHIFT0) - 1) | (ch & half) << SUCC_SHIFT0,
-        e[1] & MASK36 | (ch >> (2 * SUCC_BITS)) << N36 | 1 << SUCC_FLAG,
+        [
+            e[0] | (ch[0] & half) << SUCC_SHIFT0,
+            eq | (ch[0] >> (2 * SUCC_BITS)) << N36
+                | 1 << SUCC_FLAG
+                | ((list != dec) as u64) << SUCC_EQ,
+        ],
+        [ch[1], ch[2]],
     ]
 }
 
-/// Load (or generate from the staging table, and save) a mask table in `dir`: the large one
-/// (`big`, 18.9 GB, `p1-mask-big.tab`; from the large staging table) or the reduced one
-/// (1.6 GB, `p1-mask3.tab`, with the successors; from `p1-mask2.tab`, the same without them,
-/// if present, else from either staging table). `EGGG_P1_MASK_VIRTUAL` set: no table, masks
-/// computed when needed (slow; tests).
+/// Which move-mask table to load (see [`load_sel`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MaskSel {
+    /// The reduced table (1.6 GB, with up to 4 successors per entry).
+    Reduced,
+    /// The wide reduced table (3.2 GB, with up to 12 successors per entry).
+    Wide,
+    /// The large table (18.9 GB, no symmetry reduction).
+    Big,
+}
+
+/// [`load_sel`] of the large (`big`) or the reduced table.
 pub fn load(dir: &std::path::Path, t: &P1Tables, big: bool, verbose: bool) -> MaskTable {
+    load_sel(
+        dir,
+        t,
+        if big { MaskSel::Big } else { MaskSel::Reduced },
+        verbose,
+    )
+}
+
+/// Load (or generate, and save) a mask table in `dir`: the large one (18.9 GB,
+/// `p1-mask-big.tab`; from the large staging table), the reduced one (1.6 GB, `p1-mask3.tab`,
+/// with successors; from `p1-mask2.tab`, the same without them, if present, else from
+/// either staging table) or the wide one (3.2 GB, `p1-succ.tab`; from the reduced one).
+/// `EGGG_P1_MASK_VIRTUAL` set: no table, masks computed when needed (slow; tests).
+pub fn load_sel(dir: &std::path::Path, t: &P1Tables, sel: MaskSel, verbose: bool) -> MaskTable {
     if std::env::var_os("EGGG_P1_MASK_VIRTUAL").is_some() {
         return MaskTable::virtual_table();
     }
     if t.pat.is_some() {
         return load_pair(dir, t, verbose);
     }
-    if big {
-        let name = "p1-mask-big";
-        let path = dir.join(format!("{name}.tab"));
-        let mut m = MaskTable::empty(MaskKind::Big);
-        m.big = HugeBuf::zeroed(Staging::big_len());
-        if crate::table::load(&path, name, m.big.as_bytes_mut()).is_ok() {
-            return m;
+    match sel {
+        MaskSel::Big => {
+            let name = "p1-mask-big";
+            let path = dir.join(format!("{name}.tab"));
+            let mut m = MaskTable::empty(MaskKind::Big);
+            m.big = HugeBuf::zeroed(Staging::big_len());
+            if crate::table::load(&path, name, m.big.as_bytes_mut()).is_ok() {
+                return m;
+            }
+            drop(m);
+            if verbose {
+                eprintln!("generating the phase-1 move-mask table (18.9 GB)...");
+            }
+            let m = MaskTable::generate_big(t);
+            crate::table::save(&path, name, m.big.as_bytes()).expect("saving table");
+            m
         }
-        drop(m);
-        if verbose {
-            eprintln!("generating the phase-1 move-mask table (18.9 GB)...");
+        MaskSel::Reduced => load_reduced(dir, t, verbose),
+        MaskSel::Wide => {
+            let name = "p1-succ";
+            let path = dir.join(format!("{name}.tab"));
+            let mut m = MaskTable::empty(MaskKind::Reduced);
+            m.red = HugeBuf::zeroed(2 * N_CLASSES_A * N_SPLIT);
+            m.shift = 1;
+            if crate::table::load(&path, name, m.red.as_bytes_mut()).is_ok() {
+                return m.with_lookups(&t.staging);
+            }
+            drop(m);
+            let r = load_reduced(dir, t, verbose);
+            if verbose {
+                eprintln!("generating the wide phase-1 move-mask table (3.2 GB)...");
+            }
+            let t0 = std::time::Instant::now();
+            let (m, n) = r.widen(&t.staging);
+            drop(r);
+            if verbose {
+                eprintln!(
+                    "wide phase-1 mask successors in {:.1} s ({n} of {} entries)",
+                    t0.elapsed().as_secs_f64(),
+                    N_CLASSES_A * N_SPLIT
+                );
+            }
+            crate::table::save(&path, name, m.red.as_bytes()).expect("saving table");
+            m
         }
-        let m = MaskTable::generate_big(t);
-        crate::table::save(&path, name, m.big.as_bytes()).expect("saving table");
-        return m;
     }
+}
+
+/// [`load_sel`] of the reduced table.
+fn load_reduced(dir: &std::path::Path, t: &P1Tables, verbose: bool) -> MaskTable {
     // (The reduced tables of earlier versions: "p1-mask" without the equal masks,
     // "p1-mask2" without the successors.)
     let name = "p1-mask3";
@@ -962,31 +1090,43 @@ mod tests {
             // A parent of it.
             states.push(s.apply(rng.gen_range(0..N_MOVES), &t));
         }
-        // Children checked: the resolved index, another stabiliser variant; entries with
-        // their decreasing moves' successors.
-        let mut seen = [0usize; 3];
+        // Children checked: the resolved index, another stabiliser variant; entries' own
+        // successors (of their decreasing moves, of their decreasing and equal moves).
+        let mut seen = [0usize; 4];
         for s in &states {
             let (j, sym) = resolve(s);
             let e = masks(j);
             assert_eq!((conj(e[0], sym), conj(e[1], sym)), direct(s));
-            // The entry's own successors: stored for at most SUCC_MAX decreasing moves.
-            let full = with_succ(st, &mv, j, e);
-            let dec = (e[0] & MASK36).count_ones();
-            assert_eq!(
-                MaskTable::succ_of(full, j).is_some(),
-                dec > 0 && dec <= SUCC_MAX
-            );
-            assert_eq!([full[0] & ((1 << SUCC_SHIFT0) - 1), full[1] & MASK36], e);
+            // The entry's own successors (reduced and wide entries): of the decreasing and
+            // equal moves if there are at most `max`, else of the decreasing moves if there
+            // are at most `max`.
+            let (dec, eq) = (e[0] & MASK36, e[1] & MASK36);
+            let full = [SUCC_MAX, SUCC_MAX_WIDE].map(|max| {
+                let w = with_succ(st, &mv, j, e, max);
+                assert_eq!([w[0][0] & ((1 << SUCC_SHIFT0) - 1), w[0][1] & MASK36], e);
+                let sc = MaskTable::succ_of(w[0], w[1], j);
+                let n = (dec | eq).count_ones();
+                assert_eq!(
+                    sc.map(|sc| sc.eq),
+                    (dec != 0)
+                        .then_some(n <= max)
+                        .filter(|&b| b || dec.count_ones() <= max)
+                );
+                if max == SUCC_MAX {
+                    assert_eq!(w[1], [0; 2]);
+                }
+                sc
+            });
             for m in 0..N_MOVES {
                 let k = mt.conj_move[sym as usize][m];
-                let one = with_succ(st, &mv, j, [1 << k, 0]);
-                let sc = MaskTable::succ_of(one, j).unwrap();
+                let one = with_succ(st, &mv, j, [1 << k, 0], SUCC_MAX);
+                let sc = MaskTable::succ_of(one[0], one[1], j).unwrap();
                 let (j2, sym2) = mt.succ_child(&sc, sym, m);
-                if conj(e[0], sym) >> m & 1 == 1
-                    && let Some(sf) = MaskTable::succ_of(full, j)
-                {
-                    assert_eq!(mt.succ_child(&sf, sym, m), (j2, sym2));
-                    seen[2] += 1;
+                for sf in full.iter().flatten() {
+                    if sf.list >> k & 1 == 1 {
+                        assert_eq!(mt.succ_child(sf, sym, m), (j2, sym2));
+                        seen[2 + sf.eq as usize] += 1;
+                    }
                 }
                 let c = s.apply(m, &t);
                 let (cu, cr) = c.masks();
@@ -1014,10 +1154,12 @@ mod tests {
         assert!(seen.iter().all(|&n| n > 100), "{seen:?}");
     }
 
-    /// Chains of successors through the reduced table, as the search follows them (each
-    /// child's index and symmetry from its parent's successors, over several moves), give
-    /// the same masks and viability bits as resolving each state (needs `p1-mask3.tab` or
-    /// `p1-mask2.tab` in ./tables, made by `eggg-solver gen --tier large`; skipped without).
+    /// Chains of successors through the reduced table and the wide one, as the search
+    /// follows them (each child's index and symmetry from its parent's successors, over
+    /// several moves, each a decreasing or, where stored, an equal move), give the same masks
+    /// and viability bits as resolving each state (needs `p1-mask3.tab` or `p1-mask2.tab`
+    /// in ./tables, made by `eggg-solver gen --tier large`, skipped without; the wide table
+    /// only if `p1-succ.tab` is there too).
     #[test]
     fn successor_chains_match_resolved_entries() {
         use rand::{Rng, SeedableRng};
@@ -1026,36 +1168,44 @@ mod tests {
             return;
         }
         let t = crate::solver::load_p1(dir, false, 8, false);
-        let mt = load(dir, &t, false, false);
         let all = crate::phase1::ALL_PAIRS;
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(5);
-        let mut steps = [0usize; 2];
-        for _ in 0..2000 {
-            let mut s = P1State::from_cube(&Cube::random(&mut rng));
-            let (mut j, mut sym) = mt.resolve(&t, mt.pre_index(&t, &s, all), &s, all);
-            for _ in 0..16 {
-                let (j3, sym3) = mt.resolve(&t, mt.pre_index(&t, &s, all), &s, all);
-                assert_eq!(mt.get_dec_eq(j, sym), mt.get_dec_eq(j3, sym3));
-                for odd in [false, true] {
-                    assert_eq!(mt.viable(j, odd), mt.viable(j3, odd));
-                }
-                let dec = mt.get_dec_eq(j, sym).0;
-                if let Some(sc) = mt.succ(j)
-                    && dec != 0
-                {
-                    let ms: Vec<usize> = (0..N_MOVES).filter(|&m| dec >> m & 1 == 1).collect();
-                    let m = ms[rng.gen_range(0..ms.len())];
-                    (j, sym) = mt.succ_child(&sc, sym, m);
-                    s = s.apply(m, &t);
-                    steps[0] += 1;
-                } else {
-                    s = s.apply(rng.gen_range(0..N_MOVES), &t);
-                    (j, sym) = mt.resolve(&t, mt.pre_index(&t, &s, all), &s, all);
-                    steps[1] += 1;
+        for sel in [MaskSel::Reduced, MaskSel::Wide] {
+            if sel == MaskSel::Wide && !dir.join("p1-succ.tab").exists() {
+                continue;
+            }
+            let mt = load_sel(dir, &t, sel, false);
+            // Steps through successors (of decreasing, of equal moves), through resolving.
+            let mut steps = [0usize; 3];
+            for _ in 0..2000 {
+                let mut s = P1State::from_cube(&Cube::random(&mut rng));
+                let (mut j, mut sym) = mt.resolve(&t, mt.pre_index(&t, &s, all), &s, all);
+                for _ in 0..16 {
+                    let (j3, sym3) = mt.resolve(&t, mt.pre_index(&t, &s, all), &s, all);
+                    let (dec, eq) = mt.get_dec_eq(j, sym);
+                    assert_eq!((dec, eq), mt.get_dec_eq(j3, sym3));
+                    for odd in [false, true] {
+                        assert_eq!(mt.viable(j, odd), mt.viable(j3, odd));
+                    }
+                    let list = mt.succ(j).map(|sc| if sc.eq { dec | eq } else { dec });
+                    if let Some(sc) = mt.succ(j)
+                        && list != Some(0)
+                    {
+                        let list = list.unwrap();
+                        let ms: Vec<usize> = (0..N_MOVES).filter(|&m| list >> m & 1 == 1).collect();
+                        let m = ms[rng.gen_range(0..ms.len())];
+                        (j, sym) = mt.succ_child(&sc, sym, m);
+                        s = s.apply(m, &t);
+                        steps[(eq >> m & 1) as usize] += 1;
+                    } else {
+                        s = s.apply(rng.gen_range(0..N_MOVES), &t);
+                        (j, sym) = mt.resolve(&t, mt.pre_index(&t, &s, all), &s, all);
+                        steps[2] += 1;
+                    }
                 }
             }
+            assert!(steps.iter().all(|&n| n > 100), "{sel:?} {steps:?}");
         }
-        assert!(steps[0] > 10000 && steps[1] > 100, "{steps:?}");
     }
 
     /// The wide quarter turns among the 36 moves are exactly the moves with an odd wing

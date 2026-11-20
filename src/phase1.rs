@@ -1282,6 +1282,14 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     self.reads += 1;
                     let mut a = if d + 1 < left { allowed } else { dec | eq };
                     let flags = s.centre_flags();
+                    // With one move of slack, the children are the decreasing and equal
+                    // moves: their indices from the node's successors, where it has those.
+                    let sc = if reduced && left >= 3 && d + 1 == left {
+                        mt.succ(nd.idx).filter(|sc| sc.eq)
+                    } else {
+                        None
+                    };
+                    let sym = nd.sym;
                     while a != 0 {
                         let m = a.trailing_zeros() as usize;
                         a &= a - 1;
@@ -1296,6 +1304,9 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                             }
                         } else {
                             let i = || {
+                                if let Some(sc) = &sc {
+                                    return mt.succ_child(sc, sym, m);
+                                }
                                 let g = unsafe { child_flags(&flags, m, t) };
                                 let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
                                 (t.staging.rank24(!nud & MASK24) as u64, UNRESOLVED)
@@ -2011,41 +2022,58 @@ mod tests {
     }
 
     /// The batches find the same endpoints, in the same order, with the same node and read
-    /// counts, with and without the successors (needs `p1-mask3.tab` or `p1-mask2.tab` in
-    /// ./tables; skipped without them).
+    /// counts, with and without the successors, of the reduced table and of the wide one
+    /// (needs `p1-mask3.tab` or `p1-mask2.tab` in ./tables, skipped without them; the wide
+    /// table only if `p1-succ.tab` is there).
     #[test]
     fn successors_keep_the_search() {
+        use crate::p1mask::MaskSel;
         use rand::SeedableRng;
         let dir = std::path::Path::new("tables");
         if !dir.join("p1-mask3.tab").exists() && !dir.join("p1-mask2.tab").exists() {
             return;
         }
         let mut t = crate::solver::load_p1(dir, false, 8, false);
-        t.mask = Some(crate::p1mask::load(dir, &t, false, false));
+        let mut sels = vec![MaskSel::Reduced];
+        if dir.join("p1-succ.tab").exists() {
+            sels.push(MaskSel::Wide);
+        }
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(9);
-        let mut found = 0;
-        for _ in 0..4 {
-            let root = P1State::from_cube(&Cube::random(&mut rng));
-            let d0 = t.distance(&root);
-            for len in d0..d0 + 3 {
-                let mut runs = vec![];
-                for succ in [false, true] {
-                    t.mask.as_mut().unwrap().use_succ = succ;
-                    let mut found = vec![];
-                    let mut s = Search1::new(&t, |p: &[u8], f| {
-                        found.push((p.to_vec(), f));
-                        true
-                    });
-                    s.dfs(&root, d0, len, N_MOVES);
-                    let counts = (s.nodes, s.reads);
-                    drop(s);
-                    runs.push((found, counts));
+        let roots: Vec<P1State> = (0..4)
+            .map(|_| P1State::from_cube(&Cube::random(&mut rng)))
+            .collect();
+        let mut want = vec![];
+        for sel in sels {
+            t.mask = Some(crate::p1mask::load_sel(dir, &t, sel, false));
+            let mut runs = vec![];
+            for root in &roots {
+                let d0 = t.distance(root);
+                for len in d0..d0 + 3 {
+                    for succ in [false, true] {
+                        t.mask.as_mut().unwrap().use_succ = succ;
+                        let mut found = vec![];
+                        let mut s = Search1::new(&t, |p: &[u8], f| {
+                            found.push((p.to_vec(), f));
+                            true
+                        });
+                        s.dfs(root, d0, len, N_MOVES);
+                        let counts = (s.nodes, s.reads);
+                        drop(s);
+                        runs.push((found, counts));
+                    }
                 }
-                found += runs[0].0.len();
-                assert_eq!(runs[0], runs[1]);
+            }
+            t.mask = None;
+            // The first table's runs without the successors.
+            if want.is_empty() {
+                want = runs.iter().step_by(2).cloned().collect();
+            }
+            let found: usize = want.iter().map(|r| r.0.len()).sum();
+            assert!(found > 100, "{found} endpoints");
+            for (k, r) in runs.iter().enumerate() {
+                assert_eq!(*r, want[k / 2], "{sel:?} run {k}");
             }
         }
-        assert!(found > 100, "{found} endpoints");
     }
 
     /// [`P1Tables::staged_after`] agrees with the definition (and with the staging table's

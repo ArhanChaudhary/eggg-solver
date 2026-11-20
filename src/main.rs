@@ -169,11 +169,21 @@ struct TableArgs {
     p1_pat: Option<PatArg>,
     /// Phase-1 move-mask table (per staging state, the moves that decrease and that keep its
     /// distance: a node reads one entry instead of ~20 child entries): none, the
-    /// symmetry-reduced one (1.6 GB; the default in the large and larger tiers) or the large
-    /// one (18.9 GB, the decreasing moves only; implies --p1-big). With --p1-pat: the pair
-    /// table instead (pattern-distance-decreasing moves, 17.5 GB).
+    /// symmetry-reduced one (1.6 GB; the default in the large and larger tiers; with the
+    /// children's indices of most states' decreasing moves), the same with more children's
+    /// indices (wide, 3.2 GB) or the large one (18.9 GB, the decreasing moves only; implies
+    /// --p1-big). With --p1-pat: the pair table instead (pattern-distance-decreasing moves,
+    /// 17.5 GB).
     #[arg(long, value_enum)]
-    p1_mask: Option<PatArg>,
+    p1_mask: Option<MaskArg>,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+enum MaskArg {
+    None,
+    Small,
+    Wide,
+    Big,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
@@ -222,23 +232,25 @@ impl TableArgs {
                 }
             );
         }
+        use eggg_solver::p1mask::MaskSel;
         let mask = match self.p1_mask {
-            Some(PatArg::None) => None,
-            Some(PatArg::Small) => Some(false),
-            Some(PatArg::Big) => Some(true),
+            Some(MaskArg::None) => None,
+            Some(MaskArg::Small) => Some(MaskSel::Reduced),
+            Some(MaskArg::Wide) => Some(MaskSel::Wide),
+            Some(MaskArg::Big) => Some(MaskSel::Big),
             // The tiers with masks use the reduced move-mask table (1.6 GB; phase 1 ~10x
             // faster with the same endpoints), unless a pattern table is asked for (that
             // combination selects the 17.5 GB pair-mask table).
-            None if pat.is_none() && masks => Some(false),
+            None if pat.is_none() && masks => Some(MaskSel::Reduced),
             None => None,
         };
-        if verbose && let Some(b) = mask {
+        if verbose && let Some(sel) = mask {
             eprintln!(
                 "phase-1 move-mask table: {}",
-                if b {
-                    "large (18.9 GB)"
-                } else {
-                    "reduced (1.6 GB)"
+                match sel {
+                    MaskSel::Big => "large (18.9 GB)",
+                    MaskSel::Wide => "wide reduced (3.2 GB)",
+                    MaskSel::Reduced => "reduced (1.6 GB)",
                 }
             );
         }
@@ -248,7 +260,7 @@ impl TableArgs {
             &self.dir(),
             k,
             joint,
-            big || (pat.is_none() && mask == Some(true)),
+            big || (pat.is_none() && mask == Some(MaskSel::Big)),
             (pat, mask),
             threads,
             verbose,

@@ -1301,6 +1301,16 @@ pub fn load_mask(p1: &mut P1Tables, dir: &std::path::Path, big: bool, verbose: b
     p1.mask = Some(crate::p1mask::load(dir, p1, big, verbose));
 }
 
+/// [`load_mask`] of any of the move-mask tables (see [`crate::p1mask::load_sel`]).
+pub fn load_mask_sel(
+    p1: &mut P1Tables,
+    dir: &std::path::Path,
+    sel: crate::p1mask::MaskSel,
+    verbose: bool,
+) {
+    p1.mask = Some(crate::p1mask::load_sel(dir, p1, sel, verbose));
+}
+
 /// Load or build the phase-2 tables in `dir`; `joint`: also the joint table (1.05 GB).
 pub fn load_p2(dir: &std::path::Path, joint: bool, threads: usize, verbose: bool) -> P2Tables {
     let p2_path = dir.join("p2-tau.tab");
@@ -1345,13 +1355,13 @@ pub fn load_p2(dir: &std::path::Path, joint: bool, threads: usize, verbose: bool
 
 /// Load or build all tables in `dir`; `joint`: also the joint phase-2 table (1.05 GB);
 /// `p1_big`: the large phase-1 staging table (1.2 GB); `p1_extra`: the phase-1 pattern table
-/// and move-mask table (each `Some(big)`: reduced or large; the large masks need `p1_big`).
+/// (`Some(big)`: reduced or large) and move-mask table (the large masks need `p1_big`).
 pub fn load_tables_with(
     dir: &std::path::Path,
     h48_k: u32,
     joint: bool,
     p1_big: bool,
-    p1_extra: (Option<bool>, Option<bool>),
+    p1_extra: (Option<bool>, Option<crate::p1mask::MaskSel>),
     threads: usize,
     verbose: bool,
 ) -> Tables {
@@ -1377,12 +1387,12 @@ pub fn load_tables_with(
     if let Some(big) = p1_extra.0 {
         load_pat(&mut p1, dir, big, threads, verbose);
     }
-    if let Some(big) = p1_extra.1 {
+    if let Some(sel) = p1_extra.1 {
         assert!(
-            p1_big || !big || p1.pat.is_some(),
+            p1_big || sel != crate::p1mask::MaskSel::Big || p1.pat.is_some(),
             "the large move-mask table needs the large staging table"
         );
-        load_mask(&mut p1, dir, big, verbose);
+        load_mask_sel(&mut p1, dir, sel, verbose);
     }
     drop(g);
     let p2 = p2.join().expect("loading the phase-2 tables");
