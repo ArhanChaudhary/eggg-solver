@@ -125,6 +125,11 @@ after 60 s.
   runs) on the ARM laptop (each under an exclusive benchmark lock), then `scripts/compare.py A B` for a before/after table and
   `scripts/paired.py A.json B.json` for a per-position paired comparison (runs of one build
   reproduce per-position lengths, so small differences are measurable).
+- Profile-guided builds (LLVM PGO): `scripts/pgo-build.sh x86|m2 LABEL REF` (an instrumented
+  build, a one-minute training run on the machine the binary is for, `llvm-profdata` from the
+  toolchain's `llvm-tools` component, and the release build with the profile; per commit).
+  On the M2 phase 1 runs ~8% (8 threads) / ~6% (1 thread) more nodes per second than the
+  plain build; the final lengths of the 50-position suites did not change.
 - `examples/` holds deterministic checks used during optimisation: `p1check` (phase-1
   endpoint hash and node count), `p2jcheck` (joint-table admissibility), `p2cost` (phase-2
   nodes and CPU time per solution, by depth above the bound), `p3check`,
