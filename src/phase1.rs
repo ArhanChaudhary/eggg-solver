@@ -1002,7 +1002,7 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     /// Node-parallel wing lookahead (prototype, `EGGG_P1_SOA=1`): the children of the round
     /// not yet queued, in order (as queued, but with their parent's id; true: dropped), and
     /// per class (wing parity + 2 * not tight) those awaiting the lookahead.
-    soa: bool,
+    soa: u8,
     pend: Vec<(BNode, bool)>,
     wq: Box<[WQueue; 4]>,
 }
@@ -1020,9 +1020,14 @@ struct WQueue {
 /// See [`Search1::batch_tree`].
 const ROOT: u32 = 1 << 31;
 
-/// The node-parallel wing lookahead (prototype): `EGGG_P1_SOA=1`.
-static P1_SOA: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| std::env::var("EGGG_P1_SOA").is_ok_and(|v| v == "1"));
+/// The node-parallel wing lookahead (prototype): `EGGG_P1_SOA=1`; 2: the per-node test
+/// without bounds checks.
+static P1_SOA: std::sync::LazyLock<u8> = std::sync::LazyLock::new(|| {
+    std::env::var("EGGG_P1_SOA")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+});
 
 /// Names of the profiling counters (feature `p1prof`).
 pub const PROF_NAMES: [&str; 48] = [
@@ -1380,7 +1385,13 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             #[cfg(feature = "p1prof")]
             crate::wing2::capture(&s.pos, s.parity, d == 2);
         }
-        left != 2 || self.pair != ALL_PAIRS || self.t.wing2.possible(&s.pos, s.parity, d == 2)
+        left != 2
+            || self.pair != ALL_PAIRS
+            || if self.soa == 2 {
+                self.t.wing2.possible_unchecked(&s.pos, s.parity, d == 2)
+            } else {
+                self.t.wing2.possible(&s.pos, s.parity, d == 2)
+            }
     }
 
     /// Set `self.path` to the path of batch node `id` (see [`Search1::batch_tree`]).
@@ -1411,7 +1422,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             .mask
             .as_ref()
             .is_some_and(|m| m.kind == crate::p1mask::MaskKind::Reduced);
-        if self.soa && reduced && self.pair == ALL_PAIRS {
+        if self.soa == 1 && reduced && self.pair == ALL_PAIRS {
             self.run_batch_rounds::<true>();
             self.pend.clear();
             for q in self.wq.iter_mut() {
