@@ -6,7 +6,7 @@
 # solver flags, commas for spaces).
 set -e
 M2=/data3/eggg-tools/m2
-E="ssh -i /home/super/.ssh/id_ed22519 -o IdentitiesOnly=yes -o BatchMode=yes -S /data3/eggg-tools/m2.sock"
+E="ssh -i /home/super/.ssh/id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -S /data3/eggg-tools/m2.sock"
 h48=${EGGG_BENCH_H48:-6}
 cmds="mkdir -p ~/eggg/results; cd ~/eggg; awk '/MemAvailable/' /proc/meminfo;"
 names=()

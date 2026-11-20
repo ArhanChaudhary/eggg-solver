@@ -10,7 +10,7 @@
 set -e
 label=${1:?usage: m2-build.sh LABEL REF}; ref=${2:?}
 M2=/data3/eggg-tools/m2
-E="ssh -i /home/super/.ssh/id_ed22519 -o IdentitiesOnly=yes -o BatchMode=yes -S /data3/eggg-tools/m2.sock"
+E="ssh -i /home/super/.ssh/id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -S /data3/eggg-tools/m2.sock"
 $M2 'true' >/dev/null 2>&1
 tmp=$(mktemp -d)
 git archive "$ref" | tar x -C "$tmp"

@@ -6,7 +6,7 @@
 set -e
 n=${1:?N}; secs=${2:?SECONDS}; seed=${3:?SEED}; shift 3
 M2=/data3/eggg-tools/m2
-E="ssh -i /home/super/.ssh/id_ed22519 -o IdentitiesOnly=yes -o BatchMode=yes -S /data3/eggg-tools/m2.sock"
+E="ssh -i /home/super/.ssh/id_ed25519 -o IdentitiesOnly=yes -o BatchMode=yes -S /data3/eggg-tools/m2.sock"
 cmds="a=\$(grep MemAvailable /proc/meminfo | awk '{print int(\$2/1024/1024)}'); echo M2 MemAvailable \$a GB; [ \$a -ge 10 ] || { echo not starting; exit 1; }; mkdir -p ~/eggg/results; cd ~/eggg;"
 names=()
 for spec in "$@"; do
