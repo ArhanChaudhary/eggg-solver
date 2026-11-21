@@ -19,6 +19,9 @@ use crate::phase1::{P1State, P1Tables, Search1};
 use crate::phase2::{P2Tables, Search2, Task2, first_moves, standardise};
 use crate::phase3::{P3Tables, Search3, Task};
 
+/// Phase-1 endpoints are turned into candidates this many at a time (see `Run::phase1`).
+const EP_BUFFER: usize = 256;
+
 /// Phase-3 checks at least this deep are split into one job per child of the root.
 const SPLIT_DEPTH: u8 = 15;
 use crate::table::Mod3Table;
@@ -700,12 +703,90 @@ impl<'a, 'r> Run<'a, 'r> {
             self.phase3_levels(t1 + budget);
             self.stats.time[2] += t1.elapsed();
             check += t1.elapsed();
+            if std::env::var_os("EGGG_MEM").is_some() {
+                self.mem_report();
+            }
             if self.stopped() || self.level.len > 40 {
                 return;
             }
             want1 = want1.saturating_mul(2);
             want2 = want2.saturating_mul(2);
         }
+    }
+
+    /// Debug (`EGGG_MEM`), after each round: the sizes of the run's containers (estimated
+    /// bytes), the process RSS and malloc's bytes in use, mmapped and held in its arenas.
+    fn mem_report(&self) {
+        // The heap block of a `Vec<u8>` of this capacity (glibc: 16-byte granules, 32 at least).
+        let block = |cap: usize| {
+            if cap == 0 {
+                0
+            } else {
+                (cap + 8).div_ceil(16).max(2) * 16
+            }
+        };
+        let cand_heap: usize = self.cands.iter().map(|c| block(c.moves1.capacity())).sum();
+        let cand_bytes = self.cands.capacity() * std::mem::size_of::<Candidate>() + cand_heap;
+        let red_heap: usize = self.reds.iter().map(|r| block(r.moves12.capacity())).sum();
+        let red_bytes = self.reds.capacity() * std::mem::size_of::<Reduction>() + red_heap;
+        let idx_bytes =
+            self.red_index.capacity() * (std::mem::size_of::<((usize, Cube3), usize)>() + 1);
+        let job_heap: usize = self.level.jobs.iter().map(|j| block(j.1.capacity())).sum();
+        let job_bytes = self.level.jobs.capacity() * 32 + job_heap;
+        let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        let rss_pages: usize = statm
+            .split_whitespace()
+            .nth(1)
+            .and_then(|x| x.parse().ok())
+            .unwrap_or(0);
+        let rss = rss_pages * 4096;
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        let (inuse, mmapped, arena) = {
+            let mi = unsafe { libc::mallinfo2() };
+            (mi.uordblks, mi.hblkhd, mi.arena)
+        };
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        let (inuse, mmapped, arena) = (0usize, 0usize, 0usize);
+        let mb = |x: usize| x as f64 / 1e6;
+        // The candidates by how far below the deepest useful level their next search is (5:
+        // 5 or more), and those never searched.
+        let limit = self.useful_l12();
+        let mut by_slack = [0usize; 6];
+        let mut unsearched = 0usize;
+        for c in &self.cands {
+            let t = c.moves1.len() + c.h2.max(c.done2) as usize;
+            by_slack[limit.saturating_sub(t).min(5)] += 1;
+            if c.done2 == 0 {
+                unsearched += 1;
+            }
+        }
+        eprintln!(
+            "[{:8.3}] MEM round {} len1 {} best {} made_cands {} cands {} ({:.1} MB; by limit-t {:?}; unsearched {}) reds {} ({:.1} MB) made_reds {} idx {} ({:.1} MB) jobs {} next {} ({:.1} MB) yields {}/{} printed {} | rss {:.1} MB malloc inuse {:.1} MB mmapped {:.1} MB arena {:.1} MB",
+            self.start.elapsed().as_secs_f64(),
+            self.stats.rounds,
+            self.level.len,
+            self.best_len(),
+            self.made_cands,
+            self.cands.len(),
+            mb(cand_bytes),
+            by_slack,
+            unsearched,
+            self.reds.len(),
+            mb(red_bytes),
+            self.made_reds,
+            self.red_index.len(),
+            mb(idx_bytes),
+            self.level.jobs.len(),
+            self.level.next,
+            mb(job_bytes),
+            self.yields.len(),
+            self.prev_yields.len(),
+            self.printed.len(),
+            mb(rss),
+            mb(inuse),
+            mb(mmapped),
+            mb(arena),
+        );
     }
 
     fn level_jobs(&self, len: u8) -> Vec<(u8, Vec<u8>)> {
@@ -795,11 +876,25 @@ impl<'a, 'r> Run<'a, 'r> {
             let close = Close::new(self.p1_cut);
             let idle = AtomicUsize::new(0);
             let out = Mutex::new(vec![]);
+            // Once a solution exists, a candidate whose phase-2 bound already puts its
+            // reductions past the deepest level phase 2 will ever search is never needed (and
+            // not made).
+            let limit = self.useful_l12();
+            let (p2, cube) = (&self.t.p2, &self.cube);
+            // Wall time making candidates, summed over the threads.
+            let cand_nanos = AtomicU64::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads {
                     s.spawn(|| {
                         let mut local = vec![];
                         let mut n = 0;
+                        // Each job's endpoints become candidates as they are found, a buffer
+                        // of `EP_BUFFER` at a time (the buffer's move vectors are reused):
+                        // a round's phase 1 can find hundreds of millions of endpoints in
+                        // long runs, nearly all hopeless, and holding them until the end of
+                        // the round took gigabytes.
+                        let mut buf: Vec<(Vec<u8>, u8)> = vec![];
+                        let mut cand_ns = 0u64;
                         loop {
                             if stop.load(Ordering::Relaxed) || close.is_raised() {
                                 break;
@@ -814,10 +909,28 @@ impl<'a, 'r> Run<'a, 'r> {
                             let (pair, ref prefix) = jobs[j];
                             let pair = pair as usize;
                             let (st, d) = root.after_pair(prefix, d0[pair], t, pair);
-                            let mut eps = vec![];
+                            let mut made = vec![];
+                            let (mut used, mut k) = (0usize, 0usize);
+                            let mut flush = |buf: &[(Vec<u8>, u8)], made: &mut Vec<Candidate>| {
+                                let tc = Instant::now();
+                                make_candidates(p2, cube, buf, limit, made);
+                                cand_ns += tc.elapsed().as_nanos() as u64;
+                            };
                             let mut spill = vec![];
                             let mut srch = Search1::new(t, |p: &[u8], f| {
-                                eps.push((p.to_vec(), f));
+                                k += f.count_ones() as usize;
+                                if used == buf.len() {
+                                    buf.push((vec![], 0));
+                                }
+                                let e = &mut buf[used];
+                                e.0.clear();
+                                e.0.extend_from_slice(p);
+                                e.1 = f;
+                                used += 1;
+                                if used == EP_BUFFER {
+                                    flush(&buf[..used], &mut made);
+                                    used = 0;
+                                }
                                 true
                             });
                             srch.abort = Some(stop);
@@ -828,22 +941,24 @@ impl<'a, 'r> Run<'a, 'r> {
                             p1_run(&mut srch, &st, d, left, last, 2, &close, &mut spill);
                             let job_nodes = srch.nodes;
                             drop(srch);
+                            flush(&buf[..used], &mut made);
                             n += job_nodes;
-                            let k: usize = eps.iter().map(|e| e.1.count_ones() as usize).sum();
                             if found.fetch_add(k, Ordering::Relaxed) + k >= need {
                                 close.raise();
                             }
-                            local.push((j, eps, spill, job_nodes));
+                            local.push((j, made, spill, job_nodes, k));
                         }
                         nodes.fetch_add(n, Ordering::Relaxed);
+                        cand_nanos.fetch_add(cand_ns, Ordering::Relaxed);
                         out.lock().unwrap().extend(local);
                     });
                 }
             });
             self.stats.nodes1 += nodes.load(Ordering::Relaxed);
+            self.cand_time +=
+                Duration::from_nanos(cand_nanos.load(Ordering::Relaxed) / threads as u64);
             if self.stopped() {
-                // The run is over: these endpoints would never be searched (making their
-                // candidates took up to seconds past the time limit in long runs).
+                // The run is over: these candidates would never be searched.
                 break;
             }
             let next = claimed.load(Ordering::Relaxed).min(jobs.len());
@@ -867,30 +982,15 @@ impl<'a, 'r> Run<'a, 'r> {
                 self.level.jobs = rest;
                 self.level.next = 0;
             }
-            // New endpoints, in job order; their candidates are made in parallel. Once a
-            // solution exists, a candidate whose phase-2 bound already puts its reductions past
-            // the deepest level phase 2 will ever search is never needed (and not made).
+            // The new candidates, in job order (the order of their endpoints).
             // (Levels, jobs and handed-back subtrees are disjoint: no endpoint comes twice.)
-            let tc = Instant::now();
-            let eps: Vec<(Vec<u8>, u8)> = results.into_iter().flat_map(|r| r.1).collect();
-            let limit = self.useful_l12();
-            let made = Mutex::new(vec![]);
-            let (p2, cube) = (&self.t.p2, &self.cube);
-            crate::par::for_chunks(eps.len(), 32, |r| {
-                let mut out = vec![];
-                make_candidates(p2, cube, &eps[r.clone()], limit, &mut out);
-                made.lock().unwrap().push((r.start, out));
-            });
-            let mut made = made.into_inner().unwrap();
-            made.sort_unstable_by_key(|m| m.0);
-            self.made_cands += eps.iter().map(|e| e.1.count_ones() as usize).sum::<usize>();
-            for c in made.iter().flat_map(|m| &m.1) {
+            self.made_cands += results.iter().map(|r| r.4).sum::<usize>();
+            for c in results.iter().flat_map(|r| &r.1) {
                 if let Some(k) = prefix3(&c.moves1) {
                     self.yields.entry(k).or_default().0 += 1;
                 }
             }
-            self.cands.extend(made.into_iter().flat_map(|m| m.1));
-            self.cand_time += tc.elapsed();
+            self.cands.extend(results.into_iter().flat_map(|r| r.1));
         }
         self.stats.endpoints = self.made_cands;
     }
@@ -916,6 +1016,19 @@ impl<'a, 'r> Run<'a, 'r> {
         self.red_index.clear();
         for (i, r) in self.reds.iter().enumerate() {
             self.red_index.insert((r.frame, r.c3), i);
+        }
+        // The pools peak early, while phase 2 is still throttled (~500k candidates, 0.2 GB
+        // with the index, in the first seconds of a run that later holds a few thousand):
+        // their room is given back.
+        let roomy = |cap: usize, len: usize| cap > 4 * len + 4096;
+        if roomy(self.cands.capacity(), self.cands.len()) {
+            self.cands.shrink_to(2 * self.cands.len());
+        }
+        if roomy(self.reds.capacity(), self.reds.len()) {
+            self.reds.shrink_to(2 * self.reds.len());
+        }
+        if roomy(self.red_index.capacity(), self.red_index.len()) {
+            self.red_index.shrink_to(2 * self.red_index.len());
         }
     }
 

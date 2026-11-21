@@ -48,6 +48,14 @@ the default, `auto`, takes the largest tier that fits in a third of the physical
 | `xl` | h48 h9, joint phase 2, phase-1 move masks, wing paths up to 7 | 19.3 GB |
 | `xxl` | h48 h11 (the largest), joint phase 2, phase-1 move masks, wing paths up to 7 | 64.9 GB |
 
+Beyond the tables a run needs a few hundred MB, and that does not grow with the run time:
+phase-1 endpoints become phase-2 candidates as they are found (only the few that can still
+lead to a shorter solution are kept), and the move-mask batches run in chunks of bounded
+size. One position with `huge` on 16 threads for 40 minutes: RSS 7.9-8.3 GB (before, it
+grew to 34 GB, as each round held all its endpoints and the batches grew ~10x per phase-1
+length). `EGGG_MEM=1` prints the driver's container sizes, the RSS and malloc's statistics
+after each round.
+
 The tables: phase-1 centre staging (symmetry-reduced, 25 MB; `--p1-big`: 1.2 GB without the
 reduction, faster lookups), phase-2 pairing permutation (60 MB; `--p2-joint`: the joint
 pairing x U/D centres x PLL parity table, 1.05 GB, far fewer phase-2 nodes), phase-3 H48
