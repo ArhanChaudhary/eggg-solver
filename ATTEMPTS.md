@@ -1,6 +1,6 @@
 # Optimisation log: everything tried so far
 
-Status as of 2026-11-20. ✅ merged into master, ❌ tried and not merged (measured), ⏳ in
+Status as of 2026-11-21. ✅ merged into master, ❌ tried and not merged (measured), ⏳ in
 progress, ⏸ waiting for the 48-thread x86 server (busy with another project since
 2026-11-17). Numbers are mean solution lengths (moves) on random positions unless stated;
 "M2" is the 8-core ARM laptop, "x86" the 48-core server. Branch names in `code`; every
@@ -41,8 +41,8 @@ Phase 1 is ~87% of the run time, so most recent work targets it.
 | ❌ | Cheaper leaf staging test (`prof/leaf`) | −0.6%; not worth a branch. |
 | ❌ | Centre-blind wing table 3 moves out | Prunes only 54% of 3-left nodes, at about the cost it saves. Led to the wing-path table instead. |
 | ❌ | Pattern tables (`--p1-pat`, opt-in) | Per-colour-pair searches: 1.4x fewer reads, superseded by the masks. |
-| ⏳ | Finer job ordering (`opt/p1-order2`) | 4-move jobs ranked by hierarchical yield; benchmarks running. |
-| ⏳ | Wing-path depth 8 (~14 GB) | Code merged but untested: the build peaks at ~2x the final size (OOM at 28 GB on a 32 GB machine). An agent is cutting the build memory and adding save-to-disk. |
+| ❌ | Finer job ordering (`opt/p1-order2`) | 4- and 5-move jobs ranked by hierarchical yield: at most +3–6% kept candidates (oracle +16–37%), neutral in length (38.96 vs 38.94). |
+| ✅ | Wing-path depth 8 (`opt/wing-mem`, `--p1-wing 8`) | The build used ~2x the final size (OOM on a 32 GB machine); now the table is 14.6 GB, the build peaks at 15 GB, `--tier large --p1-wing 8` at ~19.5 GB, and it is saved to disk after the first build. Not a tier default yet (needs a 48-thread timing). |
 | ⏸ | Unreduced 8-byte mask table (~38 GB) | No symmetry handling at all; estimated 1.2–1.3x. Needs the x86 server's memory. |
 | ⏸ | 17.5 GB pair-mask table, 18.9 GB large mask table | Existing opt-in options, never benchmarked at full size. |
 
@@ -59,6 +59,7 @@ Phase 1 is ~87% of the run time, so most recent work targets it.
 | ❌ | Larger joint tables (6.35 / 18.4 GB) + deeper margins (`method/p2-big`, `int/p2-big`) | No gain, even in 300 s runs. |
 | ❌ | Cheaper per-solution bookkeeping (`exp/margins`) | Neutral: the searches, not the bookkeeping, dominate. |
 | ❌ | 4x more reductions per round | Phase 2's share rose from 12.6% to 19.2% with identical final lengths. |
+| ❌ | 8x / unlimited phase-2 budget, re-tested after the phase-1 speedups | 38.80 / 38.90 vs 38.78 at 20 s: the per-round budget is not what limits length. |
 
 ## Phase 3 (optimal 3x3 with H48 tables)
 
@@ -90,6 +91,8 @@ Phase 1 is ~87% of the run time, so most recent work targets it.
 | | Attempt | Summary |
 |---|---|---|
 | ✅ | Tiers (`--tier`, auto by memory) | tiny / small / medium / large / huge / xl / xxl = 0.16 / 0.35 / 2.3 / 4.85 / 7.9 / 19.3 / 64.9 GB. Mix and match with `--h48`, `--p2-joint`, `--p1-mask`, `--p1-wing`. |
+| ✅ | Bounded memory in long runs (`fix/long-run-memory`) | Rounds kept every phase-1 endpoint until the round ended, and deep batches grew 10x per length: 8 → 34 GB in 40 minutes. Candidates are now made as endpoints are found, batches run in chunks: 7.9–8.3 GB over 90 minutes, same lengths (8-thread phase-1 rate −3.6%). |
+| ✅ | `solve --ties`; no time limit by default | Print every solution as short as the best so far; `solve` runs until stopped or `-l` (bench keeps 5 s). |
 | ✅ | Concurrent table loading | A single `solve` on the M2: 7.35 → 5.64 s, every table still checksummed. |
 | ✅ | PGO build script (`scripts/pgo-build.sh`) | +6.5–8% phase-1 throughput with a per-machine, per-commit training run. Optional. |
 | ✅ | Fixes | Concurrent table saves; M2 build scripts that could compile another agent's code or copy a stale binary; the renamed M2 SSH key. |
