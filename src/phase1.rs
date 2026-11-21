@@ -1252,254 +1252,285 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         self.batch_roots.clear();
     }
 
+    /// The rounds run in chunks of `MaskTable::chunk` nodes; once the next round holds that
+    /// many nodes, their subtrees are searched before the rest of the round (depth first over
+    /// chunks), and the paths of those subtrees' nodes are dropped from `batch_tree`: the
+    /// buffers then stay at a few chunks per depth. (Whole rounds reached ~1M nodes, ~170 MB
+    /// per search, at phase-1 length 17, ~2.7 GB at length 18, ~10x per length.)
     fn run_batch_rounds(&mut self) {
+        let chunk = self.t.mask.as_ref().unwrap().chunk;
+        while !self.batch.is_empty() {
+            let mut cur = std::mem::take(&mut self.batch);
+            std::mem::swap(&mut self.batch, &mut self.batch_next);
+            self.batch.clear();
+            // The ids of this round's children start here (`cur`'s and their ancestors' are
+            // below it).
+            let mark = self.batch_tree.len();
+            let mut start = 0;
+            while start < cur.len() {
+                let end = (start + chunk).min(cur.len());
+                self.run_batch_round(&mut cur[start..end]);
+                if self.stop {
+                    return;
+                }
+                start = end;
+                if start < cur.len() && self.batch.len() >= chunk {
+                    self.run_batch_rounds();
+                    if self.stop {
+                        return;
+                    }
+                    // Every node queued since `mark` has been searched.
+                    self.batch_tree.truncate(mark);
+                }
+            }
+            cur.clear();
+            self.batch_next = cur;
+        }
+    }
+
+    /// One round (or a chunk of one) of batch nodes `cur`: their children are queued in
+    /// `self.batch`, or tested if they have one move left.
+    fn run_batch_round(&mut self, cur: &mut [BNode]) {
         let t = self.t;
         let mt = t.mask.as_ref().unwrap();
         let reduced = mt.kind == crate::p1mask::MaskKind::Reduced;
         // The reduced table's viability bits are for the staging distance (all pairs).
         let viable = reduced && self.pair == ALL_PAIRS;
-        while !self.batch.is_empty() {
-            let mut cur = std::mem::take(&mut self.batch);
-            std::mem::swap(&mut self.batch, &mut self.batch_next);
+        if self
+            .abort
+            .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            self.stop = true;
+        }
+        if self.stop {
             self.batch.clear();
-            if self
-                .abort
-                .is_some_and(|a| a.load(std::sync::atomic::Ordering::Relaxed))
-            {
-                self.stop = true;
+            return;
+        }
+        if matches!(
+            mt.kind,
+            crate::p1mask::MaskKind::Reduced | crate::p1mask::MaskKind::Pair
+        ) {
+            // The reduced table's index needs the class info (prefetched at the push).
+            for nd in cur.iter_mut() {
+                (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.state(), self.pair);
             }
-            if self.stop {
-                self.batch.clear();
-                return;
-            }
-            if matches!(
-                mt.kind,
-                crate::p1mask::MaskKind::Reduced | crate::p1mask::MaskKind::Pair
-            ) {
-                // The reduced table's index needs the class info (prefetched at the push).
-                for nd in cur.iter_mut() {
-                    (nd.idx, nd.sym) = mt.resolve(t, nd.idx, &nd.state(), self.pair);
-                }
-            }
-            // The nodes whose children get the wing-path tests: their live children now (u32::MAX
-            // if not), and the children's table entries prefetched for the pass below.
-            let mut pre = std::mem::take(&mut self.pre);
-            pre.clear();
-            if let Some(w) = t.wingk.as_deref().filter(|_| viable && *WK_PREFETCH) {
-                for nd in &cur {
-                    let (d, left) = (nd.d, nd.left);
-                    let mut e = u32::MAX;
-                    // The moves to children with the tests (tight ones, ones with slack 1).
-                    let mut tested = 0;
-                    if left < 3 {
-                    } else if d == left {
-                        let red = w.red.is_some() && left - 1 == w.kmax + 1;
-                        if (left - 1 <= w.kmax || red) && mt.viable(nd.idx, nd.parity) {
-                            let dec = mt.get(t, nd.idx, nd.sym, &nd.state(), self.pair);
-                            let a = dec & ALLOWED_AFTER[nd.last as usize];
-                            e = self.live_children(nd, a, d, left, dec, 0);
-                            tested = e;
-                        }
-                    } else if left - 1 <= w.kmax || left - 2 <= w.smax {
-                        let allowed = ALLOWED_AFTER[nd.last as usize];
-                        let (dec_all, eq_all) = mt.get_dec_eq(nd.idx, nd.sym);
-                        let (dec, eq) = (dec_all & allowed, eq_all & allowed);
-                        let a = if d + 1 < left { allowed } else { dec | eq };
-                        e = self.live_children(nd, a, d, left, dec_all, eq_all);
-                        // The children with no slack and with one move of slack (a decreasing
-                        // move keeps the slack, a keeping move takes one, another two).
-                        let inc = allowed & !(dec | eq);
-                        let (tight, slack1) = match left - d {
-                            1 => (eq, dec),
-                            2 => (inc, eq),
-                            3 => (0, inc),
-                            _ => (0, 0),
-                        };
-                        tested = e
-                            & (if left - 1 <= w.kmax { tight } else { 0 }
-                                | if left - 2 <= w.smax { slack1 } else { 0 });
+        }
+        // The nodes whose children get the wing-path tests: their live children now (u32::MAX
+        // if not), and the children's table entries prefetched for the pass below.
+        let mut pre = std::mem::take(&mut self.pre);
+        pre.clear();
+        if let Some(w) = t.wingk.as_deref().filter(|_| viable && *WK_PREFETCH) {
+            for nd in cur.iter() {
+                let (d, left) = (nd.d, nd.left);
+                let mut e = u32::MAX;
+                // The moves to children with the tests (tight ones, ones with slack 1).
+                let mut tested = 0;
+                if left < 3 {
+                } else if d == left {
+                    let red = w.red.is_some() && left - 1 == w.kmax + 1;
+                    if (left - 1 <= w.kmax || red) && mt.viable(nd.idx, nd.parity) {
+                        let dec = mt.get(t, nd.idx, nd.sym, &nd.state(), self.pair);
+                        let a = dec & ALLOWED_AFTER[nd.last as usize];
+                        e = self.live_children(nd, a, d, left, dec, 0);
+                        tested = e;
                     }
-                    if tested != 0 {
-                        let flags = nd.state().centre_flags();
-                        let mut b = tested;
-                        while b != 0 {
-                            let m = b.trailing_zeros() as usize;
-                            b &= b - 1;
-                            let (ud, _, rl) = flag_masks(&unsafe { child_flags(&flags, m, t) });
-                            if d == left && left - 1 == w.kmax + 1 {
-                                w.red.as_ref().unwrap().prefetch(ud, rl);
-                            } else {
-                                w.prefetch(ud, rl);
-                            }
-                        }
-                    }
-                    pre.push(e);
-                }
-            }
-            self.pre = pre;
-            for (ix, nd) in cur.iter().enumerate() {
-                let s = nd.state();
-                if nd.d < nd.left {
-                    // A node with slack (reduced table): its children's distances from its
-                    // own entry, as in `dfs_eq`; they are all queued, or with one move left
-                    // tested.
-                    let (d, left) = (nd.d, nd.left);
+                } else if left - 1 <= w.kmax || left - 2 <= w.smax {
                     let allowed = ALLOWED_AFTER[nd.last as usize];
                     let (dec_all, eq_all) = mt.get_dec_eq(nd.idx, nd.sym);
                     let (dec, eq) = (dec_all & allowed, eq_all & allowed);
-                    self.nodes += allowed.count_ones() as u64;
-                    self.reads += 1;
-                    let mut a = if d + 1 < left { allowed } else { dec | eq };
-                    if viable {
-                        // The children that cannot reach an endpoint (child bits) are not
-                        // queued, nor tested (their last moves are counted).
-                        let live = match self.pre.get(ix) {
-                            Some(&l) if l != u32::MAX => l,
-                            _ => self.live_children(nd, a, d, left, dec_all, eq_all),
-                        };
-                        if left == 2 {
-                            let mut b = a & !live;
-                            while b != 0 {
-                                let m = b.trailing_zeros() as usize;
-                                b &= b - 1;
-                                let odd = nd.parity ^ (WIDE_QUARTER >> m & 1 == 1);
-                                self.nodes += LEAF_MOVES[odd as usize][m] as u64;
-                            }
-                        }
-                        a = live;
-                    }
-                    let flags = s.centre_flags();
-                    while a != 0 {
-                        let m = a.trailing_zeros() as usize;
-                        a &= a - 1;
-                        let dc = d + 1 - 2 * (dec >> m & 1) as u8 - (eq >> m & 1) as u8;
-                        let c = s.apply(m, t);
-                        if left == 2 {
-                            let run = run_after(nd.run, nd.last as usize, m);
-                            self.leaf(&c, dc, m, None, run, Some((nd.id, Some(m as u8))));
-                            if self.stop {
-                                self.batch.clear();
-                                return;
-                            }
+                    let a = if d + 1 < left { allowed } else { dec | eq };
+                    e = self.live_children(nd, a, d, left, dec_all, eq_all);
+                    // The children with no slack and with one move of slack (a decreasing
+                    // move keeps the slack, a keeping move takes one, another two).
+                    let inc = allowed & !(dec | eq);
+                    let (tight, slack1) = match left - d {
+                        1 => (eq, dec),
+                        2 => (inc, eq),
+                        3 => (0, inc),
+                        _ => (0, 0),
+                    };
+                    tested = e
+                        & (if left - 1 <= w.kmax { tight } else { 0 }
+                            | if left - 2 <= w.smax { slack1 } else { 0 });
+                }
+                if tested != 0 {
+                    let flags = nd.state().centre_flags();
+                    let mut b = tested;
+                    while b != 0 {
+                        let m = b.trailing_zeros() as usize;
+                        b &= b - 1;
+                        let (ud, _, rl) = flag_masks(&unsafe { child_flags(&flags, m, t) });
+                        if d == left && left - 1 == w.kmax + 1 {
+                            w.red.as_ref().unwrap().prefetch(ud, rl);
                         } else {
-                            let i = || {
-                                let g = unsafe { child_flags(&flags, m, t) };
-                                let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
-                                t.staging.rank24(!nud & MASK24) as u64
-                            };
-                            self.push_child(nd, &c, i, m, dc);
+                            w.prefetch(ud, rl);
                         }
                     }
-                    continue;
                 }
-                // A node whose wing parity cannot reach an endpoint in moves left = distance
-                // moves (its entry's viability bit, see `MaskTable::add_viable`) is dropped.
-                if viable && !mt.viable(nd.idx, nd.parity) {
-                    self.reads += 1;
-                    continue;
-                }
-                let dec = mt.get(t, nd.idx, nd.sym, &s, self.pair);
-                let live = self.pre.get(ix).copied().filter(|&l| l != u32::MAX);
-                let mut a = dec & ALLOWED_AFTER[nd.last as usize];
-                self.nodes += a.count_ones() as u64;
+                pre.push(e);
+            }
+        }
+        self.pre = pre;
+        for (ix, nd) in cur.iter().enumerate() {
+            let s = nd.state();
+            if nd.d < nd.left {
+                // A node with slack (reduced table): its children's distances from its
+                // own entry, as in `dfs_eq`; they are all queued, or with one move left
+                // tested.
+                let (d, left) = (nd.d, nd.left);
+                let allowed = ALLOWED_AFTER[nd.last as usize];
+                let (dec_all, eq_all) = mt.get_dec_eq(nd.idx, nd.sym);
+                let (dec, eq) = (dec_all & allowed, eq_all & allowed);
+                self.nodes += allowed.count_ones() as u64;
                 self.reads += 1;
-                if nd.left == 1 {
-                    self.leaf(
-                        &s,
-                        1,
-                        nd.last as usize,
-                        Some(a),
-                        nd.run,
-                        Some((nd.id, None)),
-                    );
-                    if self.stop {
-                        self.batch.clear();
-                        return;
-                    }
-                } else if nd.left == 2 && !mt.batch_leaves {
-                    // Over all pairs, a child (at distance 1) whose wings have even parity has
-                    // no endpoint below it: its last move must not be a wide quarter turn, and
-                    // then cannot stage the centres or is a phase-2 move in every frame (see
-                    // `leaf`). Its last moves are counted, not tested.
-                    if self.pair == ALL_PAIRS {
-                        let even = if s.parity {
-                            WIDE_QUARTER
-                        } else {
-                            !WIDE_QUARTER
-                        };
-                        let mut b = a & even;
-                        a &= !even;
-                        while b != 0 {
-                            let m = b.trailing_zeros() as usize;
-                            b &= b - 1;
-                            self.nodes += LEAF_MOVES[0][m] as u64;
-                        }
-                    }
-                    // Nor has one that the child bits rule out (odd parity: counted too).
-                    if viable {
-                        let live = self.live_children(nd, a, nd.d, nd.left, dec, 0);
+                let mut a = if d + 1 < left { allowed } else { dec | eq };
+                if viable {
+                    // The children that cannot reach an endpoint (child bits) are not
+                    // queued, nor tested (their last moves are counted).
+                    let live = match self.pre.get(ix) {
+                        Some(&l) if l != u32::MAX => l,
+                        _ => self.live_children(nd, a, d, left, dec_all, eq_all),
+                    };
+                    if left == 2 {
                         let mut b = a & !live;
-                        a = live;
                         while b != 0 {
                             let m = b.trailing_zeros() as usize;
                             b &= b - 1;
-                            self.nodes += LEAF_MOVES[1][m] as u64;
+                            let odd = nd.parity ^ (WIDE_QUARTER >> m & 1 == 1);
+                            self.nodes += LEAF_MOVES[odd as usize][m] as u64;
                         }
                     }
-                    while a != 0 {
-                        let m = a.trailing_zeros() as usize;
-                        a &= a - 1;
-                        let c = s.apply(m, t);
+                    a = live;
+                }
+                let flags = s.centre_flags();
+                while a != 0 {
+                    let m = a.trailing_zeros() as usize;
+                    a &= a - 1;
+                    let dc = d + 1 - 2 * (dec >> m & 1) as u8 - (eq >> m & 1) as u8;
+                    let c = s.apply(m, t);
+                    if left == 2 {
                         let run = run_after(nd.run, nd.last as usize, m);
-                        self.leaf(&c, 1, m, None, run, Some((nd.id, Some(m as u8))));
+                        self.leaf(&c, dc, m, None, run, Some((nd.id, Some(m as u8))));
                         if self.stop {
                             self.batch.clear();
                             return;
                         }
-                    }
-                } else if mt.kind == crate::p1mask::MaskKind::Pair {
-                    // The children's first index: the rank of the pair's positions.
-                    let flags = t.pat.as_ref().unwrap().flags(&s.centres, self.pair);
-                    while a != 0 {
-                        let m = a.trailing_zeros() as usize;
-                        a &= a - 1;
+                    } else {
                         let i = || {
                             let g = unsafe { child_flags(&flags, m, t) };
-                            t.staging.rank24(crate::simd::movemask(&g)) as u64
+                            let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
+                            t.staging.rank24(!nud & MASK24) as u64
                         };
-                        let c = s.apply(m, t);
-                        self.push_child(nd, &c, i, m, nd.left - 1);
-                    }
-                } else {
-                    if viable {
-                        // The children that cannot reach an endpoint are not queued (the
-                        // reduced table's child bits; they are still counted as nodes).
-                        a = match live {
-                            Some(a) => a,
-                            None => self.live_children(nd, a, nd.d, nd.left, dec, 0),
-                        };
-                    }
-                    let flags = s.centre_flags();
-                    while a != 0 {
-                        let m = a.trailing_zeros() as usize;
-                        a &= a - 1;
-                        let i = || {
-                            let g = unsafe { child_flags(&flags, m, t) };
-                            // The reduced table needs only the rank of the U/D positions.
-                            if reduced {
-                                let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
-                                t.staging.rank24(!nud & MASK24) as u64
-                            } else {
-                                t.staging.big_index_flags(&g)
-                            }
-                        };
-                        let c = s.apply(m, t);
-                        self.push_child(nd, &c, i, m, nd.left - 1);
+                        self.push_child(nd, &c, i, m, dc);
                     }
                 }
+                continue;
             }
-            cur.clear();
-            self.batch_next = cur;
+            // A node whose wing parity cannot reach an endpoint in moves left = distance
+            // moves (its entry's viability bit, see `MaskTable::add_viable`) is dropped.
+            if viable && !mt.viable(nd.idx, nd.parity) {
+                self.reads += 1;
+                continue;
+            }
+            let dec = mt.get(t, nd.idx, nd.sym, &s, self.pair);
+            let live = self.pre.get(ix).copied().filter(|&l| l != u32::MAX);
+            let mut a = dec & ALLOWED_AFTER[nd.last as usize];
+            self.nodes += a.count_ones() as u64;
+            self.reads += 1;
+            if nd.left == 1 {
+                self.leaf(
+                    &s,
+                    1,
+                    nd.last as usize,
+                    Some(a),
+                    nd.run,
+                    Some((nd.id, None)),
+                );
+                if self.stop {
+                    self.batch.clear();
+                    return;
+                }
+            } else if nd.left == 2 && !mt.batch_leaves {
+                // Over all pairs, a child (at distance 1) whose wings have even parity has
+                // no endpoint below it: its last move must not be a wide quarter turn, and
+                // then cannot stage the centres or is a phase-2 move in every frame (see
+                // `leaf`). Its last moves are counted, not tested.
+                if self.pair == ALL_PAIRS {
+                    let even = if s.parity {
+                        WIDE_QUARTER
+                    } else {
+                        !WIDE_QUARTER
+                    };
+                    let mut b = a & even;
+                    a &= !even;
+                    while b != 0 {
+                        let m = b.trailing_zeros() as usize;
+                        b &= b - 1;
+                        self.nodes += LEAF_MOVES[0][m] as u64;
+                    }
+                }
+                // Nor has one that the child bits rule out (odd parity: counted too).
+                if viable {
+                    let live = self.live_children(nd, a, nd.d, nd.left, dec, 0);
+                    let mut b = a & !live;
+                    a = live;
+                    while b != 0 {
+                        let m = b.trailing_zeros() as usize;
+                        b &= b - 1;
+                        self.nodes += LEAF_MOVES[1][m] as u64;
+                    }
+                }
+                while a != 0 {
+                    let m = a.trailing_zeros() as usize;
+                    a &= a - 1;
+                    let c = s.apply(m, t);
+                    let run = run_after(nd.run, nd.last as usize, m);
+                    self.leaf(&c, 1, m, None, run, Some((nd.id, Some(m as u8))));
+                    if self.stop {
+                        self.batch.clear();
+                        return;
+                    }
+                }
+            } else if mt.kind == crate::p1mask::MaskKind::Pair {
+                // The children's first index: the rank of the pair's positions.
+                let flags = t.pat.as_ref().unwrap().flags(&s.centres, self.pair);
+                while a != 0 {
+                    let m = a.trailing_zeros() as usize;
+                    a &= a - 1;
+                    let i = || {
+                        let g = unsafe { child_flags(&flags, m, t) };
+                        t.staging.rank24(crate::simd::movemask(&g)) as u64
+                    };
+                    let c = s.apply(m, t);
+                    self.push_child(nd, &c, i, m, nd.left - 1);
+                }
+            } else {
+                if viable {
+                    // The children that cannot reach an endpoint are not queued (the
+                    // reduced table's child bits; they are still counted as nodes).
+                    a = match live {
+                        Some(a) => a,
+                        None => self.live_children(nd, a, nd.d, nd.left, dec, 0),
+                    };
+                }
+                let flags = s.centre_flags();
+                while a != 0 {
+                    let m = a.trailing_zeros() as usize;
+                    a &= a - 1;
+                    let i = || {
+                        let g = unsafe { child_flags(&flags, m, t) };
+                        // The reduced table needs only the rank of the U/D positions.
+                        if reduced {
+                            let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
+                            t.staging.rank24(!nud & MASK24) as u64
+                        } else {
+                            t.staging.big_index_flags(&g)
+                        }
+                    };
+                    let c = s.apply(m, t);
+                    self.push_child(nd, &c, i, m, nd.left - 1);
+                }
+            }
         }
     }
 
@@ -2083,7 +2114,8 @@ mod tests {
     }
 
     /// The batched search with move masks (computed, and the reduced table with its
-    /// viability bits and equal masks, slack nodes batched or not), and the per-pair searches
+    /// viability bits and equal masks, slack nodes batched or not, batch rounds in chunks of
+    /// any size), and the per-pair searches
     /// with the pattern table, find exactly the
     /// plain search's (endpoint, frame) pairs (needs the large staging table, and for the
     /// pairs the reduced pattern table, in ./tables; skipped without them; the reduced mask
@@ -2114,6 +2146,15 @@ mod tests {
                     t.mask = reduced.take();
                     t.mask.as_mut().unwrap().slack_batch = k;
                     assert_eq!(endpoint_set(&t, &root, len, false), want);
+                    reduced = t.mask.take();
+                }
+                // Batch rounds in chunks of one node and of three (depth first throughout).
+                for chunk in [1, 3] {
+                    t.mask = reduced.take();
+                    let mt = t.mask.as_mut().unwrap();
+                    (mt.slack_batch, mt.chunk) = (crate::p1mask::SLACK_BATCH, chunk);
+                    assert_eq!(endpoint_set(&t, &root, len, false), want);
+                    t.mask.as_mut().unwrap().chunk = crate::p1mask::CHUNK;
                     reduced = t.mask.take();
                 }
                 if with_pat {
