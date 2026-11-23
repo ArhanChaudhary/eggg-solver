@@ -1001,14 +1001,26 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     batch_tree: Vec<(u32, u8)>,
     batch_roots: Vec<u8>,
     batch_path: Vec<u8>,
-    /// Per node of the current round, the children that can still reach an endpoint, if
-    /// computed ahead (u32::MAX: not), to prefetch the children's wing-path table entries
-    /// (see [`Search1::run_batch_round`]), and those of them whose wing-path lists are
-    /// located in `located` from an offset.
-    pre: Vec<(u32, u32, u32)>,
+    /// Per node of the current round, what the pass ahead of the wing-path tests found (see
+    /// [`Search1::run_batch_round`]).
+    pre: Vec<Pre>,
     /// The wing-path lists of the children tested in the current round, located ahead (see
     /// [`crate::wingpath::WingPaths::locate`]).
     located: Vec<u64>,
+}
+
+/// What the pass ahead of a batch round's wing-path tests found about a node (see
+/// [`Search1::run_batch_round`]).
+#[derive(Clone, Copy)]
+struct Pre {
+    /// The children that can still reach an endpoint (u32::MAX: not computed, nor the rest).
+    live: u32,
+    /// Those whose wing-path lists are located in `Search1::located`, from `base`.
+    tested: u32,
+    base: u32,
+    /// The node's decreasing and keeping moves (the latter only for a node with slack).
+    dec: u32,
+    eq: u32,
 }
 
 /// Prefetch the wing-path entries of the tight batch nodes' children a pass ahead
@@ -1355,6 +1367,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             for nd in cur.iter() {
                 let (d, left) = (nd.d, nd.left);
                 let mut e = u32::MAX;
+                let (mut dec_all, mut eq_all) = (0, 0);
                 // The moves to children with the tests (tight ones, ones with slack 1).
                 let mut tested = 0;
                 // Those with slack 1, and with slack 2.
@@ -1368,13 +1381,14 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         let a = dec & ALLOWED_AFTER[nd.last as usize];
                         e = self.live_children(nd, a, d, left, dec, 0);
                         tested = e;
+                        dec_all = dec;
                     }
                 } else if left - 1 <= w.kmax
                     || left - 2 <= w.smax
                     || w.s2max.is_some_and(|x| left - 3 <= x)
                 {
                     let allowed = ALLOWED_AFTER[nd.last as usize];
-                    let (dec_all, eq_all) = mt.get_dec_eq(nd.idx, nd.sym);
+                    (dec_all, eq_all) = mt.get_dec_eq(nd.idx, nd.sym);
                     let (dec, eq) = (dec_all & allowed, eq_all & allowed);
                     let a = if d + 1 < left { allowed } else { dec | eq };
                     e = self.live_children(nd, a, d, left, dec_all, eq_all);
@@ -1422,7 +1436,13 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         }
                     }
                 }
-                pre.push((e, if red { 0 } else { tested }, base));
+                pre.push(Pre {
+                    live: e,
+                    tested: if red { 0 } else { tested },
+                    base,
+                    dec: dec_all,
+                    eq: eq_all,
+                });
             }
             for x in located.iter_mut() {
                 *x = w.locate(*x);
@@ -1438,7 +1458,12 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 // tested.
                 let (d, left) = (nd.d, nd.left);
                 let allowed = ALLOWED_AFTER[nd.last as usize];
-                let (dec_all, eq_all) = mt.get_dec_eq(nd.idx, nd.sym);
+                // The masks read by the pass ahead, if it did.
+                let pre = self.pre.get(ix).copied().filter(|p| p.live != u32::MAX);
+                let (dec_all, eq_all) = match pre {
+                    Some(p) => (p.dec, p.eq),
+                    None => mt.get_dec_eq(nd.idx, nd.sym),
+                };
                 let (dec, eq) = (dec_all & allowed, eq_all & allowed);
                 self.nodes += allowed.count_ones() as u64;
                 self.reads += 1;
@@ -1446,8 +1471,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 if viable {
                     // The children that cannot reach an endpoint (child bits) are not
                     // queued, nor tested (their last moves are counted).
-                    let live = match self.pre.get(ix) {
-                        Some(&(l, _, _)) if l != u32::MAX => l,
+                    let live = match pre {
+                        Some(p) => p.live,
                         _ => self.live_children(nd, a, d, left, dec_all, eq_all),
                     };
                     if left == 2 {
@@ -1462,7 +1487,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     a = live;
                 }
                 let flags = s.centre_flags();
-                let (tested, base) = self.pre.get(ix).map_or((0, 0), |p| (p.1, p.2));
+                let (tested, base) = pre.map_or((0, 0), |p| (p.tested, p.base));
                 while a != 0 {
                     let m = a.trailing_zeros() as usize;
                     a &= a - 1;
@@ -1489,14 +1514,19 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             }
             // A node whose wing parity cannot reach an endpoint in moves left = distance
             // moves (its entry's viability bit, see `MaskTable::add_viable`) is dropped.
-            if viable && !mt.viable(nd.idx, nd.parity) {
+            // (The pass ahead read the entry of a node it found viable.)
+            let pre = self.pre.get(ix).copied().filter(|p| p.live != u32::MAX);
+            if viable && pre.is_none() && !mt.viable(nd.idx, nd.parity) {
                 self.reads += 1;
                 continue;
             }
-            let dec = mt.get(t, nd.idx, nd.sym, &s, self.pair);
-            let (live, tested, base) = match self.pre.get(ix) {
-                Some(&(l, tested, base)) if l != u32::MAX => (Some(l), tested, base),
-                _ => (None, 0, 0),
+            let dec = match pre {
+                Some(p) => p.dec,
+                None => mt.get(t, nd.idx, nd.sym, &s, self.pair),
+            };
+            let (live, tested, base) = match pre {
+                Some(p) => (Some(p.live), p.tested, p.base),
+                None => (None, 0, 0),
             };
             let mut a = dec & ALLOWED_AFTER[nd.last as usize];
             self.nodes += a.count_ones() as u64;
