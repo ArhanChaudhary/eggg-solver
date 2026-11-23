@@ -1,14 +1,14 @@
 # Optimisation log: everything tried so far
 
-Status as of 2026-11-21. ✅ merged into master, ❌ tried and not merged (measured), ⏳ in
+Status as of 2026-11-23. ✅ merged into master, ❌ tried and not merged (measured), ⏳ in
 progress, ⏸ waiting for the 48-thread x86 server (busy with another project since
 2026-11-17). Numbers are mean solution lengths (moves) on random positions unless stated;
 "M2" is the 8-core ARM laptop, "x86" the 48-core server. Branch names in `code`; every
 branch, merged or not, is on GitHub.
 
 **Where things stand:** at 20 s on the M2 (8 threads, 50 positions) the solver averages
-**38.74** moves; on 2026-11-18 it needed about 2 minutes on the same machine for 38.80.
-Phase 1 is ~87% of the run time, so most recent work targets it.
+**38.66** moves; on 2026-11-18 it needed about 2 minutes on the same machine for 38.80.
+Phase 1 is still most of the run time, so most recent work targets it.
 
 ## Phase 1 (staged centres + pairable wings)
 
@@ -26,6 +26,8 @@ Phase 1 is ~87% of the run time, so most recent work targets it.
 | ✅ | Child "live" bits in the mask entries (`opt/p1-live`) | Precomputed bits skip the 29% of children that could never progress. +19% phase-1 throughput (8 threads), +24% (1 thread); lengths about equal. |
 | ✅ | **Wing-path table** (`opt/p1-wing3`) | Per centre state, the wing slot sets its few staging paths need, so only 0.2–0.5% of tight nodes pass (5.2% before). Phase-1 check 2.55x faster; 50 positions × 20 s: **38.94 → 38.74** (8 shorter, 0 longer). |
 | ✅ | Phase boundary hand-over | Phase 1's trailing same-axis moves go to phase 2, so reductions are no longer missed at the phase-1/phase-2 boundary. |
+| ✅ | Cheaper, stronger wing-path tests (`opt/p1-wingpath2`) | Key cached from the prefetch pass, bit-sliced preimage lists, lists for nodes with two spare moves, reduced next-layer lists, branch-free liveness: phase-1 check 38–45% faster, same endpoints; 50 × 20 s 38.78 → 38.66 (4 shorter, 0 longer). |
+| ❌ | Wide 64-preimage slices (`opt/p1-wingpath2-wide`) | 3–10% slower than the 8-per-plane slicing. |
 | ❌ | Lanes (`opt/p1-lanes`) | Several jobs interleaved per thread: same endpoints, slower. |
 | ❌ | Parity rule + staged-parent shortcut (`opt/p1-shortcuts`) | Exact, but only 0.7% fewer nodes and slower overall. |
 | ❌ | Slices (`opt/slices`) | Cheap endpoints with an H-move tail searched first. Helped short runs, hurt long ones. |
