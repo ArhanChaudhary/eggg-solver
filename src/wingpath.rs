@@ -1280,8 +1280,12 @@ impl WingPaths {
             if n != 0 {
                 // SAFETY: the list is in the table.
                 unsafe {
-                    crate::table::prefetch(pairs.as_ptr().add(off));
-                    crate::table::prefetch(pairs.as_ptr().add(off + PLANE * n - 1));
+                    // Its first four lines (the lists are long), and its last.
+                    let end = off + PLANE * n - 1;
+                    for j in 0..4 {
+                        crate::table::prefetch(pairs.as_ptr().add((off + 16 * j).min(end)));
+                    }
+                    crate::table::prefetch(pairs.as_ptr().add(end));
                 }
             }
             return off as u64 | (n as u64) << 32 | SLACK2;
@@ -1304,11 +1308,14 @@ impl WingPaths {
             off as u64 | (n as u64) << 32
         } else {
             let o = Self::slack_header(s);
-            // The header's line and the next (most lists end there).
-            // SAFETY: the header is in the table, and the second address is clamped to it.
+            // The header's line and the next three (most lists end there).
+            // SAFETY: the header is in the table, and the other addresses are clamped to it.
             unsafe {
                 crate::table::prefetch(p.add(o));
-                crate::table::prefetch(p.add((o + 16).min(self.pairs.len() - 1)));
+                let last = self.pairs.len() - 1;
+                for j in 1..4 {
+                    crate::table::prefetch(p.add((o + 16 * j).min(last)));
+                }
             }
             o as u64 | SLACK
         }
