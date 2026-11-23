@@ -1281,6 +1281,7 @@ impl<'a, 'r> Run<'a, 'r> {
         let stop = self.stop;
         let made = AtomicUsize::new(0);
         let started = AtomicUsize::new(0);
+        let seen_all = AtomicU64::new(0);
         let t_level = Instant::now();
         let round = self.stats.rounds as u32;
         let cut = self.p2_cut;
@@ -1342,6 +1343,7 @@ impl<'a, 'r> Run<'a, 'r> {
                 None => srch.dfs(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep),
             };
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
+            seen_all.fetch_add(seen as u64, Ordering::Relaxed);
             made.fetch_add(local.len(), Ordering::Relaxed);
             if !srch.aborted {
                 finished[k].fetch_add(1, Ordering::Relaxed);
@@ -1418,14 +1420,16 @@ impl<'a, 'r> Run<'a, 'r> {
                 "done"
             };
             eprintln!(
-                "[{:8.3}] P2LEVEL {t12}: todo {} started {} finished {} kept reds {} (need {need}) nodes {:.3e} in {:.3} s ({why})",
+                "[{:8.3}] P2LEVEL {t12}: todo {} started {} finished {} kept reds {} (need {need}) nodes {:.3e} in {:.3} s ({why}) seen {} best {}",
                 self.start.elapsed().as_secs_f64(),
                 todo.len(),
                 started.load(Ordering::Relaxed),
                 n_fin,
                 made.load(Ordering::Relaxed),
                 nodes.load(Ordering::Relaxed) as f64,
-                t_level.elapsed().as_secs_f64()
+                t_level.elapsed().as_secs_f64(),
+                seen_all.load(Ordering::Relaxed),
+                self.best_len() as isize
             );
         }
         self.stats.nodes2 += nodes.load(Ordering::Relaxed);
