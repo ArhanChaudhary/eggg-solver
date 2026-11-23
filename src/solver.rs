@@ -578,10 +578,11 @@ struct Run<'a, 'r> {
     /// Debug output (`EGGG_DEBUG`).
     trace: bool,
     knobs: Knobs,
-    /// Adaptive margin (see [`Knobs::adapt`]): levels below the schedule's margin, and the
-    /// time of the last change and the phase-2 and 3 time since.
+    /// Adaptive margin (see [`Knobs::adapt`]): levels below the schedule's margin, the start
+    /// of the current measuring window (None: the next round is a change's catch-up and is
+    /// not measured) and the phase-2 and 3 time in it.
     margin_extra: usize,
-    adapt_at: f64,
+    adapt_at: Option<f64>,
     adapt_p23: Duration,
     /// Debug: the current phase-1 level's nodes, endpoints and kept candidates so far, when
     /// it started, and the previous level's nodes.
@@ -667,7 +668,7 @@ impl<'a> Solver<'a> {
             trace: std::env::var_os("EGGG_DEBUG").is_some(),
             knobs: Knobs::from_env(),
             margin_extra: 0,
-            adapt_at: 0.0,
+            adapt_at: None,
             adapt_p23: Duration::ZERO,
             lvl_nodes: 0,
             lvl_eps: 0,
@@ -675,7 +676,6 @@ impl<'a> Solver<'a> {
             lvl_start: 0.0,
             prev_lvl_nodes: 0,
         };
-        run.adapt_at = run.knobs.adapt_from;
         run.level.jobs = run.level_jobs(len0);
         std::thread::scope(|scope| {
             // Watchdog that raises the stop flag at the deadline.
@@ -838,10 +838,7 @@ impl<'a, 'r> Run<'a, 'r> {
             self.phase3_levels(t1 + budget);
             self.stats.time[2] += t1.elapsed();
             check += t1.elapsed();
-            if self.start.elapsed().as_secs_f64() >= self.knobs.adapt_from {
-                self.adapt_p23 += t1.elapsed() + p2_round;
-            }
-            self.adapt();
+            self.adapt(t1.elapsed() + p2_round);
             if std::env::var_os("EGGG_MEM").is_some() {
                 self.mem_report();
             }
@@ -853,8 +850,12 @@ impl<'a, 'r> Run<'a, 'r> {
         }
     }
 
-    /// The adaptive margin (see [`Knobs::adapt`]), after each round.
-    fn adapt(&mut self) {
+    /// The adaptive margin (see [`Knobs::adapt`]), after each round (`p23`: the round's
+    /// phase-2 and 3 time). The share of phases 2 and 3 is measured over the rounds since the
+    /// last change, except the first one (which catches up with the new level), and over at
+    /// least `ADAPT_WINDOW` of the time elapsed (about one round).
+    fn adapt(&mut self, p23: Duration) {
+        const ADAPT_WINDOW: f64 = 0.15;
         let k = &self.knobs;
         let elapsed = self.start.elapsed().as_secs_f64();
         if !k.adapt.is_finite()
@@ -865,9 +866,15 @@ impl<'a, 'r> Run<'a, 'r> {
         {
             return;
         }
-        // Wait for the time to grow 1.5x since the last change (its catch-up is over).
-        let since = elapsed - self.adapt_at;
-        if since < 0.5 * self.adapt_at {
+        let Some(at) = self.adapt_at else {
+            // The window starts after this round.
+            self.adapt_at = Some(elapsed);
+            self.adapt_p23 = Duration::ZERO;
+            return;
+        };
+        self.adapt_p23 += p23;
+        let since = elapsed - at;
+        if since < ADAPT_WINDOW * elapsed {
             return;
         }
         let share = self.adapt_p23.as_secs_f64() / since.max(1e-9);
@@ -881,7 +888,11 @@ impl<'a, 'r> Run<'a, 'r> {
                     since
                 );
             }
-            self.adapt_at = elapsed;
+            self.adapt_at = None;
+        } else {
+            // A sliding window: the latest rounds only (the best length, and with it the
+            // cost of the deepest level, changes during the run).
+            self.adapt_at = Some(elapsed);
             self.adapt_p23 = Duration::ZERO;
         }
     }
