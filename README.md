@@ -158,9 +158,13 @@ about as many chances, and long runs keep improving. The rounds are timed agains
 limit: once a solution exists, each round's phase 1 stops early enough (at 1/1.3 of the time
 left) for that round's phase 2 and 3 to run before the limit, rounds last at most a quarter
 of the time elapsed so improvements arrive steadily, and deep phase-2 searches are split into
-tasks over the threads. 48 threads, two sets of 20 random
-positions: 39.7 / 39.5 moves on average after 2 s, 39.0 / 39.1 after 30 s, 38.8 / 39.1
-after 60 s.
+tasks over the threads. 48 threads (x86 server), 50 random positions (seed 6060), current
+version: 38.56 / 38.54 / 38.52 / 38.50 moves on average after 10 s with the large / huge /
+xl / xxl tiers (the larger tables mainly help in the first second: 39.66 / 39.46 / 39.34 /
+39.32 after 0.5 s; the 15 GB depth-8 wing-path table, `--p1-wing 8`, adds nothing at 48
+threads); 50 other positions (seed 3030): 38.76 after 2 s with the huge tier. (Before the
+masks, the round cut, the faster phase 2 and the wing-path tables, 2026-11-17: 39.7 / 39.5
+after 2 s, 38.8 / 39.1 after 60 s on two sets of 20 positions.)
 
 ## Development
 

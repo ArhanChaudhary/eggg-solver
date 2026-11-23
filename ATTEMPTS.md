@@ -44,7 +44,7 @@ Phase 1 is still most of the run time, so most recent work targets it.
 | ❌ | Centre-blind wing table 3 moves out | Prunes only 54% of 3-left nodes, at about the cost it saves. Led to the wing-path table instead. |
 | ❌ | Pattern tables (`--p1-pat`, opt-in) | Per-colour-pair searches: 1.4x fewer reads, superseded by the masks. |
 | ❌ | Finer job ordering (`opt/p1-order2`) | 4- and 5-move jobs ranked by hierarchical yield: at most +3–6% kept candidates (oracle +16–37%), neutral in length (38.96 vs 38.94). |
-| ✅ | Wing-path depth 8 (`opt/wing-mem`, `--p1-wing 8`) | The build used ~2x the final size (OOM on a 32 GB machine); now the table is 14.6 GB, the build peaks at 15 GB, `--tier large --p1-wing 8` at ~19.5 GB, and it is saved to disk after the first build. Not a tier default yet (needs a 48-thread timing). |
+| ✅ | Wing-path depth 8 (`opt/wing-mem`, `--p1-wing 8`) | The build used ~2x the final size (OOM on a 32 GB machine); now the table is 15.2 GB, built in ~40 s and saved to disk. Opt-in only: at 48 threads (50 × 10 s) huge/xl/xxl with depth 8 match depth 7 to within one position. |
 | ⏸ | Unreduced 8-byte mask table (~38 GB) | No symmetry handling at all; estimated 1.2–1.3x. Needs the x86 server's memory. |
 | ⏸ | 17.5 GB pair-mask table, 18.9 GB large mask table | Existing opt-in options, never benchmarked at full size. |
 
@@ -84,7 +84,7 @@ Phase 1 is still most of the run time, so most recent work targets it.
 | ✅ | Bounded memory in long runs | Drops hopeless candidates and reductions; fixed a 74 GB blow-up in the 1-hour run. |
 | ✅ | Phase 3 gets 3x the budget until the first solution | First solution 2.67 → 1.24 s (M2 mean). |
 | ✅ | Round cut (`opt/round-cut`) | The round running at the deadline is searched instead of thrown away (19–35% of the time before). 60 s: 39.15 → 38.95; overrun 1.1 → 0.04 s. |
-| ✅ | Smaller rounds after the first solution (`opt/round-small`) | Improvements arrive sooner; final lengths unchanged, also at 2 s on the M2. ⏸ 48-thread 2 s check pending. |
+| ✅ | Smaller rounds after the first solution (`opt/round-small`) | Improvements arrive sooner; final lengths unchanged, also at 2 s on the M2 and at 2 s with 48 threads (39.18 vs 39.20, 50 positions). |
 | ❌ | Check-first scheduler (`opt/scheduler`) | Always doing the cheapest work first; its phase-3 checks cost too much. |
 | ❌ | Phase-3 budget / round growth tuning (`opt/tune`), long-run caps (`opt/long-tune`), margin schedules | The existing constants were already at the optimum. |
 
@@ -92,6 +92,7 @@ Phase 1 is still most of the run time, so most recent work targets it.
 
 | | Attempt | Summary |
 |---|---|---|
+| ✅ | Tier sweep at 48 threads (x86, 50 × 10 s) | large / huge / xl / xxl: 38.56 / 38.54 / 38.52 / 38.50 at 10 s; the bigger tables mainly help in the first second (39.66 → 39.32 at 0.5 s). |
 | ✅ | Tiers (`--tier`, auto by memory) | tiny / small / medium / large / huge / xl / xxl = 0.16 / 0.35 / 2.3 / 4.85 / 7.9 / 19.3 / 64.9 GB. Mix and match with `--h48`, `--p2-joint`, `--p1-mask`, `--p1-wing`. |
 | ✅ | Bounded memory in long runs (`fix/long-run-memory`) | Rounds kept every phase-1 endpoint until the round ended, and deep batches grew 10x per length: 8 → 34 GB in 40 minutes. Candidates are now made as endpoints are found, batches run in chunks: 7.9–8.3 GB over 90 minutes, same lengths (8-thread phase-1 rate −3.6%). |
 | ✅ | `solve --ties`; no time limit by default | Print every solution as short as the best so far; `solve` runs until stopped or `-l` (bench keeps 5 s). |
