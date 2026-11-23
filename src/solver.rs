@@ -1483,10 +1483,12 @@ impl P1Extra {
 
 /// The wing-path lookahead for the batched nodes, with largest distance `k` for tight nodes
 /// (0: none; the tiers' defaults are [`WINGK`] and 6 for the large tier) and, for nodes with
-/// one move of slack, `EGGG_P1_WINGS` (default [`WINGS`], at most `k`); see
-/// [`crate::wingpath`]. Built (in ~1 s up to distance 7), or from distance [`WING_FILE_K`] on
-/// loaded from `dir` (e.g. `p1-wing-k8s5.tab`; built and saved if missing or invalid: 14.6 GB
-/// and about a minute for distance 8).
+/// one move of slack, `EGGG_P1_WINGS` (default [`WINGS`], or [`WINGS_DEEP`] from `k` = 7
+/// on; at most `k`); see
+/// [`crate::wingpath`]. Built (in a few seconds up to distance 7), or from distance
+/// [`WING_FILE_K`] on loaded from `dir` (e.g. `p1-wingb-k8s6.tab`; built and saved if missing
+/// or invalid: 15.2 GB and about a minute for distance 8); then the slack-2 lists are added
+/// (see [`WINGS2`]).
 pub fn wing_paths(
     dir: &std::path::Path,
     k: u8,
@@ -1497,10 +1499,10 @@ pub fn wing_paths(
     if k == 0 {
         return None;
     }
-    let sk = env("EGGG_P1_WINGS", WINGS).min(k);
+    let sk = env("EGGG_P1_WINGS", if k >= 7 { WINGS_DEEP } else { WINGS }).min(k);
     let t0 = Instant::now();
     let frames = [0, 1, 2].map(crate::phase1::Frame::new);
-    let red = env("EGGG_P1_WINGR", WINGR as u8) != 0;
+    let red = env("EGGG_P1_WINGR", (k <= WINGR_K) as u8) != 0;
     let (w, how) = if k >= WING_FILE_K {
         let path = dir.join(WingPaths::file_name(k, sk));
         match WingPaths::load(&path, &frames, k, sk, red) {
@@ -1518,10 +1520,20 @@ pub fn wing_paths(
     } else {
         (WingPaths::new(&frames, k, sk, red), "built")
     };
+    let mut w = w;
+    // Slack-2 lists up to distance `EGGG_P1_WINGS2` (default [`WINGS2`]; at most `sk` and
+    // `k` - 1; none if negative).
+    let s2 = std::env::var("EGGG_P1_WINGS2")
+        .ok()
+        .map_or(WINGS2 as i32, |v| v.parse::<i32>().expect("EGGG_P1_WINGS2"));
+    if s2 >= 0 {
+        w.add_slack2((s2 as u8).min(sk).min(k - 1));
+    }
     w.collapse();
     if verbose {
         eprintln!(
-            "wing-path table (distance <= {k}, slack <= {sk}, reduced {}): {:.1} MB, {how} in {:.2} s",
+            "wing-path table (distance <= {k}, slack <= {sk}, slack 2 <= {:?}, reduced {}): {:.1} MB, {how} in {:.2} s",
+            w.s2max,
             if red { k + 1 } else { 0 },
             w.bytes() as f64 / 1e6,
             t0.elapsed().as_secs_f64()
@@ -1538,9 +1550,19 @@ pub const WING_FILE_K: u8 = 8;
 /// with one move of slack (see [`crate::wingpath`]).
 pub const WINGK: u8 = 7;
 pub const WINGS: u8 = 5;
-/// Whether the wing-path lookahead also has the symmetry-reduced lists one move further
-/// (`EGGG_P1_WINGR`, see [`crate::wingpath::Reduced`]).
-pub const WINGR: bool = false;
+/// The default largest distance of the slack-1 lists with tight lists up to distance 7 or
+/// more (the huge and larger tiers): 0.56 GB more than [`WINGS`], phase 1 7% faster
+/// (p1check on the M2).
+pub const WINGS_DEEP: u8 = 6;
+/// The default largest distance of the slack-2 lists (`EGGG_P1_WINGS2`; negative: none; see
+/// [`crate::wingpath::WingPaths::add_slack2`]): 25 MB up to distance 4 (p1check 7% faster
+/// than none on the M2); distance 5 adds 0.4 GB for 1% more.
+pub const WINGS2: i8 = 4;
+/// The wing-path lookahead also has the symmetry-reduced lists one move further
+/// (`EGGG_P1_WINGR`, see [`crate::wingpath::Reduced`]) by default when its largest distance
+/// is at most this: distance 7 after a table up to 6 (the large tier) adds 0.25 GB, built in
+/// about a second, for 8% (p1check on the M2); distance 8 would add 2.7 GB and 20 s.
+pub const WINGR_K: u8 = 6;
 
 /// Load or build the phase-2 tables in `dir`; `joint`: also the joint table (1.05 GB).
 pub fn load_p2(dir: &std::path::Path, joint: bool, threads: usize, verbose: bool) -> P2Tables {

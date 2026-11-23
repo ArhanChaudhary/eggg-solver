@@ -467,6 +467,24 @@ impl MaskTable {
                 || pre & unsafe { *LATER_SAME_AXIS.get_unchecked(m) } != 0)
     }
 
+    /// [`MaskTable::child_live`] for every move at once, without a branch per move: the moves
+    /// whose children (if at distance = moves left) can still reach an endpoint, for a node
+    /// with symmetry `sym` and child bits `bits`. The stored bits are mapped to the searched
+    /// moves by the mask conjugation, and `pre`'s moves on a later face of each outer move's
+    /// axis are found per face (face f's later faces on its axis are f + 3 and f + 6).
+    #[inline(always)]
+    pub fn live_moves(&self, bits: (u64, u64), sym: u8, pre: u32) -> u32 {
+        let c = unsafe { self.conj27.get_unchecked(sym as usize) };
+        let viable = Self::conj27(c, bits.0);
+        let live = Self::conj27(c, bits.1);
+        // Per face (bit 3f), whether `pre` has a move on it; then per outer face whether a
+        // later face of its axis has one, spread to the face's three moves.
+        let t = pre | pre >> 1 | pre >> 2;
+        let q = t & 0x124_9249;
+        let later = ((q >> 9 | q >> 18) * 7) & ((1 << N_OUTER) - 1);
+        viable & (!((1u32 << N_OUTER) - 1) | live | later)
+    }
+
     /// The 27-move masks of the moves that decrease and that keep the staging distance, of
     /// the state with reduced index `i` and symmetry `sym` (see [`MaskTable::resolve`];
     /// reduced table only).
@@ -861,6 +879,36 @@ fn load_pair(dir: &std::path::Path, t: &P1Tables, verbose: bool) -> MaskTable {
 mod tests {
     use super::*;
     use crate::cube::Cube;
+
+    /// [`MaskTable::live_moves`] is [`MaskTable::child_live`] for every move, for every
+    /// symmetry, random child and live bits and random (and all) `pre` masks.
+    #[test]
+    fn live_moves_match_child_live() {
+        let (conj27, inv27) = MaskTable::conj27_tables();
+        let mut t = MaskTable::empty(MaskKind::Reduced);
+        t.conj27 = conj27;
+        t.inv27 = inv27;
+        let mut rng = rand::thread_rng();
+        for sym in 0..t.inv27.len() {
+            for i in 0..2000 {
+                let bits: (u64, u64) = (
+                    rand::Rng::r#gen::<u64>(&mut rng),
+                    rand::Rng::r#gen::<u64>(&mut rng) & ((1 << N_OUTER) - 1),
+                );
+                let pre = if i % 4 == 0 {
+                    u32::MAX
+                } else {
+                    rand::Rng::r#gen::<u32>(&mut rng)
+                        & MASK27 as u32
+                        & rand::Rng::r#gen::<u32>(&mut rng)
+                };
+                let want = (0..N_MOVES).fold(0u32, |a, m| {
+                    a | (MaskTable::child_live(bits, t.stored_moves(sym as u8), m, pre) as u32) << m
+                });
+                assert_eq!(t.live_moves(bits, sym as u8, pre), want, "sym {sym}");
+            }
+        }
+    }
 
     /// The large and reduced tables' masks (as computed by their generators, from either
     /// staging table, for random states) are the moves that decrease and keep the distance;
