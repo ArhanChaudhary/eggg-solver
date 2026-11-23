@@ -264,8 +264,12 @@ impl Moves {
 /// list's sorted order) contains slot x.
 pub const PLANE: usize = 6;
 
-/// Words after the last plane of a table, so that a 32-byte read of any plane stays in it.
-const PAD_WORDS: usize = 2;
+/// Words after the last plane of a table, so that a 32-byte read of any plane, and of the
+/// plane after the end of any list (see [`any_pairable`]), stays in it.
+const PAD_WORDS: usize = 2 * PLANE + 2;
+/// The padding words saved (see [`WingPaths::save`]; as in the tables saved before the
+/// padding grew to [`PAD_WORDS`], which still load).
+const SAVED_PAD: usize = 2;
 
 /// The transpose of an 8 x 8 bit matrix (byte r holding row r, bit c of it column c).
 #[inline(always)]
@@ -1037,11 +1041,13 @@ impl WingPaths {
         let head = self.head();
         // SAFETY: plain data.
         let head = unsafe { std::slice::from_raw_parts(head.as_ptr() as *const u8, 64) };
-        crate::table::save_parts(
-            path,
-            NAME,
-            &[head, self.hash.slots.as_bytes(), self.pairs.as_bytes()],
-        )
+        let pairs = &self.pairs.as_bytes()[..4 * self.saved_pairs()];
+        crate::table::save_parts(path, NAME, &[head, self.hash.slots.as_bytes(), pairs])
+    }
+
+    /// The words of the pairs saved: with [`SAVED_PAD`] words of padding.
+    fn saved_pairs(&self) -> usize {
+        self.pairs.len() - PAD_WORDS + SAVED_PAD
     }
 
     /// The header of a saved table.
@@ -1052,7 +1058,7 @@ impl WingPaths {
             self.smax as u64,
             self.hash.bits as u64,
             self.hash.slots.len() as u64,
-            self.pairs.len() as u64,
+            self.saved_pairs() as u64,
             0,
             0,
         ]
@@ -1079,7 +1085,10 @@ impl WingPaths {
         if !(4..32).contains(&head[3]) || head[4] != (1 << head[3]) + PAD as u64 {
             return Err("bad wing-path table header".into());
         }
-        if head[5] > u32::MAX as u64 || 64 + 16 * head[4] + 4 * head[5] != r.len() as u64 {
+        if head[5] > u32::MAX as u64
+            || head[5] < SAVED_PAD as u64
+            || 64 + 16 * head[4] + 4 * head[5] != r.len() as u64
+        {
             return Err("bad wing-path table length".into());
         }
         let hash = Hash::with_bits(head[3] as u32);
@@ -1088,6 +1097,9 @@ impl WingPaths {
         let mut pairs = HugeBuf::zeroed(head[5] as usize);
         r.read(pairs.as_bytes_mut())?;
         r.finish()?;
+        // The padding: saved with less (see [`SAVED_PAD`]).
+        let n = pairs.len();
+        pairs.grow(n - SAVED_PAD + PAD_WORDS);
         let mut w = WingPaths {
             kmax,
             smax,
@@ -1433,27 +1445,52 @@ impl WingPaths {
 /// see [`WingPaths::check_frames`]). Per plane, its bytes gathered by the wings' slots give
 /// per wing the preimages containing its slot (bits); a dedge is split by those where its
 /// wings' bytes differ.
+///
+/// The planes are tested two at a time, those past the list's end (read, from the next list
+/// or the table's padding) masked off: most lists have one or two planes, and their test is
+/// then one pass without a loop exit that depends on the list's length (which the branch
+/// predictor cannot know: a mispredicted exit cost about as much as a plane).
 #[inline(always)]
 unsafe fn any_pairable(p: *const u32, n: usize, pos: &V32) -> bool {
-    for k in 0..n {
-        // SAFETY: the caller's.
-        let v = unsafe { std::ptr::read_unaligned(p.add(k * PLANE) as *const V32) };
-        let g = crate::simd::gather(&v, pos).0;
-        let w = |i: usize| u64::from_le_bytes(g[8 * i..8 * i + 8].try_into().unwrap());
-        let (w0, w1, w2) = (w(0), w(1), w(2));
-        // Even bytes: per dedge, the preimages splitting it (all of them, folded), and those
-        // containing its first wing (their parity, folded).
-        let mut a = (w0 ^ w0 >> 8) & (w1 ^ w1 >> 8) & (w2 ^ w2 >> 8);
-        let mut e = w0 ^ w1 ^ w2;
-        a &= a >> 32;
-        a &= a >> 16;
-        e ^= e >> 32;
-        e ^= e >> 16;
-        if a & !e & 0xff != 0 {
+    let mut k = 0;
+    loop {
+        // SAFETY: the caller's; the plane after the list's end is in the table (padded).
+        let (r0, r1) = unsafe {
+            (
+                plane_pairable(p.add(k * PLANE), pos),
+                plane_pairable(p.add((k + 1) * PLANE), pos),
+            )
+        };
+        let m0 = if k < n { 0xff } else { 0 };
+        let m1 = if k + 1 < n { 0xff } else { 0 };
+        if r0 & m0 | r1 & m1 != 0 {
             return true;
         }
+        k += 2;
+        if k >= n {
+            return false;
+        }
     }
-    false
+}
+
+/// The preimages of the plane at `p` (bits 0..8) that split every dedge of the wings `pos`
+/// with an even number of the dedges' first wings (see [`any_pairable`]).
+#[inline(always)]
+unsafe fn plane_pairable(p: *const u32, pos: &V32) -> u64 {
+    // SAFETY: the caller's.
+    let v = unsafe { std::ptr::read_unaligned(p as *const V32) };
+    let g = crate::simd::gather(&v, pos).0;
+    let w = |i: usize| u64::from_le_bytes(g[8 * i..8 * i + 8].try_into().unwrap());
+    let (w0, w1, w2) = (w(0), w(1), w(2));
+    // Even bytes: per dedge, the preimages splitting it (all of them, folded), and those
+    // containing its first wing (their parity, folded).
+    let mut a = (w0 ^ w0 >> 8) & (w1 ^ w1 >> 8) & (w2 ^ w2 >> 8);
+    let mut e = w0 ^ w1 ^ w2;
+    a &= a >> 32;
+    a &= a >> 16;
+    e ^= e >> 32;
+    e ^= e >> 16;
+    a & !e & 0xff
 }
 
 #[cfg(test)]
