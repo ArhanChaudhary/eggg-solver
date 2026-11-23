@@ -1651,7 +1651,6 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     /// respectively a decreasing move, a decreasing or keeping move, or any move of the node.
     #[inline(always)]
     fn live_children(&self, nd: &BNode, a: u32, d: u8, left: u8, dec: u32, eq: u32) -> u32 {
-        use crate::p1mask::MaskTable;
         let (tight, pre) = if d == left {
             (dec, dec)
         } else if d + 1 == left {
@@ -1663,17 +1662,21 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         };
         let mt = self.t.mask.as_ref().unwrap();
         let bits = mt.child_bits(nd.idx, nd.parity);
-        let stored = mt.stored_moves(nd.sym);
-        let mut x = a & tight;
-        let mut out = a;
-        while x != 0 {
-            let m = x.trailing_zeros() as usize;
-            x &= x - 1;
-            if !MaskTable::child_live(bits, stored, m, pre) {
-                out &= !(1 << m);
+        let live = mt.live_moves(bits, nd.sym, pre);
+        debug_assert_eq!(live & a & tight, {
+            let stored = mt.stored_moves(nd.sym);
+            let mut x = a & tight;
+            let mut out = 0;
+            while x != 0 {
+                let m = x.trailing_zeros() as usize;
+                x &= x - 1;
+                if crate::p1mask::MaskTable::child_live(bits, stored, m, pre) {
+                    out |= 1 << m;
+                }
             }
-        }
-        out
+            out
+        });
+        a & (!tight | live)
     }
 
     /// The fewest moves left of a node queued for a batch (1 if the batches also read the
