@@ -1519,13 +1519,12 @@ pub fn wing_paths(
         (WingPaths::new(&frames, k, sk, red), "built")
     };
     let mut w = w;
-    // Slack-2 lists up to distance `EGGG_P1_WINGS2` (at most `sk` and `k` - 1; none if
-    // unset or negative).
-    if let Some(s2) = std::env::var("EGGG_P1_WINGS2")
+    // Slack-2 lists up to distance `EGGG_P1_WINGS2` (default [`WINGS2`]; at most `sk` and
+    // `k` - 1; none if negative).
+    let s2 = std::env::var("EGGG_P1_WINGS2")
         .ok()
-        .map(|v| v.parse::<i32>().expect("EGGG_P1_WINGS2"))
-        .filter(|&v| v >= 0)
-    {
+        .map_or(WINGS2 as i32, |v| v.parse::<i32>().expect("EGGG_P1_WINGS2"));
+    if s2 >= 0 {
         w.add_slack2((s2 as u8).min(sk).min(k - 1));
     }
     w.collapse();
@@ -1549,6 +1548,10 @@ pub const WING_FILE_K: u8 = 8;
 /// with one move of slack (see [`crate::wingpath`]).
 pub const WINGK: u8 = 7;
 pub const WINGS: u8 = 5;
+/// The default largest distance of the slack-2 lists (`EGGG_P1_WINGS2`; negative: none; see
+/// [`crate::wingpath::WingPaths::add_slack2`]): 25 MB up to distance 4 (p1check 7% faster
+/// than none on the M2); distance 5 adds 0.4 GB for 1% more.
+pub const WINGS2: i8 = 4;
 /// Whether the wing-path lookahead also has the symmetry-reduced lists one move further
 /// (`EGGG_P1_WINGR`, see [`crate::wingpath::Reduced`]).
 pub const WINGR: bool = false;
