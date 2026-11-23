@@ -1242,6 +1242,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 let (ud, rl) = c.masks();
                 return w.possible_slack(ud, rl, &c.pos, c.parity);
             }
+            if d + 2 == left && w.s2max.is_some_and(|x| d <= x) {
+                let (ud, rl) = c.masks();
+                return w.possible_slack2(ud, rl, &c.pos, c.parity);
+            }
         }
         self.wings_possible(c, left, d)
     }
@@ -1347,14 +1351,15 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         pre.clear();
         located.clear();
         if let Some(w) = t.wingk.as_deref().filter(|_| viable && *WK_PREFETCH) {
-            use crate::wingpath::{ODD, SLACK};
+            use crate::wingpath::{ODD, SLACK, SLACK2};
             for nd in cur.iter() {
                 let (d, left) = (nd.d, nd.left);
                 let mut e = u32::MAX;
                 // The moves to children with the tests (tight ones, ones with slack 1).
                 let mut tested = 0;
-                // Those with slack 1.
+                // Those with slack 1, and with slack 2.
                 let mut slack = 0;
+                let mut slack2 = 0;
                 if left < 3 {
                 } else if d == left {
                     let red = w.red.is_some() && left - 1 == w.kmax + 1;
@@ -1364,7 +1369,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         e = self.live_children(nd, a, d, left, dec, 0);
                         tested = e;
                     }
-                } else if left - 1 <= w.kmax || left - 2 <= w.smax {
+                } else if left - 1 <= w.kmax
+                    || left - 2 <= w.smax
+                    || w.s2max.is_some_and(|x| left - 3 <= x)
+                {
                     let allowed = ALLOWED_AFTER[nd.last as usize];
                     let (dec_all, eq_all) = mt.get_dec_eq(nd.idx, nd.sym);
                     let (dec, eq) = (dec_all & allowed, eq_all & allowed);
@@ -1380,7 +1388,15 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         _ => (0, 0),
                     };
                     slack = e & if left - 2 <= w.smax { slack1 } else { 0 };
-                    tested = e & if left - 1 <= w.kmax { tight } else { 0 } | slack;
+                    if w.s2max.is_some_and(|x| left - 3 <= x) {
+                        slack2 = e & match left - d {
+                            2 => dec,
+                            3 => eq,
+                            4 => inc,
+                            _ => 0,
+                        };
+                    }
+                    tested = e & if left - 1 <= w.kmax { tight } else { 0 } | slack | slack2;
                 }
                 // The tests of the reduced lists (tight children one move beyond the table)
                 // are not split: only their entries are prefetched.
@@ -1398,7 +1414,11 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         } else {
                             let odd = nd.parity as u64 ^ (WIDE_QUARTER >> m & 1) as u64;
                             let bits = (odd * ODD) | ((slack >> m & 1) as u64 * SLACK);
-                            located.push(w.prefetch_key(ud, rl) | bits);
+                            if slack2 >> m & 1 == 1 {
+                                located.push(w.prefetch_key2(ud, rl) | bits | SLACK2);
+                            } else {
+                                located.push(w.prefetch_key(ud, rl) | bits);
+                            }
                         }
                     }
                 }

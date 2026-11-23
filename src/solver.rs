@@ -1518,10 +1518,21 @@ pub fn wing_paths(
     } else {
         (WingPaths::new(&frames, k, sk, red), "built")
     };
+    let mut w = w;
+    // Slack-2 lists up to distance `EGGG_P1_WINGS2` (at most `sk` and `k` - 1; none if
+    // unset or negative).
+    if let Some(s2) = std::env::var("EGGG_P1_WINGS2")
+        .ok()
+        .map(|v| v.parse::<i32>().expect("EGGG_P1_WINGS2"))
+        .filter(|&v| v >= 0)
+    {
+        w.add_slack2((s2 as u8).min(sk).min(k - 1));
+    }
     w.collapse();
     if verbose {
         eprintln!(
-            "wing-path table (distance <= {k}, slack <= {sk}, reduced {}): {:.1} MB, {how} in {:.2} s",
+            "wing-path table (distance <= {k}, slack <= {sk}, slack 2 <= {:?}, reduced {}): {:.1} MB, {how} in {:.2} s",
+            w.s2max,
             if red { k + 1 } else { 0 },
             w.bytes() as f64 / 1e6,
             t0.elapsed().as_secs_f64()

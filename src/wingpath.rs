@@ -51,8 +51,11 @@ const MASK24: u32 = 0xff_ffff;
 /// parity is odd; the test is for a node with one move of slack.
 pub const ODD: u64 = 1 << 61;
 pub const SLACK: u64 = 1 << 60;
+/// The flag of a key passed to [`WingPaths::locate`] for the test of a node with two moves
+/// of slack (see [`WingPaths::add_slack2`]).
+pub const SLACK2: u64 = 1 << 59;
 /// A located list that every node passes (its state is not in the table).
-const PASS: u64 = u64::MAX >> 4;
+const PASS: u64 = u64::MAX >> 5;
 
 /// States per distance (unlabelled colour pairs: about a sixth of the U/D x R/L mask pairs).
 pub const COUNT: [usize; 9] = [1, 3, 54, 717, 8955, 116_301, 1_506_114, 18_693_124, COUNT8];
@@ -393,6 +396,10 @@ pub struct WingPaths {
     pairs: HugeBuf<u32>,
     /// The pairs of the states at distance `kmax` + 1, reduced by symmetry, if built.
     pub red: Option<Reduced>,
+    /// The largest distance with slack-2 lists, if any (see [`WingPaths::add_slack2`]).
+    pub s2max: Option<u8>,
+    /// The slack-2 lists: per state (up to distance `s2max`) its even then odd planes.
+    s2: Option<(Hash, HugeBuf<u32>)>,
 }
 
 /// A symmetry of the cube that maps the solver's 27 moves onto themselves (one of the 6 that
@@ -547,6 +554,8 @@ impl WingPaths {
             hash: Hash::for_states(states),
             pairs: HugeBuf::zeroed(0),
             red: None,
+            s2max: None,
+            s2: None,
         };
         let ax = Staging::axis_masks();
         let key0 = Self::key(ax[0], ax[1]);
@@ -890,7 +899,11 @@ impl WingPaths {
             .red
             .as_ref()
             .map_or(0, |r| r.hash.slots.byte_len() + r.pairs.byte_len());
-        self.hash.slots.byte_len() + self.pairs.byte_len() + red
+        let s2 = self
+            .s2
+            .as_ref()
+            .map_or(0, |(h, p)| h.slots.byte_len() + p.byte_len());
+        self.hash.slots.byte_len() + self.pairs.byte_len() + red + s2
     }
 
     /// Ask the kernel to back the table with huge pages now (see
@@ -902,6 +915,87 @@ impl WingPaths {
             r.hash.slots.collapse();
             r.pairs.collapse();
         }
+        if let Some((h, p)) = &self.s2 {
+            h.slots.collapse();
+            p.collapse();
+        }
+    }
+
+    /// Add the slack-2 lists of the states up to distance `max` (at most `smax`, less than
+    /// `kmax`): for a node at distance d with d + 2 moves left, the preimages of the paths
+    /// with two moves that do not decrease the distance (two that keep it, or one that
+    /// increases it and one more that decreases it). Per state, the union over its moves m
+    /// of the preimages under m of the child's slack-2 lists (m decreasing the distance), its
+    /// slack-1 lists (m keeping it) or its tight lists (m increasing it); from a staged state
+    /// only the last two. The distances come from a breadth-first search over the table up
+    /// to `max` + 1. Kept in a hash table of their own (not saved: built in well under a
+    /// second up to distance 5).
+    pub fn add_slack2(&mut self, max: u8) {
+        assert!(max <= self.smax && max < self.kmax);
+        let mv = Moves::new();
+        // The states up to distance max + 1, with their distances (key tags), by layer.
+        let n: usize = COUNT[..=max as usize + 1].iter().sum();
+        let mut dist = Hash::for_states(n);
+        let ax = Staging::axis_masks();
+        let key0 = Self::key(ax[0], ax[1]);
+        dist.insert_from(dist.home(key0), key0, 0, 0);
+        let mut layers = vec![vec![key0]];
+        for d in 1..=max as usize + 1 {
+            let mut next = vec![];
+            for &x in &layers[d - 1] {
+                for m in 0..N_MOVES {
+                    let c = mv.apply(x, m);
+                    if dist.insert_from(dist.home(c), c, (d as u64) << DIST, 0).1 {
+                        next.push(c);
+                    }
+                }
+            }
+            assert_eq!(next.len(), COUNT[d], "states at distance {d}");
+            layers.push(next);
+        }
+        let n2: usize = COUNT[..=max as usize].iter().sum();
+        let mut hash = Hash::for_states(n2);
+        let mut pairs = HugeBuf::zeroed(0);
+        let main = self.pairs.as_slice();
+        for (k, layer) in layers[..=max as usize].iter().enumerate() {
+            for &x in layer {
+                hash.insert_from(hash.home(x), x, 0, 0);
+            }
+            let parts = {
+                let (hash, pairs) = (&hash, pairs.as_slice());
+                lists_par(
+                    0..layer.len(),
+                    |i| Some((i, layer[i], 0)),
+                    |key, _, out| {
+                        for m in 0..N_MOVES {
+                            let c = mv.apply(key, m);
+                            let Some(s) = dist.get_tagged(c) else {
+                                continue;
+                            };
+                            let dc = s.dist() as usize;
+                            if dc + 1 == k {
+                                let s = hash.slot(hash.find(c));
+                                mv.extend(out, lists(pairs, s), m);
+                            } else if dc == k {
+                                mv.extend(out, slack_lists(main, self.hash.slot(self.find(c))), m);
+                            } else if dc == k + 1 {
+                                mv.extend(out, lists(main, self.hash.slot(self.find(c))), m);
+                            }
+                        }
+                    },
+                )
+            };
+            let at: Vec<usize> = layer.iter().map(|&x| hash.find(x)).collect();
+            let slots = hash.slots.as_mut_slice();
+            append(&mut pairs, parts, |i, off, c| {
+                slots[at[i]].off = off;
+                slots[at[i]].n = c;
+            });
+        }
+        let n = pairs.len();
+        pairs.grow(n + PAD_WORDS);
+        self.s2max = Some(max);
+        self.s2 = Some((hash, pairs));
     }
 
     /// The file name of a saved table with largest distances `kmax` and `smax`.
@@ -974,6 +1068,8 @@ impl WingPaths {
             },
             pairs,
             red: None,
+            s2max: None,
+            s2: None,
         };
         if red {
             w.red = Some(w.reduced_layer(&Moves::new()));
@@ -1127,6 +1223,23 @@ impl WingPaths {
     /// [`SLACK`] (the lists' lengths are read with them).
     #[inline(always)]
     pub fn locate(&self, key: u64) -> u64 {
+        if key & SLACK2 != 0 {
+            let (h, pairs) = self.s2.as_ref().unwrap();
+            let s = h.slot(h.find(key & !(ODD | SLACK2)));
+            if s.key == 0 {
+                debug_assert!(false, "state not in the slack-2 lists");
+                return PASS;
+            }
+            let (off, n) = Self::tight_list(s, key & ODD != 0);
+            if n != 0 {
+                // SAFETY: the list is in the table.
+                unsafe {
+                    crate::table::prefetch(pairs.as_ptr().add(off));
+                    crate::table::prefetch(pairs.as_ptr().add(off + PLANE * n - 1));
+                }
+            }
+            return off as u64 | (n as u64) << 32 | SLACK2;
+        }
         let s = self.hash.slot(self.find(key & !(ODD | SLACK)));
         if s.key == 0 {
             debug_assert!(false, "state not in the table");
@@ -1160,11 +1273,18 @@ impl WingPaths {
     /// [`WingPaths::locate`])?
     #[inline(always)]
     pub fn possible_at(&self, loc: u64, pos: &V32, odd: bool) -> bool {
-        if loc & SLACK == 0 {
+        if loc & (SLACK | SLACK2) == 0 {
             if loc == PASS {
                 return true;
             }
             return self.any_pairable(loc as u32 as usize, (loc >> 32) as usize, pos);
+        }
+        if loc & SLACK2 != 0 {
+            let pairs = &self.s2.as_ref().unwrap().1;
+            let (off, n) = (loc as u32 as usize, (loc >> 32) as u16 as usize);
+            debug_assert!(off + PLANE * n + PAD_WORDS <= pairs.len());
+            // SAFETY: as in `WingPaths::any_pairable`.
+            return unsafe { any_pairable(pairs.as_ptr().add(off), n, pos) };
         }
         let (off, n) = self.slack_list(loc as u32 as usize, odd);
         self.any_pairable(off, n, pos)
@@ -1182,6 +1302,30 @@ impl WingPaths {
         }
         let (off, n) = self.slack_list(Self::slack_header(s), odd);
         self.any_pairable(off, n, pos)
+    }
+
+    /// [`WingPaths::possible`] for a node at distance = moves left - 2 (<= `s2max`; see
+    /// [`WingPaths::add_slack2`]).
+    #[inline(always)]
+    pub fn possible_slack2(&self, ud: u32, rl: u32, pos: &V32, odd: bool) -> bool {
+        let (h, pairs) = self.s2.as_ref().unwrap();
+        let s = h.slot(h.find(Self::key(ud, rl)));
+        if s.key == 0 {
+            debug_assert!(false, "state not in the slack-2 lists");
+            return true;
+        }
+        let (off, n) = Self::tight_list(s, odd);
+        debug_assert!(off + PLANE * n + PAD_WORDS <= pairs.len());
+        // SAFETY: as in `WingPaths::any_pairable`.
+        unsafe { any_pairable(pairs.as_ptr().add(off), n, pos) }
+    }
+
+    /// Prefetch the slack-2 entry of the state with colour masks `ud` and `rl`.
+    #[inline(always)]
+    pub fn prefetch_key2(&self, ud: u32, rl: u32) -> u64 {
+        let key = Self::key(ud, rl);
+        self.s2.as_ref().unwrap().0.prefetch(key);
+        key
     }
 
     /// Are the wings `pos` pairable after the path of one of the preimages of the `n` planes
@@ -1326,14 +1470,16 @@ mod tests {
         })
     }
 
-    /// The table agrees with a brute-force search, for tight states at distance 1..=4 and
-    /// slack-1 states at distance 0..=4 (random walks back from the solved cube, kept if their
-    /// distance is the walk's length, or one less), with their wings (often pairable after
-    /// the walk) or random ones.
+    /// The table agrees with a brute-force search, for tight states at distance 1..=4,
+    /// slack-1 states at distance 0..=4 and slack-2 states at distance 0..=3 (random walks
+    /// back from the solved cube, kept if their distance is the walk's length, or one or two
+    /// less), with their wings (often pairable after the walk) or random ones; so does the
+    /// test split in three (`locate`, `possible_at`).
     #[test]
     fn matches_brute_force() {
         let t = tables();
-        let w = WingPaths::new(&t.frames, 5, 4, false);
+        let mut w = WingPaths::new(&t.frames, 5, 4, false);
+        w.add_slack2(3);
         let dist = distances(&t, 5);
         let keys: std::collections::HashSet<u64> = dist
             .keys()
@@ -1343,8 +1489,8 @@ mod tests {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(11);
         let solved = P1State::from_cube(&crate::cube::Cube::SOLVED);
         // [slack][moves left][random wings]
-        let mut tested = [[[0usize; 2]; 6]; 2];
-        let mut passed = [[[0usize; 2]; 6]; 2];
+        let mut tested = [[[0usize; 2]; 6]; 3];
+        let mut passed = [[[0usize; 2]; 6]; 3];
         for _ in 0..1_000_000 {
             let left = rng.gen_range(1..=5u8);
             let mut last = N_MOVES;
@@ -1361,7 +1507,7 @@ mod tests {
                 s = s.apply(inverse_move(m), &t);
             }
             let d = dist[&s.masks()];
-            if d + 1 < left || (d == left && d == 5) {
+            if d + 2 < left || (d == left && d == 5) {
                 continue;
             }
             let slack = (left - d) as usize;
@@ -1377,16 +1523,25 @@ mod tests {
             }
             let (ud, rl) = s.masks();
             let want = brute(&t, &dist, &s, left);
-            let got = if slack == 0 {
-                w.possible(ud, rl, &s.pos, s.parity)
-            } else {
-                w.possible_slack(ud, rl, &s.pos, s.parity)
+            let got = match slack {
+                0 => w.possible(ud, rl, &s.pos, s.parity),
+                1 => w.possible_slack(ud, rl, &s.pos, s.parity),
+                _ => w.possible_slack2(ud, rl, &s.pos, s.parity),
             };
+            // The same through the split test.
+            let flags = (s.parity as u64 * ODD)
+                | [0, SLACK, SLACK2][slack]
+                | if slack == 2 {
+                    w.prefetch_key2(ud, rl)
+                } else {
+                    w.prefetch_key(ud, rl)
+                };
+            assert_eq!(w.possible_at(w.locate(flags), &s.pos, s.parity), got);
             assert_eq!(got, want, "slack {slack} left {left} {ms:?}");
             tested[slack][left as usize][random as usize] += 1;
             passed[slack][left as usize][random as usize] += want as usize;
         }
-        for slack in 0..2 {
+        for slack in 0..3 {
             for left in 1 + slack..=5 {
                 if slack == 0 && left == 5 {
                     continue;
@@ -1395,7 +1550,7 @@ mod tests {
                 assert!(n.iter().all(|&x| x == 300), "{tested:?}");
                 // Walks pass often (those that end at an endpoint); random wings rarely.
                 assert!(
-                    p[0] > 30 && p[1] < 60,
+                    p[0] > 30 && p[1] < if slack == 2 { 120 } else { 60 },
                     "slack {slack} left {left}: {passed:?}"
                 );
             }
