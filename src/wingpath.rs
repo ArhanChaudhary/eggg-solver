@@ -77,6 +77,74 @@ const SYM_SHIFT: u32 = 55;
 const FLAGS: u64 = ODD | SLACK | SLACK2 | RED | 7 << SYM_SHIFT;
 /// A located list that every node passes (its state is not in the table).
 const PASS: u64 = (1 << SYM_SHIFT) - 1;
+/// The bit every key has (see [`WingPaths::key`]) and no located list: a value passed to
+/// [`WingPaths::locate`] with [`RED`] and without it is located already (see
+/// [`WingPaths::prefetch_red_cached`]).
+const KEY_BIT: u64 = 1 << 63;
+/// The flag of a key passed to [`WingPaths::locate_fill`]: its cache entry is to be filled.
+pub const FILL: u64 = 1 << 62;
+
+/// A new [`WingPaths::id`].
+fn next_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A cache of the reduced lists' classes, per thread (see
+/// [`WingPaths::prefetch_red_cached`]): the same centre states recur often among the
+/// children tested by the reduced lists (in the solver, ~55% of them are among the 1024 seen
+/// last, ~63% among the last 4096, by direct-mapped slots), and a hit replaces finding the
+/// class (six symmetries applied to both colour masks) and, once its list is located, the
+/// table's slot read too. Entries: a tag (the child's colour masks `ud` << 24 | `rl`, with
+/// [`KEY_BIT`], the symmetry to the class member at [`RC_SYM_SHIFT`] and [`RC_FILLED`] once
+/// the value is the list's location) and a value (the class key, or once filled the class's
+/// lists: offset | even planes << 32 | odd planes << 48).
+pub struct RedCache {
+    /// The table whose classes it holds ([`WingPaths::id`]; 0: none).
+    owner: u64,
+    bits: u32,
+    e: Vec<[u64; 2]>,
+}
+
+const RC_SYM_SHIFT: u32 = 48;
+const RC_FILLED: u64 = 1 << 51;
+const RC_TAG: u64 = KEY_BIT | (1 << 48) - 1;
+
+impl RedCache {
+    /// An empty cache (holding nothing until [`RedCache::reset`]).
+    pub const fn new() -> RedCache {
+        RedCache {
+            owner: 0,
+            bits: 0,
+            e: Vec::new(),
+        }
+    }
+
+    /// Make it a cache of 2^`bits` slots (0: none) for the classes of table `w`, emptied
+    /// unless it already is that.
+    pub fn reset(&mut self, w: &WingPaths, bits: u32) {
+        if self.owner != w.id || self.bits != bits || self.e.len() != (1 << bits) {
+            self.owner = w.id;
+            self.bits = bits;
+            self.e.clear();
+            if bits > 0 {
+                self.e.resize(1 << bits, [0; 2]);
+            }
+        }
+    }
+
+    /// Whether it caches anything.
+    #[inline(always)]
+    pub fn on(&self) -> bool {
+        !self.e.is_empty()
+    }
+}
+
+impl Default for RedCache {
+    fn default() -> RedCache {
+        RedCache::new()
+    }
+}
 
 /// States per distance (unlabelled colour pairs: about a sixth of the U/D x R/L mask pairs).
 pub const COUNT: [usize; 9] = [1, 3, 54, 717, 8955, 116_301, 1_506_114, 18_693_124, COUNT8];
@@ -408,6 +476,9 @@ fn append(pairs: &mut HugeBuf<u32>, parts: Vec<Part>, mut put: impl FnMut(usize,
 }
 
 pub struct WingPaths {
+    /// An identifier of this table (unique in the process), for the caches of its classes
+    /// (see [`RedCache`]).
+    pub id: u64,
     /// The largest distance with entries.
     pub kmax: u8,
     /// The largest distance with slack-1 lists.
@@ -502,19 +573,16 @@ impl Reduced {
     }
 }
 
-/// See [`Reduced::canon`]: the least key over the six symmetries, the identity's without a
-/// table lookup, in a loop of fixed length (unrolled) and branch-free (each key with the
-/// symmetry's number in three low bits: the first of equal keys wins, as before).
+/// See [`Reduced::canon`]: the least key over the symmetries (the identity's without a
+/// table), found branch-free with the symmetry's number in the low bits.
 #[inline(always)]
 fn canon(syms: &[Sym; 6], ud: u32, rl: u32) -> (u64, usize) {
-    // Keys have bit 63 and 48 bits of masks.
-    const TOP: u64 = 1 << 63;
-    let mut best = (WingPaths::key(ud, rl) & !TOP) << 3;
+    let mut best = (WingPaths::key(ud, rl) & !KEY_BIT) << 3;
     for (i, s) in syms.iter().enumerate().skip(1) {
         let k = WingPaths::key(apply_bytes(&s.centre, ud), apply_bytes(&s.centre, rl));
-        best = best.min((k & !TOP) << 3 | i as u64);
+        best = best.min((k & !KEY_BIT) << 3 | i as u64);
     }
-    (best >> 3 | TOP, (best & 7) as usize)
+    (best >> 3 | KEY_BIT, (best & 7) as usize)
 }
 
 /// Per byte of a 24-bit set, per value, the set's image under the map `f` of positions.
@@ -578,6 +646,7 @@ impl WingPaths {
             std::array::from_fn(|f| frames[f].low_slots.iter().fold(0, |a, &s| a | 1 << s));
         let states: usize = COUNT[..=kmax as usize].iter().sum();
         let mut w = WingPaths {
+            id: next_id(),
             kmax,
             smax,
             hash: Hash::for_states(states),
@@ -1089,6 +1158,7 @@ impl WingPaths {
         r.read(pairs.as_bytes_mut())?;
         r.finish()?;
         let mut w = WingPaths {
+            id: next_id(),
             kmax,
             smax,
             hash: Hash {
@@ -1253,21 +1323,17 @@ impl WingPaths {
     #[inline(always)]
     pub fn locate(&self, key: u64) -> u64 {
         if key & RED != 0 {
+            if key & KEY_BIT == 0 {
+                // Located already (by the cache).
+                return key;
+            }
             let r = self.red.as_ref().unwrap();
             let s = r.hash.slot(r.hash.find(key & !FLAGS));
             if s.key == 0 {
                 debug_assert!(false, "state not in the reduced table");
                 return PASS;
             }
-            let (off, n) = Self::tight_list(s, key & ODD != 0);
-            if n != 0 {
-                // SAFETY: the list is in the table.
-                unsafe {
-                    crate::table::prefetch(r.pairs.as_ptr().add(off));
-                    crate::table::prefetch(r.pairs.as_ptr().add(off + PLANE * n - 1));
-                }
-            }
-            return off as u64 | (n as u64) << 32 | RED | (key & (7 << SYM_SHIFT));
+            return Self::red_loc(r, s, key);
         }
         if key & SLACK2 != 0 {
             let (h, pairs) = self.s2.as_ref().unwrap();
@@ -1312,6 +1378,21 @@ impl WingPaths {
             }
             o as u64 | SLACK
         }
+    }
+
+    /// The located list (see [`WingPaths::locate`]) of a key with [`RED`] whose class is at
+    /// slot `s` of the reduced lists `r`, its first lines prefetched.
+    #[inline(always)]
+    fn red_loc(r: &Reduced, s: &Slot, key: u64) -> u64 {
+        let (off, n) = Self::tight_list(s, key & ODD != 0);
+        if n != 0 {
+            // SAFETY: the list is in the table.
+            unsafe {
+                crate::table::prefetch(r.pairs.as_ptr().add(off));
+                crate::table::prefetch(r.pairs.as_ptr().add(off + PLANE * n - 1));
+            }
+        }
+        off as u64 | (n as u64) << 32 | RED | (key & (7 << SYM_SHIFT))
     }
 
     /// The last step of a test: can a node with wing positions `pos` and wing parity `odd`
@@ -1403,6 +1484,76 @@ impl WingPaths {
         let (k, si) = r.canon(ud, rl);
         r.hash.prefetch(k);
         k | RED | (si as u64) << SYM_SHIFT
+    }
+
+    /// [`WingPaths::prefetch_red`] through the cache `c` (see [`RedCache`]; on) for a node
+    /// with wing parity `odd`: its list located (if cached so; prefetched), or its class key
+    /// with [`RED`], the symmetry and [`ODD`] if `odd` (from the cache, or found and cached
+    /// with [`FILL`], `c`'s slot then pushed to `fills`, for [`WingPaths::locate_fill`]).
+    #[inline(always)]
+    pub fn prefetch_red_cached(
+        &self,
+        c: &mut RedCache,
+        ud: u32,
+        rl: u32,
+        odd: bool,
+        fills: &mut Vec<u32>,
+    ) -> u64 {
+        let r = self.red.as_ref().unwrap();
+        let tag = KEY_BIT | (ud as u64) << 24 | rl as u64;
+        let i = (tag.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - c.bits)) as usize;
+        debug_assert!(i < c.e.len());
+        // SAFETY: i < 2^bits, the cache's length.
+        let e = unsafe { c.e.get_unchecked_mut(i) };
+        let sym = e[0] >> RC_SYM_SHIFT & 7;
+        if e[0] & RC_TAG == tag {
+            if e[0] & RC_FILLED != 0 {
+                let v = e[1];
+                let (ne, no) = (v >> 32 & 0xffff, v >> 48);
+                let (off, n) = if odd {
+                    ((v as u32 as u64) + PLANE as u64 * ne, no)
+                } else {
+                    (v as u32 as u64, ne)
+                };
+                if n != 0 {
+                    // SAFETY: the list is in the table.
+                    unsafe {
+                        let p = r.pairs.as_ptr().add(off as usize);
+                        crate::table::prefetch(p);
+                        crate::table::prefetch(p.add(PLANE * n as usize - 1));
+                    }
+                }
+                return off | n << 32 | RED | sym << SYM_SHIFT;
+            }
+            r.hash.prefetch(e[1]);
+            return e[1] | RED | sym << SYM_SHIFT | odd as u64 * ODD;
+        }
+        let (k, si) = r.canon(ud, rl);
+        r.hash.prefetch(k);
+        *e = [tag | (si as u64) << RC_SYM_SHIFT, k];
+        fills.push(i as u32);
+        k | RED | (si as u64) << SYM_SHIFT | odd as u64 * ODD | FILL
+    }
+
+    /// [`WingPaths::locate`] for a key from [`WingPaths::prefetch_red_cached`] with
+    /// [`FILL`]: its cache slot `i` in `c` is filled with the class's lists (if it still
+    /// holds the class).
+    #[inline(always)]
+    pub fn locate_fill(&self, key: u64, c: &mut RedCache, i: u32) -> u64 {
+        let r = self.red.as_ref().unwrap();
+        let k = key & !(FLAGS | FILL);
+        let s = r.hash.slot(r.hash.find(k));
+        if s.key == 0 {
+            debug_assert!(false, "state not in the reduced table");
+            return PASS;
+        }
+        // SAFETY: the slots pushed are the cache's.
+        let e = unsafe { c.e.get_unchecked_mut(i as usize) };
+        if e[0] & RC_FILLED == 0 && e[1] == k {
+            e[0] |= RC_FILLED;
+            e[1] = s.off as u64 | (s.n[0] as u64) << 32 | (s.n[1] as u64) << 48;
+        }
+        Self::red_loc(r, s, key)
     }
 
     /// [`WingPaths::possible`] for a node at distance `kmax` + 1, by the reduced lists.

@@ -1007,7 +1007,25 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     /// The wing-path lists of the children tested in the current round, located ahead (see
     /// [`crate::wingpath::WingPaths::locate`]).
     located: Vec<u64>,
+    /// The cache of the reduced wing-path lists' classes (the thread's while a batch runs,
+    /// see [`RED_CACHE`]), and the slots of it to fill in the current round.
+    rcache: crate::wingpath::RedCache,
+    fills: Vec<u32>,
 }
+
+thread_local! {
+    /// Each thread's cache of the reduced wing-path lists' classes (see
+    /// [`crate::wingpath::RedCache`]), taken by its searches' batches while they run: the
+    /// classes do not depend on the position, so the cache serves all the jobs of a thread.
+    static RED_CACHE: std::cell::Cell<crate::wingpath::RedCache> =
+        const { std::cell::Cell::new(crate::wingpath::RedCache::new()) };
+}
+
+/// The slots of the cache of the reduced wing-path lists' classes, a power of two
+/// (`EGGG_P1_RCACHE`: its exponent, default 12; 0: no cache).
+static RED_CACHE_BITS: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+    std::env::var("EGGG_P1_RCACHE").map_or(12, |v| v.parse().expect("EGGG_P1_RCACHE"))
+});
 
 /// What the pass ahead of a batch round's wing-path tests found about a node (see
 /// [`Search1::run_batch_round`]).
@@ -1134,6 +1152,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             batch_path: Vec::with_capacity(48),
             pre: vec![],
             located: vec![],
+            rcache: crate::wingpath::RedCache::new(),
+            fills: vec![],
         }
     }
 
@@ -1283,9 +1303,19 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     /// distance-decreasing moves of its mask (read a round after its prefetch); children
     /// with one move left get the last-move tests, the others are queued for the next round.
     fn run_batch(&mut self) {
-        // The batch nodes' paths replace the search's path meanwhile.
+        // The batch nodes' paths replace the search's path meanwhile, and the thread's cache
+        // of reduced classes is the search's.
         std::mem::swap(&mut self.path, &mut self.batch_path);
+        let cache = self.t.wingk.as_deref().filter(|w| w.red.is_some());
+        if let Some(w) = cache {
+            self.rcache = RED_CACHE.with(|x| x.take());
+            self.rcache.reset(w, *RED_CACHE_BITS);
+        }
         self.run_batch_rounds();
+        if cache.is_some() {
+            let c = std::mem::take(&mut self.rcache);
+            RED_CACHE.with(|x| x.set(c));
+        }
         std::mem::swap(&mut self.path, &mut self.batch_path);
         self.batch_tree.clear();
         self.batch_roots.clear();
@@ -1360,10 +1390,14 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
         // (when the children are queued).
         let mut pre = std::mem::take(&mut self.pre);
         let mut located = std::mem::take(&mut self.located);
+        let mut rc = std::mem::take(&mut self.rcache);
+        let mut fills = std::mem::take(&mut self.fills);
         pre.clear();
         located.clear();
+        fills.clear();
         if let Some(w) = t.wingk.as_deref().filter(|_| viable && *WK_PREFETCH) {
-            use crate::wingpath::{ODD, SLACK, SLACK2};
+            use crate::wingpath::{FILL, ODD, SLACK, SLACK2};
+            let cached = rc.on();
             for nd in cur.iter() {
                 let (d, left) = (nd.d, nd.left);
                 let mut e = u32::MAX;
@@ -1438,7 +1472,11 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         let (ud, _, rl) = flag_masks(&unsafe { child_flags(&flags, m, t) });
                         let odd = nd.parity as u64 ^ (WIDE_QUARTER >> m & 1) as u64;
                         if red >> m & 1 == 1 {
-                            located.push(w.prefetch_red(ud, rl) | (odd * ODD));
+                            located.push(if cached {
+                                w.prefetch_red_cached(&mut rc, ud, rl, odd == 1, &mut fills)
+                            } else {
+                                w.prefetch_red(ud, rl) | (odd * ODD)
+                            });
                         } else {
                             let bits = (odd * ODD) | ((slack >> m & 1) as u64 * SLACK);
                             if slack2 >> m & 1 == 1 {
@@ -1457,12 +1495,19 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     eq: eq_all,
                 });
             }
+            let mut f = fills.iter();
             for x in located.iter_mut() {
-                *x = w.locate(*x);
+                *x = if *x & FILL != 0 {
+                    w.locate_fill(*x, &mut rc, *f.next().unwrap())
+                } else {
+                    w.locate(*x)
+                };
             }
         }
         self.pre = pre;
         self.located = located;
+        self.rcache = rc;
+        self.fills = fills;
         for (ix, nd) in cur.iter().enumerate() {
             let s = nd.state();
             if nd.d < nd.left {
