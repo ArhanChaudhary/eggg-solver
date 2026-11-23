@@ -114,7 +114,10 @@ liveness bits are evaluated for all moves at once. Same endpoints;
 p1check on the M2 (1 thread): 1.61 -> 1.00 s with the large tier's table (-38%), 1.45 ->
 0.80 s with the huge tier's (-45%); 50 positions on the M2 (large tier, 8 threads, 20 s):
 38.78 -> 38.66 moves (4 shorter, none longer; 39.04 -> 38.94 at 10 s), one thread after 10 s
-unchanged (39.52).
+unchanged (39.52). The reduced lists' tests of the tight children of nodes with slack go
+through the same three passes, and the class search is a branch-free, unrolled loop over the
+six symmetries: p1check deep with the large tier's table 1.00 -> 0.92 s on the M2 (1
+thread), phase-1 nodes per second +6% (M2, 8 threads) and +8.5% (x86, 48 threads).
 On the M2 (8 threads), 20 random positions (seed 6060), current version: 39.45
 moves on average after 10 s, 39.10 after 30 s, 38.80 after 60 s (before the parity and
 equal-distance bits, the round cut and the cheaper candidates: 39.65 / 39.30 / 39.15, and
