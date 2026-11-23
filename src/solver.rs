@@ -61,6 +61,13 @@ struct Knobs {
     /// From `p2_free` on, a round's phase 2 stops after this multiple of its phase-1 time
     /// (`EGGG_P2_TIME`).
     p2_time: f64,
+    /// Adaptive margin (`EGGG_ADAPT`, off if infinite): from `adapt_from` seconds on
+    /// (`EGGG_ADAPT_FROM`, default 20), the margin goes one deeper (down to `margin_min`,
+    /// `EGGG_MARGIN_MIN`, default 10) when 16x the share of phases 2 and 3 in the time since
+    /// the last change is below this; candidates are kept one level below the margin.
+    adapt: f64,
+    adapt_from: f64,
+    margin_min: usize,
 }
 
 impl Knobs {
@@ -86,6 +93,15 @@ impl Knobs {
             margins,
             p2_free: num("EGGG_P2_FREE"),
             p2_time: num("EGGG_P2_TIME"),
+            adapt: num("EGGG_ADAPT"),
+            adapt_from: std::env::var("EGGG_ADAPT_FROM")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20.0),
+            margin_min: std::env::var("EGGG_MARGIN_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
         }
     }
 
@@ -562,6 +578,11 @@ struct Run<'a, 'r> {
     /// Debug output (`EGGG_DEBUG`).
     trace: bool,
     knobs: Knobs,
+    /// Adaptive margin (see [`Knobs::adapt`]): levels below the schedule's margin, and the
+    /// time of the last change and the phase-2 and 3 time since.
+    margin_extra: usize,
+    adapt_at: f64,
+    adapt_p23: Duration,
     /// Debug: the current phase-1 level's nodes, endpoints and kept candidates so far, when
     /// it started, and the previous level's nodes.
     lvl_nodes: u64,
@@ -645,12 +666,16 @@ impl<'a> Solver<'a> {
             prev_yields: HashMap::new(),
             trace: std::env::var_os("EGGG_DEBUG").is_some(),
             knobs: Knobs::from_env(),
+            margin_extra: 0,
+            adapt_at: 0.0,
+            adapt_p23: Duration::ZERO,
             lvl_nodes: 0,
             lvl_eps: 0,
             lvl_kept: 0,
             lvl_start: 0.0,
             prev_lvl_nodes: 0,
         };
+        run.adapt_at = run.knobs.adapt_from;
         run.level.jobs = run.level_jobs(len0);
         std::thread::scope(|scope| {
             // Watchdog that raises the stop flag at the deadline.
@@ -791,6 +816,7 @@ impl<'a, 'r> Run<'a, 'r> {
             let tp = Instant::now();
             self.phase2(want2_now);
             self.stats.time[1] += tp.elapsed();
+            let p2_round = tp.elapsed();
             debug(
                 self.start,
                 &format!(
@@ -812,6 +838,10 @@ impl<'a, 'r> Run<'a, 'r> {
             self.phase3_levels(t1 + budget);
             self.stats.time[2] += t1.elapsed();
             check += t1.elapsed();
+            if self.start.elapsed().as_secs_f64() >= self.knobs.adapt_from {
+                self.adapt_p23 += t1.elapsed() + p2_round;
+            }
+            self.adapt();
             if std::env::var_os("EGGG_MEM").is_some() {
                 self.mem_report();
             }
@@ -820,6 +850,39 @@ impl<'a, 'r> Run<'a, 'r> {
             }
             want1 = want1.saturating_mul(2);
             want2 = want2.saturating_mul(2);
+        }
+    }
+
+    /// The adaptive margin (see [`Knobs::adapt`]), after each round.
+    fn adapt(&mut self) {
+        let k = &self.knobs;
+        let elapsed = self.start.elapsed().as_secs_f64();
+        if !k.adapt.is_finite()
+            || self.best.is_none()
+            || elapsed < k.adapt_from
+            || self.margin_now() <= k.margin_min
+            || self.margin_now() > k.deepest()
+        {
+            return;
+        }
+        // Wait for the time to grow 1.5x since the last change (its catch-up is over).
+        let since = elapsed - self.adapt_at;
+        if since < 0.5 * self.adapt_at {
+            return;
+        }
+        let share = self.adapt_p23.as_secs_f64() / since.max(1e-9);
+        if 16.0 * share < k.adapt {
+            self.margin_extra += 1;
+            if self.trace {
+                eprintln!(
+                    "[{elapsed:8.3}] ADAPT margin {} (phase 2+3 share {:.4} over {:.1} s)",
+                    self.margin_now(),
+                    share,
+                    since
+                );
+            }
+            self.adapt_at = elapsed;
+            self.adapt_p23 = Duration::ZERO;
         }
     }
 
@@ -1132,7 +1195,24 @@ impl<'a, 'r> Run<'a, 'r> {
     /// The longest reduction that could still lead to a shorter solution at the deepest
     /// phase-2 level (`DEEPEST_MARGIN`); unlimited before the first solution.
     fn useful_l12(&self) -> usize {
-        self.best_len().saturating_sub(self.knobs.deepest())
+        self.best_len().saturating_sub(self.keep_margin())
+    }
+
+    /// The phase-2 margin now (see [`Knobs`]).
+    fn margin_now(&self) -> usize {
+        let m = self.knobs.margin(self.start.elapsed().as_secs_f64());
+        m.saturating_sub(self.margin_extra)
+            .max(self.knobs.margin_min.min(m))
+    }
+
+    /// Candidates are kept down to best - this.
+    fn keep_margin(&self) -> usize {
+        if self.knobs.adapt.is_finite() {
+            let m = self.knobs.deepest().min(self.margin_now());
+            (m - 1).max(self.knobs.margin_min)
+        } else {
+            self.knobs.deepest()
+        }
     }
 
     /// Drop the candidates and reductions that can no longer lead to a shorter solution
@@ -1176,7 +1256,7 @@ impl<'a, 'r> Run<'a, 'r> {
         // margin goes from 15 to 13 as the run gets longer (phases 2 and 3 are then cheap
         // next to phase 1). Measured on 20 positions x 30 s: 39.3 -> 39.0 moves.
         let elapsed = self.start.elapsed().as_secs_f64();
-        let margin = self.knobs.margin(elapsed);
+        let margin = self.margin_now();
         let want = if elapsed >= self.knobs.p2_free {
             usize::MAX
         } else {
