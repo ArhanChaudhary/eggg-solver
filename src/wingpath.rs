@@ -246,7 +246,7 @@ pub const PLANE: usize = 6;
 /// The longest lists stored in planes (three); longer ones are stored in wide slices (see
 /// [`WIDE`]), cheaper to test from about 24 preimages on (a plane costs about a third of a
 /// wide slice, which holds eight times as many).
-const NARROW: usize = 24;
+const NARROW: usize = 64;
 
 /// Words per wide slice: 64 preimages of a list longer than [`NARROW`], bit-sliced, word
 /// pair x (a u64) holding bit j if the slice's preimage j contains slot x.
@@ -1292,13 +1292,7 @@ impl WingPaths {
                 return PASS;
             }
             let (off, n) = Self::tight_list(s, key & ODD != 0);
-            if n != 0 {
-                // SAFETY: the list is in the table.
-                unsafe {
-                    crate::table::prefetch(pairs.as_ptr().add(off));
-                    crate::table::prefetch(pairs.as_ptr().add(off + words(n) - 1));
-                }
-            }
+            prefetch_list(pairs.as_ptr(), off, words(n));
             return off as u64 | (n as u64) << 32 | SLACK2;
         }
         let s = self.hash.slot(self.find(key & !(ODD | SLACK)));
@@ -1309,21 +1303,18 @@ impl WingPaths {
         let p = self.pairs.as_ptr();
         if key & SLACK == 0 {
             let (off, n) = Self::tight_list(s, key & ODD != 0);
-            if n != 0 {
-                // SAFETY: the list is in the table.
-                unsafe {
-                    crate::table::prefetch(p.add(off));
-                    crate::table::prefetch(p.add(off + words(n) - 1));
-                }
-            }
+            prefetch_list(p, off, words(n));
             off as u64 | (n as u64) << 32
         } else {
             let o = Self::slack_header(s);
-            // The header's line and the next (most lists end there).
-            // SAFETY: the header is in the table, and the second address is clamped to it.
+            // The header's line and the next three (most lists end there).
+            // SAFETY: the header is in the table, and the other addresses are clamped to it.
             unsafe {
                 crate::table::prefetch(p.add(o));
-                crate::table::prefetch(p.add((o + 16).min(self.pairs.len() - 1)));
+                let last = self.pairs.len() - 1;
+                crate::table::prefetch(p.add((o + 16).min(last)));
+                crate::table::prefetch(p.add((o + 32).min(last)));
+                crate::table::prefetch(p.add((o + 48).min(last)));
             }
             o as u64 | SLACK
         }
@@ -1453,17 +1444,43 @@ unsafe fn any_pairable(p: *const u32, n: usize, pos: &V32) -> bool {
     false
 }
 
+/// Prefetch the lines of the `len` words from `off` at `p` (at most four lines).
+#[inline(always)]
+fn prefetch_list(p: *const u32, off: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // SAFETY: the words are in the table.
+    unsafe {
+        crate::table::prefetch(p.add(off));
+        crate::table::prefetch(p.add(off + len - 1));
+        if len > 32 {
+            crate::table::prefetch(p.add(off + 16));
+            crate::table::prefetch(p.add(off + 32));
+        }
+    }
+}
+
 /// [`any_pairable`] for the `n` wide slices at `p`.
-#[inline(never)]
+#[inline(always)]
 unsafe fn any_pairable_wide(p: *const u32, n: usize, pos: &V32) -> bool {
-    // Per wing, the offset of its slot's word in a slice.
-    let o: [usize; 24] = std::array::from_fn(|i| 2 * pos.0[i] as usize);
     for k in 0..n {
         // SAFETY: the caller's (24 u64 per slice).
         let q = unsafe { p.add(k * WIDE) };
-        let w = |i: usize| unsafe { std::ptr::read_unaligned(q.add(o[i]) as *const u64) };
+        let w = |i: usize| unsafe {
+            std::ptr::read_unaligned(q.add(2 * *pos.0.get_unchecked(i) as usize) as *const u64)
+        };
         let (mut a, mut e) = (!0u64, 0u64);
-        for d in 0..12 {
+        for d in 0..6 {
+            let (x, y) = (w(2 * d), w(2 * d + 1));
+            a &= x ^ y;
+            e ^= x;
+        }
+        // Most preimages fail a few dedges: the rest only if any are left.
+        if a == 0 {
+            continue;
+        }
+        for d in 6..12 {
             let (x, y) = (w(2 * d), w(2 * d + 1));
             a &= x ^ y;
             e ^= x;
