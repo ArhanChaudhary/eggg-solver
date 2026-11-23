@@ -47,6 +47,13 @@ use crate::table::HugeBuf;
 
 const MASK24: u32 = 0xff_ffff;
 
+/// Flags of a key passed to [`WingPaths::locate`] (bits a key never has): the node's wing
+/// parity is odd; the test is for a node with one move of slack.
+pub const ODD: u64 = 1 << 61;
+pub const SLACK: u64 = 1 << 60;
+/// A located list that every node passes (its state is not in the table).
+const PASS: u64 = u64::MAX >> 4;
+
 /// States per distance (unlabelled colour pairs: about a sixth of the U/D x R/L mask pairs).
 pub const COUNT: [usize; 9] = [1, 3, 54, 717, 8955, 116_301, 1_506_114, 18_693_124, COUNT8];
 const COUNT8: usize = 195_489_242;
@@ -1028,6 +1035,76 @@ impl WingPaths {
     #[inline(always)]
     pub fn prefetch(&self, ud: u32, rl: u32) {
         self.hash.prefetch(Self::key(ud, rl));
+    }
+
+    /// The key of the state with colour masks `ud` and `rl`, its slot prefetched: the first
+    /// step of a test split in three (see [`WingPaths::locate`]).
+    #[inline(always)]
+    pub fn prefetch_key(&self, ud: u32, rl: u32) -> u64 {
+        let key = Self::key(ud, rl);
+        self.hash.prefetch(key);
+        key
+    }
+
+    /// The second step of a test (a pass after [`WingPaths::prefetch_key`]): the list that a
+    /// node with key `key` (with [`ODD`] if its wing parity is odd, and [`SLACK`] for the
+    /// test of a node with one move of slack, as in [`WingPaths::possible_slack`]) is tested
+    /// against, its first lines prefetched, for [`WingPaths::possible_at`]: the list's offset
+    /// | its length << 32, or for a slack test the offset of the header before the lists |
+    /// [`SLACK`] (the lists' lengths are read with them).
+    #[inline(always)]
+    pub fn locate(&self, key: u64) -> u64 {
+        let s = self.hash.slot(self.find(key & !(ODD | SLACK)));
+        if s.key == 0 {
+            debug_assert!(false, "state not in the table");
+            return PASS;
+        }
+        let p = self.pairs.as_ptr();
+        if key & SLACK == 0 {
+            let (off, n) = if key & ODD != 0 {
+                (s.off as usize + s.n[0] as usize, s.n[1] as usize)
+            } else {
+                (s.off as usize, s.n[0] as usize)
+            };
+            if n != 0 {
+                // SAFETY: the list is in the table.
+                unsafe {
+                    crate::table::prefetch(p.add(off));
+                    crate::table::prefetch(p.add(off + n - 1));
+                }
+            }
+            off as u64 | (n as u64) << 32
+        } else {
+            let o = s.off as usize + s.n[0] as usize + s.n[1] as usize;
+            // The header's line and the next (most lists end there).
+            // SAFETY: the header is in the table, and the second address is clamped to it.
+            unsafe {
+                crate::table::prefetch(p.add(o));
+                crate::table::prefetch(p.add((o + 16).min(self.pairs.len() - 1)));
+            }
+            o as u64 | SLACK
+        }
+    }
+
+    /// The last step of a test: can a node with wing positions `pos` and wing parity `odd`
+    /// reach an endpoint as far as its wings tell, its list located at `loc` (see
+    /// [`WingPaths::locate`])?
+    #[inline(always)]
+    pub fn possible_at(&self, loc: u64, pos: &V32, odd: bool) -> bool {
+        if loc & SLACK == 0 {
+            if loc == PASS {
+                return true;
+            }
+            return self.any_pairable(loc as u32 as usize, (loc >> 32) as usize, pos);
+        }
+        let o = loc as u32 as usize;
+        let h = unsafe { *self.pairs.as_ptr().add(o) } as usize;
+        let (off, n) = if odd {
+            (o + 1 + (h & 0xffff), h >> 16)
+        } else {
+            (o + 1, h & 0xffff)
+        };
+        self.any_pairable(off, n, pos)
     }
 
     /// [`WingPaths::possible`] for a node at distance = moves left - 1 (<= `smax`): its paths

@@ -1003,8 +1003,12 @@ pub struct Search1<'a, F: FnMut(&[u8], u8) -> bool> {
     batch_path: Vec<u8>,
     /// Per node of the current round, the children that can still reach an endpoint, if
     /// computed ahead (u32::MAX: not), to prefetch the children's wing-path table entries
-    /// (see [`Search1::run_batch_rounds`]).
-    pre: Vec<u32>,
+    /// (see [`Search1::run_batch_round`]), and those of them whose wing-path lists are
+    /// located in `located` from an offset.
+    pre: Vec<(u32, u32, u32)>,
+    /// The wing-path lists of the children tested in the current round, located ahead (see
+    /// [`crate::wingpath::WingPaths::locate`]).
+    located: Vec<u64>,
 }
 
 /// Prefetch the wing-path entries of the tight batch nodes' children a pass ahead
@@ -1117,6 +1121,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             batch_roots: vec![],
             batch_path: Vec::with_capacity(48),
             pre: vec![],
+            located: vec![],
         }
     }
 
@@ -1164,10 +1169,28 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
     }
 
     /// Queue the child `c` (after move `m`, first index `idx()`, computed only if it is
-    /// queued, distance `d`) of batch node `nd`.
+    /// queued, distance `d`) of batch node `nd`, if it passes its wing tests (`loc`: its
+    /// wing-path list, located ahead; see [`Search1::child_possible`]).
     #[inline(always)]
-    fn push_child(&mut self, nd: &BNode, c: &P1State, idx: impl FnOnce() -> u64, m: usize, d: u8) {
-        if !self.child_possible(c, nd.left - 1, d) {
+    fn push_child(
+        &mut self,
+        nd: &BNode,
+        c: &P1State,
+        idx: impl FnOnce() -> u64,
+        m: usize,
+        d: u8,
+        loc: Option<u64>,
+    ) {
+        let ok = match loc {
+            Some(l) => self
+                .t
+                .wingk
+                .as_deref()
+                .unwrap()
+                .possible_at(l, &c.pos, c.parity),
+            None => self.child_possible(c, nd.left - 1, d),
+        };
+        if !ok {
             return;
         }
         let idx = idx();
@@ -1316,15 +1339,22 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
             }
         }
         // The nodes whose children get the wing-path tests: their live children now (u32::MAX
-        // if not), and the children's table entries prefetched for the pass below.
+        // if not), and the tests split in three passes: the children's keys, their slots
+        // prefetched (here); the slots read and the lists prefetched (next); the lists read
+        // (when the children are queued).
         let mut pre = std::mem::take(&mut self.pre);
+        let mut located = std::mem::take(&mut self.located);
         pre.clear();
+        located.clear();
         if let Some(w) = t.wingk.as_deref().filter(|_| viable && *WK_PREFETCH) {
+            use crate::wingpath::{ODD, SLACK};
             for nd in cur.iter() {
                 let (d, left) = (nd.d, nd.left);
                 let mut e = u32::MAX;
                 // The moves to children with the tests (tight ones, ones with slack 1).
                 let mut tested = 0;
+                // Those with slack 1.
+                let mut slack = 0;
                 if left < 3 {
                 } else if d == left {
                     let red = w.red.is_some() && left - 1 == w.kmax + 1;
@@ -1349,10 +1379,13 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         3 => (0, inc),
                         _ => (0, 0),
                     };
-                    tested = e
-                        & (if left - 1 <= w.kmax { tight } else { 0 }
-                            | if left - 2 <= w.smax { slack1 } else { 0 });
+                    slack = e & if left - 2 <= w.smax { slack1 } else { 0 };
+                    tested = e & if left - 1 <= w.kmax { tight } else { 0 } | slack;
                 }
+                // The tests of the reduced lists (tight children one move beyond the table)
+                // are not split: only their entries are prefetched.
+                let red = d == left && left - 1 == w.kmax + 1;
+                let base = located.len() as u32;
                 if tested != 0 {
                     let flags = nd.state().centre_flags();
                     let mut b = tested;
@@ -1360,17 +1393,23 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         let m = b.trailing_zeros() as usize;
                         b &= b - 1;
                         let (ud, _, rl) = flag_masks(&unsafe { child_flags(&flags, m, t) });
-                        if d == left && left - 1 == w.kmax + 1 {
+                        if red {
                             w.red.as_ref().unwrap().prefetch(ud, rl);
                         } else {
-                            w.prefetch(ud, rl);
+                            let odd = nd.parity as u64 ^ (WIDE_QUARTER >> m & 1) as u64;
+                            let bits = (odd * ODD) | ((slack >> m & 1) as u64 * SLACK);
+                            located.push(w.prefetch_key(ud, rl) | bits);
                         }
                     }
                 }
-                pre.push(e);
+                pre.push((e, if red { 0 } else { tested }, base));
+            }
+            for x in located.iter_mut() {
+                *x = w.locate(*x);
             }
         }
         self.pre = pre;
+        self.located = located;
         for (ix, nd) in cur.iter().enumerate() {
             let s = nd.state();
             if nd.d < nd.left {
@@ -1388,7 +1427,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     // The children that cannot reach an endpoint (child bits) are not
                     // queued, nor tested (their last moves are counted).
                     let live = match self.pre.get(ix) {
-                        Some(&l) if l != u32::MAX => l,
+                        Some(&(l, _, _)) if l != u32::MAX => l,
                         _ => self.live_children(nd, a, d, left, dec_all, eq_all),
                     };
                     if left == 2 {
@@ -1403,6 +1442,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     a = live;
                 }
                 let flags = s.centre_flags();
+                let (tested, base) = self.pre.get(ix).map_or((0, 0), |p| (p.1, p.2));
                 while a != 0 {
                     let m = a.trailing_zeros() as usize;
                     a &= a - 1;
@@ -1421,7 +1461,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                             let nud = crate::simd::movemask(&crate::simd::add(&g, &g));
                             t.staging.rank24(!nud & MASK24) as u64
                         };
-                        self.push_child(nd, &c, i, m, dc);
+                        let loc = self.located(tested, base, m);
+                        self.push_child(nd, &c, i, m, dc, loc);
                     }
                 }
                 continue;
@@ -1433,7 +1474,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 continue;
             }
             let dec = mt.get(t, nd.idx, nd.sym, &s, self.pair);
-            let live = self.pre.get(ix).copied().filter(|&l| l != u32::MAX);
+            let (live, tested, base) = match self.pre.get(ix) {
+                Some(&(l, tested, base)) if l != u32::MAX => (Some(l), tested, base),
+                _ => (None, 0, 0),
+            };
             let mut a = dec & ALLOWED_AFTER[nd.last as usize];
             self.nodes += a.count_ones() as u64;
             self.reads += 1;
@@ -1502,7 +1546,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         t.staging.rank24(crate::simd::movemask(&g)) as u64
                     };
                     let c = s.apply(m, t);
-                    self.push_child(nd, &c, i, m, nd.left - 1);
+                    self.push_child(nd, &c, i, m, nd.left - 1, None);
                 }
             } else {
                 if viable {
@@ -1528,10 +1572,24 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         }
                     };
                     let c = s.apply(m, t);
-                    self.push_child(nd, &c, i, m, nd.left - 1);
+                    let loc = self.located(tested, base, m);
+                    self.push_child(nd, &c, i, m, nd.left - 1, loc);
                 }
             }
         }
+    }
+
+    /// The located wing-path list of the child via move `m` of a node of the current round
+    /// whose children `tested` have theirs in `self.located` from `base` (see
+    /// [`Search1::run_batch_round`]).
+    #[inline(always)]
+    fn located(&self, tested: u32, base: u32, m: usize) -> Option<u64> {
+        (tested >> m & 1 == 1).then(|| {
+            let i = base as usize + (tested & ((1 << m) - 1)).count_ones() as usize;
+            debug_assert!(i < self.located.len());
+            // SAFETY: one entry per tested child.
+            unsafe { *self.located.get_unchecked(i) }
+        })
     }
 
     /// The children among `a` (moves of batch node `nd`, at distance `d` with `left` moves
