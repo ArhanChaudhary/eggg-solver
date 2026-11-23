@@ -1501,7 +1501,7 @@ pub fn wing_paths(
     let sk = env("EGGG_P1_WINGS", if k >= 7 { WINGS_DEEP } else { WINGS }).min(k);
     let t0 = Instant::now();
     let frames = [0, 1, 2].map(crate::phase1::Frame::new);
-    let red = env("EGGG_P1_WINGR", WINGR as u8) != 0;
+    let red = env("EGGG_P1_WINGR", (k <= WINGR_K) as u8) != 0;
     let (w, how) = if k >= WING_FILE_K {
         let path = dir.join(WingPaths::file_name(k, sk));
         match WingPaths::load(&path, &frames, k, sk, red) {
@@ -1557,9 +1557,11 @@ pub const WINGS_DEEP: u8 = 6;
 /// [`crate::wingpath::WingPaths::add_slack2`]): 25 MB up to distance 4 (p1check 7% faster
 /// than none on the M2); distance 5 adds 0.4 GB for 1% more.
 pub const WINGS2: i8 = 4;
-/// Whether the wing-path lookahead also has the symmetry-reduced lists one move further
-/// (`EGGG_P1_WINGR`, see [`crate::wingpath::Reduced`]).
-pub const WINGR: bool = false;
+/// The wing-path lookahead also has the symmetry-reduced lists one move further
+/// (`EGGG_P1_WINGR`, see [`crate::wingpath::Reduced`]) by default when its largest distance
+/// is at most this: distance 7 after a table up to 6 (the large tier) adds 0.25 GB, built in
+/// about a second, for 8% (p1check on the M2); distance 8 would add 2.7 GB and 20 s.
+pub const WINGR_K: u8 = 6;
 
 /// Load or build the phase-2 tables in `dir`; `joint`: also the joint table (1.05 GB).
 pub fn load_p2(dir: &std::path::Path, joint: bool, threads: usize, verbose: bool) -> P2Tables {
