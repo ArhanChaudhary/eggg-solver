@@ -432,8 +432,9 @@ struct Sym {
     qinv: V32,
 }
 
-/// The symmetries that map the 27 moves onto themselves (by conjugation, centres and wings).
-fn move_set_syms() -> Vec<Sym> {
+/// The symmetries that map the 27 moves onto themselves (by conjugation, centres and wings),
+/// the identity first.
+fn move_set_syms() -> Box<[Sym; 6]> {
     let g = &*crate::cube::GEO;
     let mut out = vec![];
     for inv in [1i8, -1] {
@@ -470,7 +471,12 @@ fn move_set_syms() -> Vec<Sym> {
         }
     }
     assert_eq!(out.len(), 6, "symmetries keeping the move set");
-    out
+    assert!(
+        (0..24).all(|i| out[0].centre[i / 8][1 << (i % 8)] == 1 << i),
+        "the identity first"
+    );
+    let out: Box<[Sym]> = out.into_boxed_slice();
+    out.try_into().ok().unwrap()
 }
 
 /// The pair lists of the states at one distance, one per class under the symmetries that
@@ -478,7 +484,7 @@ fn move_set_syms() -> Vec<Sym> {
 pub struct Reduced {
     hash: Hash,
     pairs: HugeBuf<u32>,
-    syms: Vec<Sym>,
+    syms: Box<[Sym; 6]>,
 }
 
 impl Reduced {
@@ -496,17 +502,19 @@ impl Reduced {
     }
 }
 
-/// See [`Reduced::canon`].
+/// See [`Reduced::canon`]: the least key over the six symmetries, the identity's without a
+/// table lookup, in a loop of fixed length (unrolled) and branch-free (each key with the
+/// symmetry's number in three low bits: the first of equal keys wins, as before).
 #[inline(always)]
-fn canon(syms: &[Sym], ud: u32, rl: u32) -> (u64, usize) {
-    let mut best = (u64::MAX, 0);
-    for (i, s) in syms.iter().enumerate() {
+fn canon(syms: &[Sym; 6], ud: u32, rl: u32) -> (u64, usize) {
+    // Keys have bit 63 and 48 bits of masks.
+    const TOP: u64 = 1 << 63;
+    let mut best = (WingPaths::key(ud, rl) & !TOP) << 3;
+    for (i, s) in syms.iter().enumerate().skip(1) {
         let k = WingPaths::key(apply_bytes(&s.centre, ud), apply_bytes(&s.centre, rl));
-        if k < best.0 {
-            best = (k, i);
-        }
+        best = best.min((k & !TOP) << 3 | i as u64);
     }
-    best
+    (best >> 3 | TOP, (best & 7) as usize)
 }
 
 /// Per byte of a 24-bit set, per value, the set's image under the map `f` of positions.
