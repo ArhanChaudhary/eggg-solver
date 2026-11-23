@@ -88,16 +88,16 @@ enum Tier {
     Small,
     /// ~2.3 GB: h48 h5 and the joint phase-2 table.
     Medium,
-    /// ~4.85 GB: h48 h6, the joint phase-2 table, the phase-1 move masks and wing paths up to
-    /// distance 6 (0.14 GB).
+    /// ~5.13 GB: h48 h6, the joint phase-2 table, the phase-1 move masks and wing paths up to
+    /// distance 6, with the reduced lists of distance 7 (0.42 GB).
     Large,
-    /// ~7.9 GB: h48 h7, the joint phase-2 table, the phase-1 move masks and wing paths up to
-    /// distance 7 (1.24 GB).
+    /// ~8.45 GB: h48 h7, the joint phase-2 table, the phase-1 move masks and wing paths up to
+    /// distance 7 (1.8 GB).
     Huge,
-    /// ~19.3 GB: h48 h9, the joint phase-2 table, the phase-1 move masks and wing paths up to
+    /// ~19.85 GB: h48 h9, the joint phase-2 table, the phase-1 move masks and wing paths up to
     /// distance 7 (phase 3 3.6x faster than huge; single-threaded first solutions ~4x sooner).
     Xl,
-    /// ~64.9 GB: h48 h11 (the largest), the joint phase-2 table, the phase-1 move masks and
+    /// ~65.45 GB: h48 h11 (the largest), the joint phase-2 table, the phase-1 move masks and
     /// wing paths up to distance 7 (phase 3 11x faster than huge; single-threaded first
     /// solutions ~12x sooner).
     Xxl,
@@ -111,10 +111,10 @@ impl Tier {
             Tier::Tiny => (0, false, false, 0, 0.16e9),
             Tier::Small => (3, false, false, 0, 0.35e9),
             Tier::Medium => (5, true, false, 0, 2.3e9),
-            Tier::Large => (6, true, true, 6, 4.85e9),
-            Tier::Huge | Tier::Auto => (7, true, true, 7, 7.9e9),
-            Tier::Xl => (9, true, true, 7, 19.3e9),
-            Tier::Xxl => (11, true, true, 7, 64.9e9),
+            Tier::Large => (6, true, true, 6, 5.13e9),
+            Tier::Huge | Tier::Auto => (7, true, true, 7, 8.45e9),
+            Tier::Xl => (9, true, true, 7, 19.85e9),
+            Tier::Xxl => (11, true, true, 7, 65.45e9),
         }
     }
 
@@ -180,9 +180,9 @@ struct TableArgs {
     #[arg(long, value_enum)]
     p1_mask: Option<PatArg>,
     /// Phase-1 wing-path lookahead (with the move masks): per centre state, the wing slot
-    /// sets its staging paths need, up to this distance (0: none; 6: 0.14 GB, 7: 1.24 GB,
-    /// built in ~1 s; 8: 14.6 GB, built once in about a minute (peak 14.7 GB) and saved as
-    /// p1-wing-k8s5.tab; default: the tier's).
+    /// sets its staging paths need, up to this distance (0: none; 6: 0.42 GB, 7: 1.8 GB,
+    /// built in a few seconds; 8: 15.2 GB, built once in about a minute (peak 15.0 GB)
+    /// and saved as p1-wingb-k8s6.tab; default: the tier's).
     #[arg(long, value_name = "K")]
     p1_wing: Option<u8>,
 }

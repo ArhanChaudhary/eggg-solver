@@ -1485,9 +1485,10 @@ impl P1Extra {
 /// (0: none; the tiers' defaults are [`WINGK`] and 6 for the large tier) and, for nodes with
 /// one move of slack, `EGGG_P1_WINGS` (default [`WINGS`], or [`WINGS_DEEP`] from `k` = 7
 /// on; at most `k`); see
-/// [`crate::wingpath`]. Built (in ~1 s up to distance 7), or from distance [`WING_FILE_K`] on
-/// loaded from `dir` (e.g. `p1-wing-k8s5.tab`; built and saved if missing or invalid: 14.6 GB
-/// and about a minute for distance 8).
+/// [`crate::wingpath`]. Built (in a few seconds up to distance 7), or from distance
+/// [`WING_FILE_K`] on loaded from `dir` (e.g. `p1-wingb-k8s6.tab`; built and saved if missing
+/// or invalid: 15.2 GB and about a minute for distance 8); then the slack-2 lists are added
+/// (see [`WINGS2`]).
 pub fn wing_paths(
     dir: &std::path::Path,
     k: u8,
