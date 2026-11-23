@@ -58,8 +58,8 @@ struct Knobs {
     margins: Vec<(f64, usize)>,
     /// From this time on (seconds), phase 2 has no reduction budget (`EGGG_P2_FREE`).
     p2_free: f64,
-    /// Once a solution exists, a round's phase 2 stops after this multiple of its phase-1
-    /// time (`EGGG_P2_TIME`).
+    /// From `p2_free` on, a round's phase 2 stops after this multiple of its phase-1 time
+    /// (`EGGG_P2_TIME`).
     p2_time: f64,
 }
 
@@ -780,7 +780,10 @@ impl<'a, 'r> Run<'a, 'r> {
             } else {
                 want2
             };
-            if self.best.is_some() && self.knobs.p2_time.is_finite() {
+            if self.best.is_some()
+                && self.knobs.p2_time.is_finite()
+                && self.start.elapsed().as_secs_f64() >= self.knobs.p2_free
+            {
                 let p1 = t0.elapsed().mul_f64(self.knobs.p2_time);
                 let at = Instant::now() + p1;
                 self.p2_cut = Some(self.p2_cut.map_or(at, |c| c.min(at)));
