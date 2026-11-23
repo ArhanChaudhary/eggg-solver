@@ -141,6 +141,8 @@ struct Candidate {
     h2: u8,
     /// Phase-2 depths below this have been searched.
     done2: u8,
+    /// The round that made it (debug output).
+    round: u32,
 }
 
 struct Reduction {
@@ -151,6 +153,9 @@ struct Reduction {
     h3: u8,
     /// Phase-3 depths below this have been searched without a solution.
     done3: u8,
+    /// The rounds that made it and its candidate (debug output).
+    round: u32,
+    cand_round: u32,
 }
 
 /// The resumable state of one phase-1 length level.
@@ -391,6 +396,7 @@ fn make_candidates(
             df,
             h2,
             done2: 0,
+            round: 0,
         });
     }
 }
@@ -502,6 +508,15 @@ struct Run<'a, 'r> {
     /// and at the previous length.
     yields: HashMap<[u8; 3], (u64, u64)>,
     prev_yields: HashMap<[u8; 3], (u64, u64)>,
+    /// Debug output (`EGGG_DEBUG`).
+    trace: bool,
+    /// Debug: the current phase-1 level's nodes, endpoints and kept candidates so far, when
+    /// it started, and the previous level's nodes.
+    lvl_nodes: u64,
+    lvl_eps: usize,
+    lvl_kept: usize,
+    lvl_start: f64,
+    prev_lvl_nodes: u64,
 }
 
 impl<'a> Solver<'a> {
@@ -576,6 +591,12 @@ impl<'a> Solver<'a> {
             printed: HashSet::new(),
             yields: HashMap::new(),
             prev_yields: HashMap::new(),
+            trace: std::env::var_os("EGGG_DEBUG").is_some(),
+            lvl_nodes: 0,
+            lvl_eps: 0,
+            lvl_kept: 0,
+            lvl_start: 0.0,
+            prev_lvl_nodes: 0,
         };
         run.level.jobs = run.level_jobs(len0);
         std::thread::scope(|scope| {
@@ -658,8 +679,35 @@ impl<'a, 'r> Run<'a, 'r> {
                 (None, None)
             };
             let tp = Instant::now();
+            let (eps0, nodes0, kept0) = (self.made_cands, self.stats.nodes1, self.cands.len());
+            let len0 = self.level.len;
             self.phase1(want1);
             self.stats.time[0] += tp.elapsed();
+            if self.trace {
+                let now = self.start.elapsed().as_secs_f64();
+                let cut = self
+                    .p1_cut
+                    .map(|c| c.saturating_duration_since(t0).as_secs_f64())
+                    .unwrap_or(-1.0);
+                eprintln!(
+                    "[{now:8.3}] ROUND {} best {} p1 {:.3} s (cut {:.3}) levels {}..{} round nodes {:.3e} eps {} kept {} | level {} nodes {:.3e} (prev level {:.3e}) jobs {}/{} want1 {}",
+                    self.stats.rounds,
+                    self.best_len(),
+                    tp.elapsed().as_secs_f64(),
+                    cut,
+                    len0,
+                    self.level.len,
+                    (self.stats.nodes1 - nodes0) as f64,
+                    self.made_cands - eps0,
+                    self.cands.len() - kept0,
+                    self.level.len,
+                    self.lvl_nodes as f64,
+                    self.prev_lvl_nodes as f64,
+                    self.level.next,
+                    self.level.jobs.len(),
+                    want1
+                );
+            }
             debug(
                 self.start,
                 &format!(
@@ -853,6 +901,22 @@ impl<'a, 'r> Run<'a, 'r> {
                 // solution exists (before, every candidate counts as kept, and the order
                 // made some first solutions later on the M2).
                 let len = self.level.len + 1;
+                if self.trace {
+                    let now = self.start.elapsed().as_secs_f64();
+                    eprintln!(
+                        "[{now:8.3}] P1LEVEL {} done: nodes {:.3e} endpoints {} kept {} in {:.3} s ({:.3}..{:.3})",
+                        self.level.len,
+                        self.lvl_nodes as f64,
+                        self.lvl_eps,
+                        self.lvl_kept,
+                        now - self.lvl_start,
+                        self.lvl_start,
+                        now
+                    );
+                    self.prev_lvl_nodes = self.lvl_nodes;
+                    (self.lvl_nodes, self.lvl_eps, self.lvl_kept) = (0, 0, 0);
+                    self.lvl_start = now;
+                }
                 self.prev_yields = std::mem::take(&mut self.yields);
                 let mut jobs = self.level_jobs(len);
                 if self.order_jobs && self.best.is_some() {
@@ -955,6 +1019,7 @@ impl<'a, 'r> Run<'a, 'r> {
                 }
             });
             self.stats.nodes1 += nodes.load(Ordering::Relaxed);
+            self.lvl_nodes += nodes.load(Ordering::Relaxed);
             self.cand_time +=
                 Duration::from_nanos(cand_nanos.load(Ordering::Relaxed) / threads as u64);
             if self.stopped() {
@@ -985,6 +1050,14 @@ impl<'a, 'r> Run<'a, 'r> {
             // The new candidates, in job order (the order of their endpoints).
             // (Levels, jobs and handed-back subtrees are disjoint: no endpoint comes twice.)
             self.made_cands += results.iter().map(|r| r.4).sum::<usize>();
+            self.lvl_eps += results.iter().map(|r| r.4).sum::<usize>();
+            self.lvl_kept += results.iter().map(|r| r.1.len()).sum::<usize>();
+            let round = self.stats.rounds as u32;
+            for r in &mut results {
+                for c in &mut r.1 {
+                    c.round = round;
+                }
+            }
             for c in results.iter().flat_map(|r| &r.1) {
                 if let Some(k) = prefix3(&c.moves1) {
                     self.yields.entry(k).or_default().0 += 1;
@@ -1056,6 +1129,23 @@ impl<'a, 'r> Run<'a, 'r> {
             .map(|c| c.moves1.len() + c.h2.max(c.done2) as usize)
             .min()
             .unwrap_or(99);
+        if self.trace {
+            // The candidates by the level of their next search (up to the cap).
+            let mut reach = std::collections::BTreeMap::new();
+            for c in &self.cands {
+                let t = c.moves1.len() + c.h2.max(c.done2) as usize;
+                if t <= cap + 1 {
+                    *reach.entry(t).or_insert(0usize) += 1;
+                }
+            }
+            eprintln!(
+                "[{:8.3}] P2 start: margin {margin} cap {cap} want {want} made_reds {} cands {} next-level counts {:?}",
+                self.start.elapsed().as_secs_f64(),
+                self.made_reds,
+                self.cands.len(),
+                reach
+            );
+        }
         while self.made_reds < want
             && !self.stopped()
             && t12 <= cap
@@ -1074,6 +1164,23 @@ impl<'a, 'r> Run<'a, 'r> {
                 }
             }
             t12 += 1;
+        }
+        if self.trace {
+            let why = if self.stopped() {
+                "stop"
+            } else if self.made_reds >= want {
+                "budget"
+            } else if t12 > cap {
+                "cap"
+            } else {
+                "cut"
+            };
+            eprintln!(
+                "[{:8.3}] P2 end ({why}): made_reds {} reds {}",
+                self.start.elapsed().as_secs_f64(),
+                self.made_reds,
+                self.reds.len()
+            );
         }
         self.stats.reductions = self.reds.len();
     }
@@ -1113,6 +1220,9 @@ impl<'a, 'r> Run<'a, 'r> {
         let nodes = AtomicU64::new(0);
         let stop = self.stop;
         let made = AtomicUsize::new(0);
+        let started = AtomicUsize::new(0);
+        let t_level = Instant::now();
+        let round = self.stats.rounds as u32;
         let cut = self.p2_cut;
         let past_cut = || cut.is_some_and(|c| Instant::now() >= c);
         // Per search: its jobs (1 if whole), and those that ran to the end.
@@ -1156,6 +1266,8 @@ impl<'a, 'r> Run<'a, 'r> {
                             c3,
                             h3,
                             done3: 0,
+                            round,
+                            cand_round: c.round,
                         });
                     }
                 }
@@ -1204,6 +1316,7 @@ impl<'a, 'r> Run<'a, 'r> {
                             splitting.fetch_sub(1, Ordering::SeqCst);
                             continue;
                         }
+                        started.fetch_add(1, Ordering::Relaxed);
                         let c = &cands[todo[k]];
                         let l2 = (t12 - c.moves1.len()) as u8;
                         let slack = l2.saturating_sub(c.h2);
@@ -1226,11 +1339,34 @@ impl<'a, 'r> Run<'a, 'r> {
                 });
             }
         });
+        let mut n_fin = 0usize;
         for (k, &i) in todo.iter().enumerate() {
             if finished[k].load(Ordering::Relaxed) == parts[k].load(Ordering::Relaxed) {
                 let c = &mut self.cands[i];
                 c.done2 = c.done2.max((t12 - c.moves1.len()) as u8 + 1);
+                n_fin += 1;
             }
+        }
+        if self.trace {
+            let why = if self.stopped() {
+                "stop"
+            } else if past_cut() {
+                "cut"
+            } else if made.load(Ordering::Relaxed) >= need {
+                "budget"
+            } else {
+                "done"
+            };
+            eprintln!(
+                "[{:8.3}] P2LEVEL {t12}: todo {} started {} finished {} kept reds {} (need {need}) nodes {:.3e} in {:.3} s ({why})",
+                self.start.elapsed().as_secs_f64(),
+                todo.len(),
+                started.load(Ordering::Relaxed),
+                n_fin,
+                made.load(Ordering::Relaxed),
+                nodes.load(Ordering::Relaxed) as f64,
+                t_level.elapsed().as_secs_f64()
+            );
         }
         self.stats.nodes2 += nodes.load(Ordering::Relaxed);
         let mut v = out.into_inner().unwrap();
@@ -1260,6 +1396,19 @@ impl<'a, 'r> Run<'a, 'r> {
             return;
         }
         if sol.len() < self.best_len() {
+            if self.trace {
+                eprintln!(
+                    "[{:8.3}] IMPROVE {} -> {} phases {:?} (L12 {}) round {} candidate round {} reduction round {}",
+                    self.start.elapsed().as_secs_f64(),
+                    self.best_len() as isize,
+                    sol.len(),
+                    sol.phases,
+                    red.moves12.len(),
+                    self.stats.rounds,
+                    red.cand_round,
+                    red.round
+                );
+            }
             if self.ties {
                 self.printed.insert(sol.moves.clone());
             }
@@ -1345,6 +1494,7 @@ impl<'a, 'r> Run<'a, 'r> {
                 jobs.push((i, None));
             }
         }
+        let t_level = Instant::now();
         let result = Mutex::new(Vec::<(usize, Vec<u8>)>::new());
         let found = AtomicBool::new(false);
         let nodes = AtomicU64::new(0);
@@ -1384,13 +1534,32 @@ impl<'a, 'r> Run<'a, 'r> {
         // reduction's first.
         result.sort_by_key(|x| x.0);
         result.dedup_by_key(|x| x.0);
+        let mut n_fin = 0usize;
         for i in 0..self.reds.len() {
             if (parts[i] > 0 && finished[i].load(Ordering::Relaxed) == parts[i])
                 || pruned.contains(&i)
             {
                 let r = &mut self.reds[i];
                 r.done3 = r.done3.max((total - r.moves12.len()) as u8 + 1);
+                n_fin += 1;
             }
+        }
+        if self.trace {
+            eprintln!(
+                "[{:8.3}] P3LEVEL {total}: reds {} jobs {} finished {} found {} nodes {:.3e} in {:.3} s{}",
+                self.start.elapsed().as_secs_f64(),
+                order.len(),
+                jobs.len(),
+                n_fin,
+                result.len(),
+                nodes.load(Ordering::Relaxed) as f64,
+                t_level.elapsed().as_secs_f64(),
+                if Instant::now() >= deadline {
+                    " (deadline)"
+                } else {
+                    ""
+                }
+            );
         }
         if all {
             // A reduction with a solution at this level has given its share.
@@ -1751,6 +1920,7 @@ mod tests {
             df,
             h2: cd.max(dt).max(df),
             done2: 0,
+            round: 0,
         };
         (c.moves1.len() + c.h2 as usize <= limit).then_some(c)
     }
