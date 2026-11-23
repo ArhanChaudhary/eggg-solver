@@ -1412,8 +1412,8 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                     }
                     tested = e & if left - 1 <= w.kmax { tight } else { 0 } | slack | slack2;
                 }
-                // The tests of the reduced lists (tight children one move beyond the table)
-                // are not split: only their entries are prefetched.
+                // The tests by the reduced lists (tight children one move beyond the table):
+                // their class (and symmetry) is found here, once.
                 let red = d == left && left - 1 == w.kmax + 1;
                 let base = located.len() as u32;
                 if tested != 0 {
@@ -1423,10 +1423,10 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         let m = b.trailing_zeros() as usize;
                         b &= b - 1;
                         let (ud, _, rl) = flag_masks(&unsafe { child_flags(&flags, m, t) });
+                        let odd = nd.parity as u64 ^ (WIDE_QUARTER >> m & 1) as u64;
                         if red {
-                            w.red.as_ref().unwrap().prefetch(ud, rl);
+                            located.push(w.prefetch_red(ud, rl) | (odd * ODD));
                         } else {
-                            let odd = nd.parity as u64 ^ (WIDE_QUARTER >> m & 1) as u64;
                             let bits = (odd * ODD) | ((slack >> m & 1) as u64 * SLACK);
                             if slack2 >> m & 1 == 1 {
                                 located.push(w.prefetch_key2(ud, rl) | bits | SLACK2);
@@ -1438,7 +1438,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 }
                 pre.push(Pre {
                     live: e,
-                    tested: if red { 0 } else { tested },
+                    tested,
                     base,
                     dec: dec_all,
                     eq: eq_all,

@@ -54,8 +54,15 @@ pub const SLACK: u64 = 1 << 60;
 /// The flag of a key passed to [`WingPaths::locate`] for the test of a node with two moves
 /// of slack (see [`WingPaths::add_slack2`]).
 pub const SLACK2: u64 = 1 << 59;
+/// The flag of a key for the test of a node one move beyond the table, by the reduced lists
+/// (see [`WingPaths::prefetch_red`]), with the symmetry to its class member at
+/// [`SYM_SHIFT`].
+const RED: u64 = 1 << 58;
+const SYM_SHIFT: u32 = 55;
+/// The bits of a key passed to [`WingPaths::locate`] that are not the key's.
+const FLAGS: u64 = ODD | SLACK | SLACK2 | RED | 7 << SYM_SHIFT;
 /// A located list that every node passes (its state is not in the table).
-const PASS: u64 = u64::MAX >> 5;
+const PASS: u64 = (1 << SYM_SHIFT) - 1;
 
 /// States per distance (unlabelled colour pairs: about a sixth of the U/D x R/L mask pairs).
 pub const COUNT: [usize; 9] = [1, 3, 54, 717, 8955, 116_301, 1_506_114, 18_693_124, COUNT8];
@@ -1223,9 +1230,26 @@ impl WingPaths {
     /// [`SLACK`] (the lists' lengths are read with them).
     #[inline(always)]
     pub fn locate(&self, key: u64) -> u64 {
+        if key & RED != 0 {
+            let r = self.red.as_ref().unwrap();
+            let s = r.hash.slot(r.hash.find(key & !FLAGS));
+            if s.key == 0 {
+                debug_assert!(false, "state not in the reduced table");
+                return PASS;
+            }
+            let (off, n) = Self::tight_list(s, key & ODD != 0);
+            if n != 0 {
+                // SAFETY: the list is in the table.
+                unsafe {
+                    crate::table::prefetch(r.pairs.as_ptr().add(off));
+                    crate::table::prefetch(r.pairs.as_ptr().add(off + PLANE * n - 1));
+                }
+            }
+            return off as u64 | (n as u64) << 32 | RED | (key & (7 << SYM_SHIFT));
+        }
         if key & SLACK2 != 0 {
             let (h, pairs) = self.s2.as_ref().unwrap();
-            let s = h.slot(h.find(key & !(ODD | SLACK2)));
+            let s = h.slot(h.find(key & !FLAGS));
             if s.key == 0 {
                 debug_assert!(false, "state not in the slack-2 lists");
                 return PASS;
@@ -1240,7 +1264,7 @@ impl WingPaths {
             }
             return off as u64 | (n as u64) << 32 | SLACK2;
         }
-        let s = self.hash.slot(self.find(key & !(ODD | SLACK)));
+        let s = self.hash.slot(self.find(key & !FLAGS));
         if s.key == 0 {
             debug_assert!(false, "state not in the table");
             return PASS;
@@ -1273,11 +1297,21 @@ impl WingPaths {
     /// [`WingPaths::locate`])?
     #[inline(always)]
     pub fn possible_at(&self, loc: u64, pos: &V32, odd: bool) -> bool {
-        if loc & (SLACK | SLACK2) == 0 {
+        if loc & (SLACK | SLACK2 | RED) == 0 {
             if loc == PASS {
                 return true;
             }
             return self.any_pairable(loc as u32 as usize, (loc >> 32) as usize, pos);
+        }
+        if loc & RED != 0 {
+            let r = self.red.as_ref().unwrap();
+            let (off, n) = (loc as u32 as usize, (loc >> 32) as u16 as usize);
+            // The wings of the class member: piece q(w) at slot q(pos(w)).
+            let sym = unsafe { r.syms.get_unchecked((loc >> SYM_SHIFT & 7) as usize) };
+            let p = crate::simd::gather(&sym.q, &crate::simd::gather(pos, &sym.qinv));
+            debug_assert!(off + PLANE * n + PAD_WORDS <= r.pairs.len());
+            // SAFETY: as in `WingPaths::any_pairable`.
+            return unsafe { any_pairable(r.pairs.as_ptr().add(off), n, &p) };
         }
         if loc & SLACK2 != 0 {
             let pairs = &self.s2.as_ref().unwrap().1;
@@ -1335,6 +1369,18 @@ impl WingPaths {
         debug_assert!(off + PLANE * n + PAD_WORDS <= self.pairs.len());
         // SAFETY: the planes are in the table, which is padded after the last one.
         unsafe { any_pairable(self.pairs.as_ptr().add(off), n, pos) }
+    }
+
+    /// The key of the class of the state with colour masks `ud` and `rl` in the reduced
+    /// lists, with [`RED`] and the symmetry to the class member, its slot prefetched: the
+    /// first step of a test by the reduced lists split in three (see
+    /// [`WingPaths::locate`]), so that the class is found once.
+    #[inline(always)]
+    pub fn prefetch_red(&self, ud: u32, rl: u32) -> u64 {
+        let r = self.red.as_ref().unwrap();
+        let (k, si) = r.canon(ud, rl);
+        r.hash.prefetch(k);
+        k | RED | (si as u64) << SYM_SHIFT
     }
 
     /// [`WingPaths::possible`] for a node at distance `kmax` + 1, by the reduced lists.
@@ -1559,7 +1605,8 @@ mod tests {
 
     /// The symmetry-reduced lists one move beyond the table (distance 4 after a table up to
     /// 3, and 5 after 4) agree with the full table's on states at that distance (random
-    /// walks back from the solved cube) with their wings or random ones.
+    /// walks back from the solved cube) with their wings or random ones; so does their test
+    /// split in three (`prefetch_red`, `locate`, `possible_at`).
     #[test]
     fn reduced_layer_matches_full_table() {
         let t = tables();
@@ -1596,6 +1643,9 @@ mod tests {
                     want,
                     "k {k} case {n}"
                 );
+                // The same through the split test.
+                let key = w.prefetch_red(ud, rl) | (s.parity as u64 * ODD);
+                assert_eq!(w.possible_at(w.locate(key), &s.pos, s.parity), want);
                 pass[random as usize] += want as usize;
                 n += 1;
             }
