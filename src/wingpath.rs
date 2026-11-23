@@ -267,6 +267,22 @@ pub const PLANE: usize = 6;
 /// Words after the last plane of a table, so that a 32-byte read of any plane stays in it.
 const PAD_WORDS: usize = 2;
 
+/// Lists of at least this many planes (64 or more preimages; most slack-2 lists and the
+/// longest slack-1 lists) start with wide blocks: per eight planes, the same 48 words hold
+/// a block of 64 preimages stored per slot (word x, 64 bits: the block's preimages that
+/// contain slot x), tested with one load per wing and three operations per dedge (see
+/// [`any_pairable`]); the rest of the list (fewer than eight planes) stays in planes.
+pub const WIDE_MIN: usize = 8;
+
+/// The wide blocks of a list of `n` planes (see [`WIDE_MIN`]).
+#[inline(always)]
+fn wide_blocks(n: usize) -> usize {
+    if n >= WIDE_MIN { n / 8 } else { 0 }
+}
+
+/// Words per wide block (eight planes).
+const BLOCK_WORDS: usize = 8 * PLANE;
+
 /// The transpose of an 8 x 8 bit matrix (byte r holding row r, bit c of it column c).
 #[inline(always)]
 fn transpose8(mut x: u64) -> u64 {
@@ -278,10 +294,34 @@ fn transpose8(mut x: u64) -> u64 {
     x ^ t ^ (t << 28)
 }
 
-/// Append the planes of the preimages `pre` (24-bit slot sets, not empty) to `out`; their
-/// number.
+/// Append the planes of the preimages `pre` (24-bit slot sets, not empty) to `out`, its
+/// first preimages in wide blocks if they are many (see [`WIDE_MIN`]); their number (of
+/// planes, or the planes' worth of words).
 fn encode(pre: &[u32], out: &mut Vec<u32>) -> usize {
-    for c in pre.chunks(8) {
+    let blocks = wide_blocks(pre.len().div_ceil(8));
+    let wide = pre.len().min(64 * blocks);
+    for c in pre[..wide].chunks(64) {
+        let mut b = [0u64; 24];
+        for (j, &p) in c.iter().enumerate() {
+            for (x, w) in b.iter_mut().enumerate() {
+                *w |= ((p >> x & 1) as u64) << j;
+            }
+        }
+        for w in b {
+            out.extend(
+                w.to_ne_bytes()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&h| u32::from_ne_bytes(h)),
+            );
+        }
+    }
+    // The last block may have fewer than 64 preimages (its other bits are zero).
+    for _ in pre[..wide].len().div_ceil(64)..blocks {
+        out.extend([0; BLOCK_WORDS]);
+    }
+    for c in pre[wide..].chunks(8) {
         let mut b = [0u8; 4 * PLANE];
         for i in 0..3 {
             // Byte j: slots 8i.. of preimage j; transposed, byte k: the preimages with slot
@@ -296,9 +336,26 @@ fn encode(pre: &[u32], out: &mut Vec<u32>) -> usize {
     pre.len().div_ceil(8)
 }
 
-/// Each preimage of the planes `w` (in order), to `f`.
+/// Each preimage of the planes (and wide blocks) `w` (in order), to `f`.
 #[inline(always)]
 fn decode(w: &[u32], mut f: impl FnMut(u32)) {
+    let blocks = wide_blocks(w.len() / PLANE);
+    let (wide, w) = w.split_at(blocks * BLOCK_WORDS);
+    for b in wide.as_chunks::<BLOCK_WORDS>().0 {
+        let words: [u64; 24] =
+            std::array::from_fn(|x| b[2 * x] as u64 | (b[2 * x + 1] as u64) << 32);
+        let words = if cfg!(target_endian = "little") {
+            words
+        } else {
+            words.map(|v| v.rotate_left(32))
+        };
+        for j in 0..64 {
+            let x = (0..24).fold(0u32, |a, i| a | ((words[i] >> j & 1) as u32) << i);
+            if x != 0 {
+                f(x);
+            }
+        }
+    }
     for pl in w.as_chunks::<PLANE>().0 {
         let mut b = [0u8; 4 * PLANE];
         for (i, &x) in pl.iter().enumerate() {
@@ -539,7 +596,7 @@ fn apply_bytes(t: &[[u32; 256]; 3], x: u32) -> u32 {
 
 /// The name of the saved tables and the version of their layout.
 const NAME: &str = "p1-wingb";
-const FORMAT: u64 = 3;
+const FORMAT: u64 = 4;
 
 impl WingPaths {
     /// The key of a centre state with U/D and R/L colour masks `ud` and `rl` (either two of
@@ -1435,7 +1492,13 @@ impl WingPaths {
 /// wings' bytes differ.
 #[inline(always)]
 unsafe fn any_pairable(p: *const u32, n: usize, pos: &V32) -> bool {
-    for k in 0..n {
+    let blocks = wide_blocks(n);
+    // SAFETY: the caller's (the blocks come first).
+    if blocks != 0 && unsafe { any_pairable_wide(p, blocks, pos) } {
+        return true;
+    }
+    let p = unsafe { p.add(blocks * BLOCK_WORDS) };
+    for k in 0..n - 8 * blocks {
         // SAFETY: the caller's.
         let v = unsafe { std::ptr::read_unaligned(p.add(k * PLANE) as *const V32) };
         let g = crate::simd::gather(&v, pos).0;
@@ -1450,6 +1513,38 @@ unsafe fn any_pairable(p: *const u32, n: usize, pos: &V32) -> bool {
         e ^= e >> 32;
         e ^= e >> 16;
         if a & !e & 0xff != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`any_pairable`] for `blocks` wide blocks at `p` (see [`WIDE_MIN`]): per block, the
+/// words of the wings' slots give per wing the preimages containing its slot (bits); a dedge
+/// is split by those where its wings' words differ, and the first wings' words XORed give the
+/// parity of the dedges' first wings in each preimage. The blocks' unused bits are zero in
+/// every word, so no dedge is split by them.
+#[inline(never)]
+unsafe fn any_pairable_wide(p: *const u32, blocks: usize, pos: &V32) -> bool {
+    let s: [usize; 24] = std::array::from_fn(|i| pos.0[i] as usize);
+    for b in 0..blocks {
+        // SAFETY: the caller's: the block's 24 words (two u32 each, maybe unaligned).
+        let q = unsafe { p.add(b * BLOCK_WORDS) } as *const u64;
+        let word = |x: usize| {
+            let v = unsafe { std::ptr::read_unaligned(q.add(x)) };
+            if cfg!(target_endian = "little") {
+                v
+            } else {
+                v.rotate_left(32)
+            }
+        };
+        let (mut ok, mut h) = (!0u64, 0u64);
+        for e in 0..12 {
+            let (x, y) = (word(s[2 * e]), word(s[2 * e + 1]));
+            ok &= x ^ y;
+            h ^= x;
+        }
+        if ok & !h != 0 {
             return true;
         }
     }
@@ -1721,6 +1816,73 @@ mod tests {
                     assert_eq!(bytes[x], want);
                 }
             }
+        }
+    }
+
+    /// Long lists (wide blocks, then planes) decode to the preimages encoded, in order, and
+    /// test as the preimages one at a time do.
+    #[test]
+    fn wide_blocks_round_trip() {
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(14);
+        // One preimage: every dedge split, an even number of first wings in it.
+        let one = |p: u32, pos: &V32| {
+            (0..12).all(|e| (p >> pos.0[2 * e] & 1) != (p >> pos.0[2 * e + 1] & 1))
+                && (0..12).filter(|&e| p >> pos.0[2 * e] & 1 == 1).count() % 2 == 0
+        };
+        let mut passed = 0;
+        for n in [1, 7, 8, 56, 57, 63, 64, 65, 120, 128, 129, 200, 300] {
+            for _ in 0..20 {
+                // Random preimages, many of 12 slots (as the lists' are).
+                let mut pre: Vec<u32> = (0..n)
+                    .map(|_| {
+                        let mut s: Vec<u32> = (0..24).collect();
+                        s.shuffle(&mut rng);
+                        let k = if rng.gen_bool(0.8) {
+                            12
+                        } else {
+                            rng.gen_range(1..24)
+                        };
+                        s[..k].iter().fold(0, |a, &x| a | 1 << x)
+                    })
+                    .collect();
+                pre.sort_unstable();
+                pre.dedup();
+                let mut w = vec![];
+                let planes = encode(&pre, &mut w);
+                assert_eq!(planes, pre.len().div_ceil(8));
+                assert_eq!(w.len(), PLANE * planes);
+                let mut back = vec![];
+                decode(&w, |x| back.push(x));
+                assert_eq!(back, pre);
+                w.extend([0; PAD_WORDS]);
+                for k in 0..50 {
+                    let mut p: Vec<u8> = (0..24).collect();
+                    p.shuffle(&mut rng);
+                    let mut pos = V32::from_slice(&p);
+                    if k % 2 == 0 {
+                        // Wings pairable after one of the preimages (often).
+                        let x = pre[rng.gen_range(0..pre.len())];
+                        let (a, b): (Vec<u8>, Vec<u8>) = (0..24u8).partition(|&s| x >> s & 1 == 1);
+                        if a.len() == 12 {
+                            for e in 0..12 {
+                                pos.0[2 * e] = a[e];
+                                pos.0[2 * e + 1] = b[e];
+                            }
+                            if e_parity(&pos, x) {
+                                pos.0.swap(0, 1);
+                            }
+                        }
+                    }
+                    let want = pre.iter().any(|&x| one(x, &pos));
+                    passed += want as usize;
+                    assert_eq!(unsafe { any_pairable(w.as_ptr(), planes, &pos) }, want);
+                }
+            }
+        }
+        assert!(passed > 1000, "{passed}");
+
+        fn e_parity(pos: &V32, x: u32) -> bool {
+            (0..12).filter(|&e| x >> pos.0[2 * e] & 1 == 1).count() % 2 == 1
         }
     }
 
