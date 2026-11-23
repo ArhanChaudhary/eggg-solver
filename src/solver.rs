@@ -1483,7 +1483,8 @@ impl P1Extra {
 
 /// The wing-path lookahead for the batched nodes, with largest distance `k` for tight nodes
 /// (0: none; the tiers' defaults are [`WINGK`] and 6 for the large tier) and, for nodes with
-/// one move of slack, `EGGG_P1_WINGS` (default [`WINGS`], at most `k`); see
+/// one move of slack, `EGGG_P1_WINGS` (default [`WINGS`], or [`WINGS_DEEP`] from `k` = 7
+/// on; at most `k`); see
 /// [`crate::wingpath`]. Built (in ~1 s up to distance 7), or from distance [`WING_FILE_K`] on
 /// loaded from `dir` (e.g. `p1-wing-k8s5.tab`; built and saved if missing or invalid: 14.6 GB
 /// and about a minute for distance 8).
@@ -1497,7 +1498,7 @@ pub fn wing_paths(
     if k == 0 {
         return None;
     }
-    let sk = env("EGGG_P1_WINGS", WINGS).min(k);
+    let sk = env("EGGG_P1_WINGS", if k >= 7 { WINGS_DEEP } else { WINGS }).min(k);
     let t0 = Instant::now();
     let frames = [0, 1, 2].map(crate::phase1::Frame::new);
     let red = env("EGGG_P1_WINGR", WINGR as u8) != 0;
@@ -1548,6 +1549,10 @@ pub const WING_FILE_K: u8 = 8;
 /// with one move of slack (see [`crate::wingpath`]).
 pub const WINGK: u8 = 7;
 pub const WINGS: u8 = 5;
+/// The default largest distance of the slack-1 lists with tight lists up to distance 7 or
+/// more (the huge and larger tiers): 0.56 GB more than [`WINGS`], phase 1 7% faster
+/// (p1check on the M2).
+pub const WINGS_DEEP: u8 = 6;
 /// The default largest distance of the slack-2 lists (`EGGG_P1_WINGS2`; negative: none; see
 /// [`crate::wingpath::WingPaths::add_slack2`]): 25 MB up to distance 4 (p1check 7% faster
 /// than none on the M2); distance 5 adds 0.4 GB for 1% more.
