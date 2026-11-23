@@ -238,13 +238,32 @@ impl Moves {
     }
 }
 
-/// Words per plane: the preimages (24-bit slot sets) of a list are stored bit-sliced, eight
-/// per plane of 24 bytes, byte x of a plane holding bit j if the plane's preimage j (in the
-/// list's sorted order) contains slot x.
+/// Words per plane: the preimages (24-bit slot sets) of a list of at most [`NARROW`] are
+/// stored bit-sliced, eight per plane of 24 bytes, byte x of a plane holding bit j if the
+/// plane's preimage j (in the list's sorted order) contains slot x.
 pub const PLANE: usize = 6;
+
+/// The longest lists stored in planes (three); longer ones are stored in wide slices (see
+/// [`WIDE`]), cheaper to test from about 24 preimages on (a plane costs about a third of a
+/// wide slice, which holds eight times as many).
+const NARROW: usize = 24;
+
+/// Words per wide slice: 64 preimages of a list longer than [`NARROW`], bit-sliced, word
+/// pair x (a u64) holding bit j if the slice's preimage j contains slot x.
+const WIDE: usize = 48;
 
 /// Words after the last plane of a table, so that a 32-byte read of any plane stays in it.
 const PAD_WORDS: usize = 2;
+
+/// The words of a list of `n` preimages.
+#[inline(always)]
+fn words(n: usize) -> usize {
+    if n <= NARROW {
+        PLANE * n.div_ceil(8)
+    } else {
+        WIDE * n.div_ceil(64)
+    }
+}
 
 /// The transpose of an 8 x 8 bit matrix (byte r holding row r, bit c of it column c).
 #[inline(always)]
@@ -257,9 +276,28 @@ fn transpose8(mut x: u64) -> u64 {
     x ^ t ^ (t << 28)
 }
 
-/// Append the planes of the preimages `pre` (24-bit slot sets, not empty) to `out`; their
-/// number.
+/// Append the planes or wide slices of the preimages `pre` (24-bit slot sets, not empty) to
+/// `out` ([`words`] of them); their number.
 fn encode(pre: &[u32], out: &mut Vec<u32>) -> usize {
+    if pre.len() > NARROW {
+        for c in pre.chunks(64) {
+            let mut b = [0u64; 24];
+            for (j, &p) in c.iter().enumerate() {
+                debug_assert!(p != 0 && p >> 24 == 0);
+                let mut x = p;
+                while x != 0 {
+                    b[x.trailing_zeros() as usize] |= 1 << j;
+                    x &= x - 1;
+                }
+            }
+            for x in b {
+                let y = x.to_ne_bytes();
+                out.push(u32::from_ne_bytes(y[..4].try_into().unwrap()));
+                out.push(u32::from_ne_bytes(y[4..].try_into().unwrap()));
+            }
+        }
+        return pre.len();
+    }
     for c in pre.chunks(8) {
         let mut b = [0u8; 4 * PLANE];
         for i in 0..3 {
@@ -272,12 +310,36 @@ fn encode(pre: &[u32], out: &mut Vec<u32>) -> usize {
         }
         out.extend(b.as_chunks::<4>().0.iter().map(|&w| u32::from_ne_bytes(w)));
     }
-    pre.len().div_ceil(8)
+    pre.len()
 }
 
-/// Each preimage of the planes `w` (in order), to `f`.
+/// Each preimage of the list `w` (planes, or wide slices if longer than three planes; in
+/// order), to `f`.
 #[inline(always)]
 fn decode(w: &[u32], mut f: impl FnMut(u32)) {
+    if w.len() > words(NARROW) {
+        for sl in w.as_chunks::<WIDE>().0 {
+            let mut p = [0u32; 64];
+            for x in 0..24 {
+                let mut b = u64::from_ne_bytes(
+                    [sl[2 * x].to_ne_bytes(), sl[2 * x + 1].to_ne_bytes()]
+                        .concat()
+                        .try_into()
+                        .unwrap(),
+                );
+                while b != 0 {
+                    p[b.trailing_zeros() as usize] |= 1 << x;
+                    b &= b - 1;
+                }
+            }
+            for x in p {
+                if x != 0 {
+                    f(x);
+                }
+            }
+        }
+        return;
+    }
     for pl in w.as_chunks::<PLANE>().0 {
         let mut b = [0u8; 4 * PLANE];
         for (i, &x) in pl.iter().enumerate() {
@@ -297,30 +359,29 @@ fn decode(w: &[u32], mut f: impl FnMut(u32)) {
     }
 }
 
-/// A state's tight lists (even, odd; planes) at `s` in `pairs`.
+/// A state's tight lists (even, odd) at `s` in `pairs`.
 #[inline(always)]
 fn lists<'a>(pairs: &'a [u32], s: &Slot) -> [&'a [u32]; 2] {
     let (o, e, d) = (
         s.off as usize,
-        PLANE * s.n[0] as usize,
-        PLANE * s.n[1] as usize,
+        words(s.n[0] as usize),
+        words(s.n[1] as usize),
     );
     [&pairs[o..o + e], &pairs[o + e..o + e + d]]
 }
 
-/// A state's slack-1 lists (even, odd; planes) at `s` in `pairs` (distance <= `smax`):
-/// after its tight lists, a header (their numbers of planes, even | odd << 16), then the
-/// lists.
+/// A state's slack-1 lists (even, odd) at `s` in `pairs` (distance <= `smax`): after its
+/// tight lists, a header (their lengths, even | odd << 16), then the lists.
 #[inline(always)]
 fn slack_lists<'a>(pairs: &'a [u32], s: &Slot) -> [&'a [u32]; 2] {
-    let o = s.off as usize + PLANE * (s.n[0] as usize + s.n[1] as usize);
+    let o = s.off as usize + words(s.n[0] as usize) + words(s.n[1] as usize);
     let h = pairs[o] as usize;
-    let (e, d) = (PLANE * (h & 0xffff), PLANE * (h >> 16));
+    let (e, d) = (words(h & 0xffff), words(h >> 16));
     [&pairs[o + 1..o + 1 + e], &pairs[o + 1 + e..o + 1 + e + d]]
 }
 
-/// The lists of a chunk of states: per state its slot, offset in `pairs` and numbers of
-/// planes (even, odd); per state the planes of its sorted deduplicated even then odd list.
+/// The lists of a chunk of states: per state its slot, offset in `pairs` and lengths (even,
+/// odd); per state its sorted deduplicated even then odd list (see [`encode`]).
 struct Part {
     start: usize,
     states: Vec<(u32, u32, [u16; 2])>,
@@ -392,7 +453,7 @@ pub struct WingPaths {
     /// The largest distance with slack-1 lists.
     pub smax: u8,
     hash: Hash,
-    /// The lists' planes (see [`PLANE`]), and headers.
+    /// The lists (planes or wide slices, see [`PLANE`] and [`WIDE`]), and headers.
     pairs: HugeBuf<u32>,
     /// The pairs of the states at distance `kmax` + 1, reduced by symmetry, if built.
     pub red: Option<Reduced>,
@@ -510,7 +571,7 @@ fn apply_bytes(t: &[[u32; 256]; 3], x: u32) -> u32 {
 
 /// The name of the saved tables and the version of their layout.
 const NAME: &str = "p1-wingb";
-const FORMAT: u64 = 3;
+const FORMAT: u64 = 4;
 
 impl WingPaths {
     /// The key of a centre state with U/D and R/L colour masks `ud` and `rl` (either two of
@@ -763,7 +824,7 @@ impl WingPaths {
                     Some(s) if s.dist() + 1 == k => mv.extend(out, slack_lists(pairs, s), m),
                     Some(s) if s.dist() == k => {
                         let (o, [e, d]) = at[s.off as usize];
-                        let (o, e, d) = (o as usize, PLANE * e as usize, PLANE * d as usize);
+                        let (o, e, d) = (o as usize, words(e as usize), words(d as usize));
                         let t = tight.as_slice();
                         mv.extend(out, [&t[o..o + e], &t[o + e..o + e + d]], m);
                     }
@@ -775,13 +836,13 @@ impl WingPaths {
         // The records: tight even, tight odd, a header (the slack-1 lists' planes), slack-1
         // even, slack-1 odd.
         let (t, sl) = (tight.as_slice(), slack.as_slice());
-        let words: usize = t.len() + sl.len() + layer.len();
+        let total: usize = t.len() + sl.len() + layer.len();
         let base = self.pairs.len();
         assert!(
-            base + words <= u32::MAX as usize,
+            base + total <= u32::MAX as usize,
             "wing-path table: too many pairs"
         );
-        self.pairs.grow(base + words);
+        self.pairs.grow(base + total);
         let pairs = &mut self.pairs.as_mut_slice()[base..];
         let mut o = 0;
         for (i, &h) in layer.iter().enumerate() {
@@ -789,16 +850,16 @@ impl WingPaths {
             let s = &mut self.hash.slots.as_mut_slice()[h as usize];
             s.off = (base + o) as u32;
             s.n = [te, tn];
-            let tl = PLANE * (te + tn) as usize;
+            let tl = words(te as usize) + words(tn as usize);
             pairs[o..o + tl].copy_from_slice(&t[to as usize..to as usize + tl]);
             o += tl;
             pairs[o] = se as u32 | (sn as u32) << 16;
             o += 1;
-            let sl_len = PLANE * (se + sn) as usize;
+            let sl_len = words(se as usize) + words(sn as usize);
             pairs[o..o + sl_len].copy_from_slice(&sl[so as usize..so as usize + sl_len]);
             o += sl_len;
         }
-        debug_assert_eq!(o, words);
+        debug_assert_eq!(o, total);
     }
 
     /// The reduced lists of the states at distance `kmax` + 1 (the children of the table's
@@ -1161,7 +1222,7 @@ impl WingPaths {
     #[inline(always)]
     fn tight_list(s: &Slot, odd: bool) -> (usize, usize) {
         if odd {
-            (s.off as usize + PLANE * s.n[0] as usize, s.n[1] as usize)
+            (s.off as usize + words(s.n[0] as usize), s.n[1] as usize)
         } else {
             (s.off as usize, s.n[0] as usize)
         }
@@ -1171,7 +1232,7 @@ impl WingPaths {
     /// lists).
     #[inline(always)]
     fn slack_header(s: &Slot) -> usize {
-        s.off as usize + PLANE * (s.n[0] as usize + s.n[1] as usize)
+        s.off as usize + words(s.n[0] as usize) + words(s.n[1] as usize)
     }
 
     /// The slack-1 list for wing parity `odd` after the header at `o`: its offset and planes.
@@ -1180,7 +1241,7 @@ impl WingPaths {
         // SAFETY: a header is in the table.
         let h = unsafe { *self.pairs.as_ptr().add(o) } as usize;
         if odd {
-            (o + 1 + PLANE * (h & 0xffff), h >> 16)
+            (o + 1 + words(h & 0xffff), h >> 16)
         } else {
             (o + 1, h & 0xffff)
         }
@@ -1235,7 +1296,7 @@ impl WingPaths {
                 // SAFETY: the list is in the table.
                 unsafe {
                     crate::table::prefetch(pairs.as_ptr().add(off));
-                    crate::table::prefetch(pairs.as_ptr().add(off + PLANE * n - 1));
+                    crate::table::prefetch(pairs.as_ptr().add(off + words(n) - 1));
                 }
             }
             return off as u64 | (n as u64) << 32 | SLACK2;
@@ -1252,7 +1313,7 @@ impl WingPaths {
                 // SAFETY: the list is in the table.
                 unsafe {
                     crate::table::prefetch(p.add(off));
-                    crate::table::prefetch(p.add(off + PLANE * n - 1));
+                    crate::table::prefetch(p.add(off + words(n) - 1));
                 }
             }
             off as u64 | (n as u64) << 32
@@ -1282,7 +1343,7 @@ impl WingPaths {
         if loc & SLACK2 != 0 {
             let pairs = &self.s2.as_ref().unwrap().1;
             let (off, n) = (loc as u32 as usize, (loc >> 32) as u16 as usize);
-            debug_assert!(off + PLANE * n + PAD_WORDS <= pairs.len());
+            debug_assert!(off + words(n) + PAD_WORDS <= pairs.len());
             // SAFETY: as in `WingPaths::any_pairable`.
             return unsafe { any_pairable(pairs.as_ptr().add(off), n, pos) };
         }
@@ -1315,7 +1376,7 @@ impl WingPaths {
             return true;
         }
         let (off, n) = Self::tight_list(s, odd);
-        debug_assert!(off + PLANE * n + PAD_WORDS <= pairs.len());
+        debug_assert!(off + words(n) + PAD_WORDS <= pairs.len());
         // SAFETY: as in `WingPaths::any_pairable`.
         unsafe { any_pairable(pairs.as_ptr().add(off), n, pos) }
     }
@@ -1332,7 +1393,7 @@ impl WingPaths {
     /// from `off`?
     #[inline(always)]
     fn any_pairable(&self, off: usize, n: usize, pos: &V32) -> bool {
-        debug_assert!(off + PLANE * n + PAD_WORDS <= self.pairs.len());
+        debug_assert!(off + words(n) + PAD_WORDS <= self.pairs.len());
         // SAFETY: the planes are in the table, which is padded after the last one.
         unsafe { any_pairable(self.pairs.as_ptr().add(off), n, pos) }
     }
@@ -1351,23 +1412,27 @@ impl WingPaths {
         // The wings of the class member: piece q(w) at slot q(pos(w)).
         let sym = unsafe { r.syms.get_unchecked(si) };
         let p = crate::simd::gather(&sym.q, &crate::simd::gather(pos, &sym.qinv));
-        debug_assert!(off + PLANE * n + PAD_WORDS <= r.pairs.len());
+        debug_assert!(off + words(n) + PAD_WORDS <= r.pairs.len());
         // SAFETY: as in `WingPaths::any_pairable`.
         unsafe { any_pairable(r.pairs.as_ptr().add(off), n, &p) }
     }
 }
 
-/// Does one of the preimages of the `n` planes at `p` (see [`PLANE`]; a 32-byte read from
-/// each must be valid) split every dedge of the wings `pos` (one of its two wings' slots in
-/// it), with an even number of the dedges' first wings (2e) in it? That is: are the wings
-/// pairable after the preimage's path (one wing of each dedge in the frame's low slots, an
-/// even number of the frame's high pieces among them: as many as the first wings, mod 2,
-/// see [`WingPaths::check_frames`]). Per plane, its bytes gathered by the wings' slots give
-/// per wing the preimages containing its slot (bits); a dedge is split by those where its
-/// wings' bytes differ.
+/// Does one of the `n` preimages of the list at `p` (planes, or wide slices if longer than
+/// [`NARROW`]; a 32-byte read from each plane must be valid) split every dedge of the wings
+/// `pos` (one of its two wings' slots in it), with an even number of the dedges' first wings
+/// (2e) in it? That is: are the wings pairable after the preimage's path (one wing of each
+/// dedge in the frame's low slots, an even number of the frame's high pieces among them: as
+/// many as the first wings, mod 2, see [`WingPaths::check_frames`]). A plane's bytes (a wide
+/// slice's words) gathered by the wings' slots give per wing the preimages containing its
+/// slot (bits); a dedge is split by those where its wings' bits differ.
 #[inline(always)]
 unsafe fn any_pairable(p: *const u32, n: usize, pos: &V32) -> bool {
-    for k in 0..n {
+    if n > NARROW {
+        // SAFETY: the caller's.
+        return unsafe { any_pairable_wide(p, n.div_ceil(64), pos) };
+    }
+    for k in 0..n.div_ceil(8) {
         // SAFETY: the caller's.
         let v = unsafe { std::ptr::read_unaligned(p.add(k * PLANE) as *const V32) };
         let g = crate::simd::gather(&v, pos).0;
@@ -1382,6 +1447,28 @@ unsafe fn any_pairable(p: *const u32, n: usize, pos: &V32) -> bool {
         e ^= e >> 32;
         e ^= e >> 16;
         if a & !e & 0xff != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`any_pairable`] for the `n` wide slices at `p`.
+#[inline(never)]
+unsafe fn any_pairable_wide(p: *const u32, n: usize, pos: &V32) -> bool {
+    // Per wing, the offset of its slot's word in a slice.
+    let o: [usize; 24] = std::array::from_fn(|i| 2 * pos.0[i] as usize);
+    for k in 0..n {
+        // SAFETY: the caller's (24 u64 per slice).
+        let q = unsafe { p.add(k * WIDE) };
+        let w = |i: usize| unsafe { std::ptr::read_unaligned(q.add(o[i]) as *const u64) };
+        let (mut a, mut e) = (!0u64, 0u64);
+        for d in 0..12 {
+            let (x, y) = (w(2 * d), w(2 * d + 1));
+            a &= x ^ y;
+            e ^= x;
+        }
+        if a & !e != 0 {
             return true;
         }
     }
@@ -1626,16 +1713,19 @@ mod tests {
     #[test]
     fn planes_round_trip() {
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(13);
-        for n in 0..40 {
+        for n in (0..40).chain([63, 64, 65, 130, 300]) {
             let mut pre: Vec<u32> = (0..n).map(|_| rng.r#gen::<u32>() & MASK24 | 1).collect();
             pre.sort_unstable();
             pre.dedup();
             let mut w = vec![];
-            assert_eq!(encode(&pre, &mut w), pre.len().div_ceil(8));
-            assert_eq!(w.len(), PLANE * pre.len().div_ceil(8));
+            assert_eq!(encode(&pre, &mut w), pre.len());
+            assert_eq!(w.len(), words(pre.len()));
             let mut back = vec![];
             decode(&w, |x| back.push(x));
             assert_eq!(back, pre);
+            if pre.len() > NARROW {
+                continue;
+            }
             for (k, c) in pre.chunks(8).enumerate() {
                 let bytes: Vec<u8> = w[PLANE * k..PLANE * (k + 1)]
                     .iter()
