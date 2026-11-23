@@ -1373,17 +1373,24 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                 // Those with slack 1, and with slack 2.
                 let mut slack = 0;
                 let mut slack2 = 0;
+                // Whether the tight children are one move beyond the table, and those of them
+                // tested by the reduced lists (their class and symmetry found here, once).
+                let beyond = w.red.is_some() && left - 1 == w.kmax + 1;
+                let mut red = 0;
                 if left < 3 {
                 } else if d == left {
-                    let red = w.red.is_some() && left - 1 == w.kmax + 1;
-                    if (left - 1 <= w.kmax || red) && mt.viable(nd.idx, nd.parity) {
+                    if (left - 1 <= w.kmax || beyond) && mt.viable(nd.idx, nd.parity) {
                         let dec = mt.get(t, nd.idx, nd.sym, &nd.state(), self.pair);
                         let a = dec & ALLOWED_AFTER[nd.last as usize];
                         e = self.live_children(nd, a, d, left, dec, 0);
                         tested = e;
                         dec_all = dec;
+                        if beyond {
+                            red = e;
+                        }
                     }
                 } else if left - 1 <= w.kmax
+                    || beyond
                     || left - 2 <= w.smax
                     || w.s2max.is_some_and(|x| left - 3 <= x)
                 {
@@ -1410,11 +1417,17 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                             _ => 0,
                         };
                     }
-                    tested = e & if left - 1 <= w.kmax { tight } else { 0 } | slack | slack2;
+                    let tight = e & tight;
+                    if beyond {
+                        red = tight;
+                    }
+                    tested = if left - 1 <= w.kmax || beyond {
+                        tight
+                    } else {
+                        0
+                    } | slack
+                        | slack2;
                 }
-                // The tests by the reduced lists (tight children one move beyond the table):
-                // their class (and symmetry) is found here, once.
-                let red = d == left && left - 1 == w.kmax + 1;
                 let base = located.len() as u32;
                 if tested != 0 {
                     let flags = nd.state().centre_flags();
@@ -1424,7 +1437,7 @@ impl<'a, F: FnMut(&[u8], u8) -> bool> Search1<'a, F> {
                         b &= b - 1;
                         let (ud, _, rl) = flag_masks(&unsafe { child_flags(&flags, m, t) });
                         let odd = nd.parity as u64 ^ (WIDE_QUARTER >> m & 1) as u64;
-                        if red {
+                        if red >> m & 1 == 1 {
                             located.push(w.prefetch_red(ud, rl) | (odd * ODD));
                         } else {
                             let bits = (odd * ODD) | ((slack >> m & 1) as u64 * SLACK);
