@@ -51,6 +51,57 @@ const MIN_ROUND: Duration = Duration::from_millis(20);
 /// ~5 ms to 1.5 s on the M2, the others less than a millisecond (see `Run::phase2_level`).
 const P2_SPLIT_SLACK: u8 = 3;
 
+/// Experimental schedule knobs (environment, read once per solve; see `Knobs::from_env`).
+#[derive(Clone, Debug)]
+struct Knobs {
+    /// (seconds, margin): the phase-2 margin from that time on (`EGGG_MARGINS=0:15,3:14`).
+    margins: Vec<(f64, usize)>,
+    /// From this time on (seconds), phase 2 has no reduction budget (`EGGG_P2_FREE`).
+    p2_free: f64,
+    /// Once a solution exists, a round's phase 2 stops after this multiple of its phase-1
+    /// time (`EGGG_P2_TIME`).
+    p2_time: f64,
+}
+
+impl Knobs {
+    fn from_env() -> Self {
+        let num = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(f64::INFINITY)
+        };
+        let margins = std::env::var("EGGG_MARGINS")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|x| {
+                        let (t, m) = x.split_once(':')?;
+                        Some((t.parse().ok()?, m.parse().ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![(0.0, 15), (3.0, 14), (6.0, DEEPEST_MARGIN)]);
+        Knobs {
+            margins,
+            p2_free: num("EGGG_P2_FREE"),
+            p2_time: num("EGGG_P2_TIME"),
+        }
+    }
+
+    fn margin(&self, elapsed: f64) -> usize {
+        self.margins
+            .iter()
+            .filter(|m| m.0 <= elapsed)
+            .last()
+            .map_or(15, |m| m.1)
+    }
+
+    fn deepest(&self) -> usize {
+        self.margins.iter().map(|m| m.1).min().unwrap_or(15)
+    }
+}
+
 pub struct Tables {
     pub p1: P1Tables,
     pub p2: P2Tables,
@@ -510,6 +561,7 @@ struct Run<'a, 'r> {
     prev_yields: HashMap<[u8; 3], (u64, u64)>,
     /// Debug output (`EGGG_DEBUG`).
     trace: bool,
+    knobs: Knobs,
     /// Debug: the current phase-1 level's nodes, endpoints and kept candidates so far, when
     /// it started, and the previous level's nodes.
     lvl_nodes: u64,
@@ -592,6 +644,7 @@ impl<'a> Solver<'a> {
             yields: HashMap::new(),
             prev_yields: HashMap::new(),
             trace: std::env::var_os("EGGG_DEBUG").is_some(),
+            knobs: Knobs::from_env(),
             lvl_nodes: 0,
             lvl_eps: 0,
             lvl_kept: 0,
@@ -727,6 +780,11 @@ impl<'a, 'r> Run<'a, 'r> {
             } else {
                 want2
             };
+            if self.best.is_some() && self.knobs.p2_time.is_finite() {
+                let p1 = t0.elapsed().mul_f64(self.knobs.p2_time);
+                let at = Instant::now() + p1;
+                self.p2_cut = Some(self.p2_cut.map_or(at, |c| c.min(at)));
+            }
             let tp = Instant::now();
             self.phase2(want2_now);
             self.stats.time[1] += tp.elapsed();
@@ -1071,7 +1129,7 @@ impl<'a, 'r> Run<'a, 'r> {
     /// The longest reduction that could still lead to a shorter solution at the deepest
     /// phase-2 level (`DEEPEST_MARGIN`); unlimited before the first solution.
     fn useful_l12(&self) -> usize {
-        self.best_len().saturating_sub(DEEPEST_MARGIN)
+        self.best_len().saturating_sub(self.knobs.deepest())
     }
 
     /// Drop the candidates and reductions that can no longer lead to a shorter solution
@@ -1115,12 +1173,11 @@ impl<'a, 'r> Run<'a, 'r> {
         // margin goes from 15 to 13 as the run gets longer (phases 2 and 3 are then cheap
         // next to phase 1). Measured on 20 positions x 30 s: 39.3 -> 39.0 moves.
         let elapsed = self.start.elapsed().as_secs_f64();
-        let margin = if elapsed < 3.0 {
-            15
-        } else if elapsed < 6.0 {
-            14
+        let margin = self.knobs.margin(elapsed);
+        let want = if elapsed >= self.knobs.p2_free {
+            usize::MAX
         } else {
-            DEEPEST_MARGIN
+            want
         };
         let cap = self.best_len().saturating_sub(margin).min(64);
         let mut t12 = self
