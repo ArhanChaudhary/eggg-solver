@@ -650,6 +650,104 @@ impl<'a> Search2<'a> {
     }
 }
 
+impl<'a> Search2<'a> {
+    /// [`Search2::dfs_joint`] with a side state carried along (e.g. the corners, which the
+    /// phase-2 moves turn like 3x3x3 moves) and an extra test: a child is entered only if
+    /// `keep(side, left)` holds for its side state with `left` phase-2 moves still to go.
+    /// The same solutions as `dfs_joint` minus those the test cuts, in the same order; `nodes`
+    /// counts the children within the centre bound, as there. (Experiments: no prefetching.)
+    #[allow(clippy::too_many_arguments)]
+    pub fn dfs_joint_side<P: Copy>(
+        &mut self,
+        cc: u32,
+        tau: &[u8; 16],
+        dj: u8,
+        df: u8,
+        left: u8,
+        last: usize,
+        after: u32,
+        side: P,
+        mv: &impl Fn(&P, usize) -> P,
+        keep: &impl Fn(&P, u8) -> bool,
+        found: &mut dyn FnMut(&[u8], &P) -> bool,
+    ) -> bool {
+        let tt = self.t.joint.as_ref().unwrap().dual(tau);
+        self.side_rec(cc, &tt, dj, df, left, last, after, side, mv, keep, found)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn side_rec<P: Copy>(
+        &mut self,
+        cc: u32,
+        tt: &V32,
+        dj: u8,
+        df: u8,
+        left: u8,
+        last: usize,
+        after: u32,
+        side: P,
+        mv: &impl Fn(&P, usize) -> P,
+        keep: &impl Fn(&P, u8) -> bool,
+        found: &mut dyn FnMut(&[u8], &P) -> bool,
+    ) -> bool {
+        if left == 0 {
+            if cc_is_goal(self.t, cc) && dj == 0 {
+                return found(&self.path, &side);
+            }
+            return true;
+        }
+        let t = self.t;
+        let j = t.joint.as_ref().unwrap();
+        let fb = &j.fb;
+        let allowed = after & PHASE2_MASK & if left == 1 { last_mask(last) } else { u32::MAX };
+        for (i, &m) in P2_MOVES.iter().enumerate() {
+            if allowed >> m & 1 == 0 {
+                continue;
+            }
+            let c2 = t.centre_move[cc as usize][i];
+            if t.centre_dist[c2 as usize] >= left {
+                continue;
+            }
+            self.nodes += 1;
+            let t2 = j.dual_move(tt, i);
+            let ru = j.raw_lane::<0>(c2 / 1680, &t2);
+            let rf = j.raw_lane::<1>(fb.ud(c2), &t2);
+            let idx = j.index_dual(ru, rf, &t2, c2 & 1);
+            let d2 = Mod3Table::decode(dj, j.get(idx.0));
+            if d2 >= left {
+                continue;
+            }
+            let e2 = Mod3Table::decode(df, j.get(idx.1));
+            if e2 >= left {
+                continue;
+            }
+            let s2 = mv(&side, i);
+            if !keep(&s2, left - 1) {
+                continue;
+            }
+            self.path.push(m);
+            let go = self.side_rec(
+                c2,
+                &t2,
+                d2,
+                e2,
+                left - 1,
+                m as usize,
+                after_child(after, m as usize),
+                s2,
+                mv,
+                keep,
+                found,
+            );
+            self.path.pop();
+            if !go {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// A subtree of a phase-2 search, from [`Search2::tasks`].
 #[derive(Clone, Debug)]
 pub struct Task2 {

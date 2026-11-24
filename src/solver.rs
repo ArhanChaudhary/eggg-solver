@@ -2830,6 +2830,77 @@ mod tests {
         assert!(total > 1000, "too few solutions to test ({total})");
     }
 
+    /// [`Search2::dfs_joint_side`] (the finishing study's search with a side state) finds the
+    /// solutions of `dfs_joint` that pass its test, in the same order, with the side state of
+    /// each solution's end; every solution is a reduction.
+    #[test]
+    fn phase2_side_search_matches_joint_search() {
+        use crate::phase2::P2_MOVES;
+        let dir = std::path::Path::new("tables");
+        let t = load_tables_with(dir, 3, true, false, P1Extra::NONE, 8, false);
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(21);
+        let mut total = 0;
+        for _ in 0..8 {
+            let mut cube = Cube::SOLVED;
+            for _ in 0..14 {
+                let m = P2_MOVES[rand::Rng::gen_range(&mut rng, 0..P2_MOVES.len())];
+                cube = cube.apply_perm(&MOVE_PERMS[m as usize]);
+            }
+            let c = candidate(&t, &cube, &[], 0, usize::MAX).unwrap();
+            let (_, last1, first) = phase2_root(&c);
+            let x0 = c.cube(&cube);
+            for left in c.h2..c.h2 + 3 {
+                let mut want = vec![];
+                let mut srch = Search2::new(&t.p2);
+                srch.dfs_joint(c.centre, &c.tau, c.dt, c.df, left, last1, first, &mut |p| {
+                    want.push(p.to_vec());
+                    true
+                });
+                let mv = |x: &Cube, i: usize| x.apply_perm(&MOVE_PERMS[P2_MOVES[i] as usize]);
+                // A test on the side state: everything, or the corner in slot 0 untwisted at
+                // the end.
+                for strict in [false, true] {
+                    let keep = |x: &Cube, l: u8| !strict || l > 0 || x.co[0] == 0;
+                    let mut got = vec![];
+                    srch.dfs_joint_side(
+                        c.centre,
+                        &c.tau,
+                        c.dt,
+                        c.df,
+                        left,
+                        last1,
+                        first,
+                        x0,
+                        &mv,
+                        &keep,
+                        &mut |p, x| {
+                            let y = p
+                                .iter()
+                                .fold(x0, |y, &m| y.apply_perm(&MOVE_PERMS[m as usize]));
+                            assert_eq!(&y, x);
+                            assert!(Cube3::from_reduced(&y).is_some(), "not reduced");
+                            got.push(p.to_vec());
+                            true
+                        },
+                    );
+                    let expect: Vec<Vec<u8>> = want
+                        .iter()
+                        .filter(|p| {
+                            let y = p
+                                .iter()
+                                .fold(x0, |y, &m| y.apply_perm(&MOVE_PERMS[m as usize]));
+                            !strict || y.co[0] == 0
+                        })
+                        .cloned()
+                        .collect();
+                    assert_eq!(got, expect, "left {left}, strict {strict}");
+                }
+                total += want.len();
+            }
+        }
+        assert!(total > 100, "too few solutions to test ({total})");
+    }
+
     /// [`order_by_yield`] permutes the jobs, best smoothed yield first, unknown prefixes at
     /// the mean, ties in their order.
     #[test]
