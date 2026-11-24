@@ -1,7 +1,9 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use eggg_solver::cube::{Cube, Facelets};
 use eggg_solver::notation::{Style, format_moves, parse_moves};
-use eggg_solver::solver::{Options, P1Extra, Solution, Solver, Tables, load_tables_with, verify};
+use eggg_solver::solver::{
+    JointTable, Options, P1Extra, Solution, Solver, Tables, load_tables_with, verify,
+};
 use rand::SeedableRng;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -91,14 +93,15 @@ enum Tier {
     /// ~5.13 GB: h48 h6, the joint phase-2 table, the phase-1 move masks and wing paths up to
     /// distance 6, with the reduced lists of distance 7 (0.42 GB).
     Large,
-    /// ~8.45 GB: h48 h7, the joint phase-2 table, the phase-1 move masks and wing paths up to
-    /// distance 7 (1.8 GB).
+    /// ~9.5 GB: h48 h7, the exact joint phase-2 table, the phase-1 move masks and wing paths
+    /// up to distance 7 (1.8 GB).
     Huge,
-    /// ~19.85 GB: h48 h9, the joint phase-2 table, the phase-1 move masks and wing paths up to
-    /// distance 7 (phase 3 3.6x faster than huge; single-threaded first solutions ~4x sooner).
+    /// ~20.9 GB: h48 h9, the exact joint phase-2 table, the phase-1 move masks and wing paths
+    /// up to distance 7 (phase 3 3.6x faster than huge; single-threaded first solutions ~4x
+    /// sooner).
     Xl,
-    /// ~65.45 GB: h48 h11 (the largest), the joint phase-2 table, the phase-1 move masks and
-    /// wing paths up to distance 7 (phase 3 11x faster than huge; single-threaded first
+    /// ~66.5 GB: h48 h11 (the largest), the exact joint phase-2 table, the phase-1 move masks
+    /// and wing paths up to distance 7 (phase 3 11x faster than huge; single-threaded first
     /// solutions ~12x sooner).
     Xxl,
 }
@@ -106,15 +109,16 @@ enum Tier {
 impl Tier {
     /// (h48 K, joint phase-2 table, phase-1 move masks, wing-path distance, peak memory in
     /// bytes: measured, plus the wing-path table).
-    fn tables(self) -> (u32, bool, bool, u8, f64) {
+    fn tables(self) -> (u32, JointTable, bool, u8, f64) {
+        use JointTable::{Exact, Mod3, None};
         match self {
-            Tier::Tiny => (0, false, false, 0, 0.16e9),
-            Tier::Small => (3, false, false, 0, 0.35e9),
-            Tier::Medium => (5, true, false, 0, 2.3e9),
-            Tier::Large => (6, true, true, 6, 5.13e9),
-            Tier::Huge | Tier::Auto => (7, true, true, 7, 8.45e9),
-            Tier::Xl => (9, true, true, 7, 19.85e9),
-            Tier::Xxl => (11, true, true, 7, 65.45e9),
+            Tier::Tiny => (0, None, false, 0, 0.16e9),
+            Tier::Small => (3, None, false, 0, 0.35e9),
+            Tier::Medium => (5, Mod3, false, 0, 2.3e9),
+            Tier::Large => (6, Mod3, true, 6, 5.13e9),
+            Tier::Huge | Tier::Auto => (7, Exact, true, 7, 9.5e9),
+            Tier::Xl => (9, Exact, true, 7, 20.9e9),
+            Tier::Xxl => (11, Exact, true, 7, 66.5e9),
         }
     }
 
@@ -163,6 +167,12 @@ struct TableArgs {
     /// tier: far fewer phase-2 nodes.
     #[arg(long)]
     p2_joint: bool,
+    /// Hold the joint phase-2 table's distances exactly (2.1 GB instead of 1.05 GB; made once
+    /// from the mod-3 table, saved as p2-joint-exact.tab): phase-1 endpoints become phase-2
+    /// candidates with one table read per bound instead of a walk down the table. Default:
+    /// the tier's (true in huge and larger).
+    #[arg(long, value_name = "BOOL")]
+    p2_exact: Option<bool>,
     /// Use the large phase-1 staging table (1.2 GB, no symmetry reduction; faster lookups)
     /// whatever the tier.
     #[arg(long)]
@@ -197,11 +207,16 @@ enum PatArg {
 impl TableArgs {
     /// (h48 K, joint phase-2 table, phase-1 move masks, large phase-1 staging table,
     /// wing-path distance) from the tier and the overrides.
-    fn config(&self) -> (u32, bool, bool, bool, u8) {
+    fn config(&self) -> (u32, JointTable, bool, bool, u8) {
         let (k, joint, masks, wing, _) = self.tier.resolve(&self.dir()).tables();
+        let joint = match (joint, self.p2_exact) {
+            (_, Some(true)) | (JointTable::Exact, None) => JointTable::Exact,
+            (JointTable::None, _) if !self.p2_joint => JointTable::None,
+            _ => JointTable::Mod3,
+        };
         (
             self.h48.unwrap_or(k),
-            joint || self.p2_joint,
+            joint,
             masks,
             self.p1_big,
             self.p1_wing.unwrap_or(wing),
@@ -213,7 +228,11 @@ impl TableArgs {
         if verbose {
             eprintln!(
                 "tables: h48 h{k}{}{}{}{} ({:?} tier)",
-                if joint { ", joint phase 2" } else { "" },
+                match joint {
+                    JointTable::None => "",
+                    JointTable::Mod3 => ", joint phase 2",
+                    JointTable::Exact => ", exact joint phase 2",
+                },
                 if masks { ", phase-1 move masks" } else { "" },
                 if masks && wing_k > 0 {
                     format!(", wing paths <= {wing_k}")

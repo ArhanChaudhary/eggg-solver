@@ -44,9 +44,9 @@ the default, `auto`, takes the largest tier that fits in a third of the physical
 | `small` | h48 h3 | 0.35 GB |
 | `medium` | h48 h5, joint phase 2 | 2.3 GB |
 | `large` | h48 h6, joint phase 2, phase-1 move masks, wing paths up to 6 (+7 reduced) | 5.13 GB |
-| `huge` | h48 h7, joint phase 2, phase-1 move masks, wing paths up to 7 | 8.45 GB |
-| `xl` | h48 h9, joint phase 2, phase-1 move masks, wing paths up to 7 | 19.85 GB |
-| `xxl` | h48 h11 (the largest), joint phase 2, phase-1 move masks, wing paths up to 7 | 65.45 GB |
+| `huge` | h48 h7, exact joint phase 2, phase-1 move masks, wing paths up to 7 | 9.5 GB |
+| `xl` | h48 h9, exact joint phase 2, phase-1 move masks, wing paths up to 7 | 20.9 GB |
+| `xxl` | h48 h11 (the largest), exact joint phase 2, phase-1 move masks, wing paths up to 7 | 66.5 GB |
 
 Beyond the tables a run needs a few hundred MB, and that does not grow with the run time:
 phase-1 endpoints become phase-2 candidates as they are found (only the few that can still
@@ -64,6 +64,16 @@ The tables: phase-1 centre staging (symmetry-reduced, 25 MB; `--p1-big`: 1.2 GB 
 reduction, faster lookups), phase-2 pairing permutation (60 MB; `--p2-joint`: the joint
 pairing x U/D centres x PLL parity table, 1.05 GB, far fewer phase-2 nodes), phase-3 H48
 (30 MB * 2^K for K edge-orientation bits, `--h48 K`). The three options override the tier.
+The joint table stores distances mod 3 (2 bits), so a state's distance is a walk down the
+table (~10 steps of several reads each); every phase-1 endpoint needs one or two such walks
+to become a phase-2 candidate (about 1% are kept), 12-20% of the phase-1 time in long runs.
+The huge and larger tiers hold its exact distances instead (`p2-joint-exact.tab`, 4 bits,
+2.1 GB, same index; `--p2-exact true|false` overrides the tier): one read per bound. It is
+made once from the mod-3 table, breadth-first (a neighbour of a state at distance d is at d + 1
+exactly when its mod-3 value says so), in 58 s on 48 threads with a peak of 3.3 GB; the
+distances go up to 14 and every entry agrees with the mod-3 table. Bounded distances of random
+states: 1046 ns per walk, 15.5 ns per read (x86, one thread); phase 2 reads the same table
+(its values mod 3).
 The larger phase-3 tables matter most with few threads, where phase 3 is a large share of
 the time (one thread: first solution after 6.2 s with `huge`, 1.4 s with `xl`, 0.5 s with
 `xxl`, on average); with many threads phase 1 dominates.
@@ -219,5 +229,7 @@ after 2 s, 38.8 / 39.1 after 60 s on two sets of 20 positions.)
   plain build; the final lengths of the 50-position suites did not change.
 - `examples/` holds deterministic checks used during optimisation: `p1check` (phase-1
   endpoint hash and node count), `p2jcheck` (joint-table admissibility), `p2cost` (phase-2
-  nodes and CPU time per solution, by depth above the bound), `p3check`,
+  nodes and CPU time per solution, by depth above the bound), `p2exact` (bounded joint
+  distances read from the exact table against walks down the mod-3 one, and their times;
+  makes the exact table if missing), `p3check`,
   `p3nodes` and `p3tasks` (phase-3 bounds, node counts and task splitting).
