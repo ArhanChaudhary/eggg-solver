@@ -197,6 +197,21 @@ after 2 s, 38.8 / 39.1 after 60 s on two sets of 20 positions.)
   runs) on the ARM laptop (each under an exclusive benchmark lock), then `scripts/compare.py A B` for a before/after table and
   `scripts/paired.py A.json B.json` for a per-position paired comparison (runs of one build
   reproduce per-position lengths, so small differences are measurable).
+- Long runs (`scripts/erate.py`): a 20-position run of 10 minutes improves only ~5 times after
+  10 s, so paired final lengths cannot resolve effects under ~2x. Each phase-2 solution of
+  total length L12 found at best length B is a draw that wins if its optimal phase 3 has at
+  most B - 1 - L12 moves, distributed like the distance of a random 3x3 position (P(<= 17) =
+  0.305, P(<= 18) = 0.965; the table in the script, from Rokicki et al. / cube20.org), so the
+  run's expected improvements are E = sum of solutions x P(3x3 distance <= B - 1 - L12). E
+  resolves ~10-20%. `EGGG_DEBUG=1 eggg-solver bench ... 2> X.trace` writes the trace (its
+  `P2LEVEL <L12>: ... seen <N> best <B>` and `IMPROVE` lines are used; `scripts/x86-long.sh`
+  writes `$EGGG_TRACE_DIR/NAME.trace` when that is set); `scripts/erate.py X.trace` prints E and
+  the observed improvements per position and time window, `scripts/erate.py --pair A.trace
+  B.trace` the E each run gathered while both had the same best (same positions, same wall
+  time: a run that improves sooner faces a harder target afterwards), the ratio B/A and a
+  bootstrap interval over positions (`--from S`, default 10 s, `--to S`). E is relative: the
+  improvements observed after 10 s were 0.5-0.7 of it (successes cluster: the solutions of
+  one candidate are correlated, and several in one round make one improvement).
 - Profile-guided builds (LLVM PGO): `scripts/pgo-build.sh x86|m2 LABEL REF` (an instrumented
   build, a one-minute training run on the machine the binary is for, `llvm-profdata` from the
   toolchain's `llvm-tools` component, and the release build with the profile; per commit).
