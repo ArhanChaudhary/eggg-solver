@@ -3277,7 +3277,7 @@ mod coverage {
         load_tables_with(
             &dir,
             0,
-            true,
+            JointTable::Mod3,
             false,
             P1Extra {
                 pat: None,
