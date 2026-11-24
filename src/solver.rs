@@ -123,8 +123,7 @@ impl Knobs {
     fn margin(&self, elapsed: f64) -> usize {
         self.margins
             .iter()
-            .filter(|m| m.0 <= elapsed)
-            .last()
+            .rfind(|m| m.0 <= elapsed)
             .map_or(15, |m| m.1)
     }
 
