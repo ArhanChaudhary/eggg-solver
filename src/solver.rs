@@ -195,10 +195,44 @@ pub struct Stats {
     pub time: [Duration; 3],
 }
 
+/// A phase-1 path, stored inline (the driver searches phase-1 lengths up to 40): long runs keep
+/// millions of candidates, and a heap block per path cost as much as the rest of a candidate
+/// and a malloc per candidate made in the phase-1 workers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Moves1 {
+    len: u8,
+    m: [u8; 40],
+}
+
+impl Moves1 {
+    fn new(p: &[u8]) -> Self {
+        let mut m = [0u8; 40];
+        m[..p.len()].copy_from_slice(p);
+        Moves1 {
+            len: p.len() as u8,
+            m,
+        }
+    }
+}
+
+impl std::ops::Deref for Moves1 {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.m[..self.len as usize]
+    }
+}
+
+impl std::fmt::Debug for Moves1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+/// A phase-1 endpoint in one phase-2 frame (72 bytes: its cube is recomputed when it is
+/// searched, see [`Candidate::cube`]).
 struct Candidate {
-    moves1: Vec<u8>,
-    frame: usize,
-    cube: Cube,
+    moves1: Moves1,
+    frame: u8,
     centre: u32,
     tau: [u8; 16],
     /// Exact tau distance, or with the joint table, the exact joint distance.
@@ -210,6 +244,17 @@ struct Candidate {
     done2: u8,
     /// The round that made it (debug output).
     round: u32,
+}
+
+impl Candidate {
+    /// The standardised phase-2 cube of the candidate (`cube`: the cube being solved).
+    fn cube(&self, cube: &Cube) -> Cube {
+        let c = self
+            .moves1
+            .iter()
+            .fold(*cube, |c, &m| c.apply_perm(&MOVE_PERMS[m as usize]));
+        standardise(&c, self.frame as usize)
+    }
 }
 
 struct Reduction {
@@ -453,10 +498,10 @@ fn make_candidates(
         if moves1.len() + h2 as usize > limit {
             continue;
         }
+        let _ = x;
         out.push(Candidate {
-            moves1: moves1.clone(),
-            frame,
-            cube: x,
+            moves1: Moves1::new(moves1),
+            frame: frame as u8,
             centre,
             tau: w.1,
             dt,
@@ -511,7 +556,7 @@ fn order_by_yield(jobs: &mut Vec<(u8, Vec<u8>)>, yields: &HashMap<[u8; 3], (u64,
 /// The frame rotation of a candidate's phase 2, the last phase-1 move in that frame, and the
 /// moves allowed to open phase 2 (see [`first_moves`]).
 fn phase2_root(c: &Candidate) -> (Mat, usize, u32) {
-    let rot = frame_rotation(c.frame);
+    let rot = frame_rotation(c.frame as usize);
     let last1 = c
         .moves1
         .last()
@@ -908,8 +953,7 @@ impl<'a, 'r> Run<'a, 'r> {
                 (cap + 8).div_ceil(16).max(2) * 16
             }
         };
-        let cand_heap: usize = self.cands.iter().map(|c| block(c.moves1.capacity())).sum();
-        let cand_bytes = self.cands.capacity() * std::mem::size_of::<Candidate>() + cand_heap;
+        let cand_bytes = self.cands.capacity() * std::mem::size_of::<Candidate>();
         let red_heap: usize = self.reds.iter().map(|r| block(r.moves12.capacity())).sum();
         let red_bytes = self.reds.capacity() * std::mem::size_of::<Reduction>() + red_heap;
         let idx_bytes =
@@ -1216,14 +1260,21 @@ impl<'a, 'r> Run<'a, 'r> {
             .max(self.knobs.margin_min.min(m))
     }
 
-    /// Candidates are kept down to best - this.
+    /// Candidates are made (and kept while not searched) down to L1 + h2 = best - this.
     fn keep_margin(&self) -> usize {
         if self.knobs.adapt.is_finite() {
-            let m = self.knobs.deepest().min(self.margin_now());
-            (m - 1).max(self.knobs.margin_min)
+            self.knobs.deepest().min(self.margin_now())
         } else {
             self.knobs.deepest()
         }
+    }
+
+    /// Searched candidates are kept while the level of their next search is at most this
+    /// (with the adaptive margin, one level more than [`Run::useful_l12`] while the margin can
+    /// still deepen: then every candidate searched so far gets the new level's search).
+    fn useful_next(&self) -> usize {
+        let deepen = self.knobs.adapt.is_finite() && self.margin_now() > self.knobs.margin_min;
+        self.useful_l12() + deepen as usize
     }
 
     /// Drop the candidates and reductions that can no longer lead to a shorter solution
@@ -1232,9 +1283,11 @@ impl<'a, 'r> Run<'a, 'r> {
         if self.best.is_none() {
             return;
         }
-        let limit = self.useful_l12();
-        self.cands
-            .retain(|c| c.moves1.len() + c.h2.max(c.done2) as usize <= limit);
+        let (limit, next) = (self.useful_l12(), self.useful_next());
+        self.cands.retain(|c| {
+            let l1 = c.moves1.len();
+            l1 + c.h2 as usize <= limit && l1 + c.h2.max(c.done2) as usize <= next
+        });
         let bound = self.bound();
         self.reds
             .retain(|r| r.moves12.len() + (r.h3.max(r.done3) as usize) < bound);
@@ -1360,6 +1413,7 @@ impl<'a, 'r> Run<'a, 'r> {
             u8::MAX
         };
         let cands = &self.cands;
+        let root_cube = &self.cube;
         let todo: Vec<usize> = (0..cands.len())
             .filter(|&i| {
                 let c = &cands[i];
@@ -1398,9 +1452,10 @@ impl<'a, 'r> Run<'a, 'r> {
             // per search, nearly all hopeless).
             let mut local = vec![];
             let mut seen = 0usize;
+            let x0 = c.cube(root_cube);
             let mut keep = |p: &[u8]| {
                 seen += 1;
-                let mut x = c.cube;
+                let mut x = x0;
                 for &m in p {
                     x = x.apply_perm(&MOVE_PERMS[m as usize]);
                 }
@@ -1409,12 +1464,12 @@ impl<'a, 'r> Run<'a, 'r> {
                     // A reduction whose phase 3 cannot beat the best solution (or, with
                     // ties, equal it) never will (the best only gets shorter).
                     if c.moves1.len() + p.len() + (h3 as usize) < bound {
-                        let mut moves12 = c.moves1.clone();
+                        let mut moves12 = c.moves1.to_vec();
                         moves12.extend(p.iter().map(|&m| rotate_move(m as usize, &rot_inv) as u8));
                         local.push(Reduction {
                             moves12,
                             len1: c.moves1.len(),
-                            frame: c.frame,
+                            frame: c.frame as usize,
                             c3,
                             h3,
                             done3: 0,
@@ -2036,14 +2091,14 @@ mod tests {
     }
 
     /// The former candidate construction: a rotation search per standardisation, the full
-    /// joint-table walk, and the limit applied afterwards.
+    /// joint-table walk, and the limit applied afterwards; with its standardised cube.
     fn candidate_ref(
         t: &Tables,
         cube: &Cube,
         moves1: &[u8],
         frame: usize,
         limit: usize,
-    ) -> Option<Candidate> {
+    ) -> Option<(Candidate, Cube)> {
         let mut c = *cube;
         for &m in moves1 {
             c = c.apply_perm(&MOVE_PERMS[m as usize]);
@@ -2066,9 +2121,8 @@ mod tests {
             None => (t.p2.tau_distance(&tau), 0),
         };
         let c = Candidate {
-            moves1: moves1.to_vec(),
-            frame,
-            cube: x,
+            moves1: Moves1::new(moves1),
+            frame: frame as u8,
             centre,
             tau,
             dt,
@@ -2077,7 +2131,7 @@ mod tests {
             done2: 0,
             round: 0,
         };
-        (c.moves1.len() + c.h2 as usize <= limit).then_some(c)
+        (c.moves1.len() + c.h2 as usize <= limit).then_some((c, x))
     }
 
     /// The joint-table state (U/D pattern, tau, PLL bit) of the cube rotated by x (about the
@@ -2143,11 +2197,21 @@ mod tests {
             .collect()
     }
 
-    fn same(a: &Candidate, b: &Candidate) -> bool {
+    /// `a` (with `cube` the cube being solved) is the reference candidate `b` with standardised
+    /// cube `xb`.
+    fn same(a: &Candidate, cube: &Cube, b: &Candidate, xb: &Cube) -> bool {
         (
-            &a.moves1, a.frame, a.cube, a.centre, a.tau, a.dt, a.df, a.h2, a.done2,
+            a.moves1,
+            a.frame,
+            a.cube(cube),
+            a.centre,
+            a.tau,
+            a.dt,
+            a.df,
+            a.h2,
+            a.done2,
         ) == (
-            &b.moves1, b.frame, b.cube, b.centre, b.tau, b.dt, b.df, b.h2, b.done2,
+            b.moves1, b.frame, *xb, b.centre, b.tau, b.dt, b.df, b.h2, b.done2,
         )
     }
 
@@ -2178,9 +2242,9 @@ mod tests {
                 }
                 kept += old.len();
                 assert_eq!(new.len(), old.len(), "limit {limit}");
-                for (a, b) in new.iter().zip(&old) {
+                for (a, (b, xb)) in new.iter().zip(&old) {
                     assert!(
-                        same(a, b),
+                        same(a, &cube, b, xb),
                         "limit {limit}: {:?} frame {}",
                         b.moves1,
                         b.frame
@@ -2785,6 +2849,16 @@ mod tests {
                     printed: HashSet::new(),
                     yields: HashMap::new(),
                     prev_yields: HashMap::new(),
+                    trace: false,
+                    knobs: Knobs::from_env(),
+                    margin_extra: 0,
+                    adapt_at: None,
+                    adapt_p23: Duration::ZERO,
+                    lvl_nodes: 0,
+                    lvl_eps: 0,
+                    lvl_kept: 0,
+                    lvl_start: 0.0,
+                    prev_lvl_nodes: 0,
                 };
                 run.level.jobs = run.level_jobs(run.level.len);
                 // The order applies once a solution exists (a 60-move one keeps every
@@ -2803,7 +2877,7 @@ mod tests {
                     .cands
                     .iter()
                     .filter(|c| c.moves1.len() <= last as usize)
-                    .map(|c| (c.moves1.clone(), c.frame))
+                    .map(|c| (c.moves1.to_vec(), c.frame as usize))
                     .collect();
                 c.sort();
                 found.push(c);
@@ -2878,6 +2952,16 @@ mod tests {
                 printed: HashSet::new(),
                 yields: HashMap::new(),
                 prev_yields: HashMap::new(),
+                trace: false,
+                knobs: Knobs::from_env(),
+                margin_extra: 0,
+                adapt_at: None,
+                adapt_p23: Duration::ZERO,
+                lvl_nodes: 0,
+                lvl_eps: 0,
+                lvl_kept: 0,
+                lvl_start: 0.0,
+                prev_lvl_nodes: 0,
             };
             run.level.jobs = run.level_jobs(run.level.len);
             run.phase1(1000);
