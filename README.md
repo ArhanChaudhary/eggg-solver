@@ -54,7 +54,11 @@ lead to a shorter solution are kept), and the move-mask batches run in chunks of
 size. One position with `huge` on 16 threads for 40 minutes: RSS 7.9-8.3 GB (before, it
 grew to 34 GB, as each round held all its endpoints and the batches grew ~10x per phase-1
 length). `EGGG_MEM=1` prints the driver's container sizes, the RSS and malloc's statistics
-after each round.
+after each round; `EGGG_DEBUG=1` traces each round (phase-1 lengths with their nodes,
+endpoints and kept candidates; per phase-2 level the candidates searched and finished, the
+solutions found and kept and why it stopped; per phase-3 level the reductions searched; margin
+changes; each improvement's phase lengths and the rounds that made it). A candidate takes 72
+bytes (its phase-1 path inline, its cube recomputed when it is searched).
 
 The tables: phase-1 centre staging (symmetry-reduced, 25 MB; `--p1-big`: 1.2 GB without the
 reduction, faster lookups), phase-2 pairing permutation (60 MB; `--p2-joint`: the joint
@@ -155,9 +159,20 @@ allows; the pool grows while time remains. Once a solution exists, each new phas
 its jobs (3-move prefixes) best first, by their kept-candidate yield per node at the previous
 length, so the length the time limit cuts short has searched its most productive subtrees. Once a solution exists, phase 2 only produces
 reductions that a short enough phase 3 could still turn into a shorter solution: phase 3 of
-at most 14 moves at first, 13 after 3 s and 12 after 6 s. Each deeper level has ~16x the
+at most 14 moves at first, 13 after 3 s and 12 after 6 s. Each deeper level has ~13x the
 reductions and each is ~13x less likely to have a short enough phase 3, so every level adds
-about as many chances, and long runs keep improving. The rounds are timed against the
+about as many chances, and long runs keep improving. In long runs phases 2 and 3 run out of
+work: after a minute on 48 threads each round's phase 2 finishes every level up to the cap in
+a few hundredths of a second (0.1-0.5% of the time), the reduction budget no longer binds and
+phase 3 is never cut short, while phase 1 spends minutes on its last length (17 moves, about
+20x the work of length 16). So from 20 s on the cap goes one level deeper (phase 3 of at most
+11, then 10 moves) whenever 16 times the share of phases 2 and 3 in the latest rounds is below
+a quarter; candidates already searched keep their next level for that, and phase 2 then runs
+without a reduction budget (but at most as long as the round's phase 1). Measured per level
+(`EGGG_DEBUG=1`, 300 s runs): the phase-2 solutions grow ~13x per level and their expected
+improvements (solutions x P(optimal 3x3 short enough)) are equal to within 5%, so the two
+deeper levels add ~40% more chance per round for ~2% of the time (`EGGG_ADAPT=inf
+EGGG_P2_FREE=inf EGGG_P2_TIME=inf` turns this off). The rounds are timed against the
 limit: once a solution exists, each round's phase 1 stops early enough (at 1/1.3 of the time
 left) for that round's phase 2 and 3 to run before the limit, rounds last at most a quarter
 of the time elapsed so improvements arrive steadily, and deep phase-2 searches are split into
@@ -165,7 +180,11 @@ tasks over the threads. 48 threads (x86 server), 50 random positions (seed 6060)
 version: 38.56 / 38.54 / 38.52 / 38.50 moves on average after 10 s with the large / huge /
 xl / xxl tiers (the larger tables mainly help in the first second: 39.66 / 39.46 / 39.34 /
 39.32 after 0.5 s; the 15 GB depth-8 wing-path table, `--p1-wing 8`, adds nothing at 48
-threads); 50 other positions (seed 3030): 38.76 after 2 s with the huge tier. (Before the
+threads); 50 other positions (seed 3030): 38.76 after 2 s with the huge tier; 20 positions
+(seed 6060, huge) for 5 minutes: 38.50 / 38.45 / 38.40 / 38.30 after 10 s / 1 / 2 / 5 minutes
+without the deeper caps, 38.55 / 38.50 / 38.40 / 38.25 with them (one position shorter at 5
+minutes, none longer; 4 of the 6 improvements after 10 s came from the two deeper levels).
+(Before the
 masks, the round cut, the faster phase 2 and the wing-path tables, 2026-11-17: 39.7 / 39.5
 after 2 s, 38.8 / 39.1 after 60 s on two sets of 20 positions.)
 

@@ -51,6 +51,87 @@ const MIN_ROUND: Duration = Duration::from_millis(20);
 /// ~5 ms to 1.5 s on the M2, the others less than a millisecond (see `Run::phase2_level`).
 const P2_SPLIT_SLACK: u8 = 3;
 
+/// Long runs: from `ADAPT_FROM` seconds on, after each round, the phase-2 margin goes one
+/// level deeper (down to `MIN_MARGIN`) while 16x the share of phases 2 and 3 in the latest
+/// rounds is below `ADAPT_SHARE`; from then on phase 2 has no reduction budget, and a round's
+/// phase 2 stops after `P2_ROUND_TIME` times its phase 1 (see `Run::adapt`).
+///
+/// Each deeper level has ~13x the phase-2 solutions of the one above, each ~13x less likely to
+/// have a short enough phase 3, so it adds as much chance as each level above it (measured:
+/// the expected improvements per level, solutions x P(optimal 3x3 <= best - 1 - L12), are
+/// equal to within 5%), for ~13x the phase-2 work. After a minute on 48 threads phases 2 and
+/// 3 took 0.1-0.5% of the time at margin 13, so two more levels (12, 11) add ~40% more chance
+/// per round for ~1-3% of the time.
+const ADAPT_FROM: f64 = 20.0;
+const ADAPT_SHARE: f64 = 0.25;
+const MIN_MARGIN: usize = 11;
+const P2_ROUND_TIME: f64 = 1.0;
+
+/// The long-run schedule: the constants above, which the environment can override for
+/// experiments (read once per solve; see `Knobs::from_env`).
+#[derive(Clone, Debug)]
+struct Knobs {
+    /// (seconds, margin): the phase-2 margin from that time on (`EGGG_MARGINS=0:15,3:14`).
+    margins: Vec<(f64, usize)>,
+    /// From this time on (seconds), phase 2 has no reduction budget (`EGGG_P2_FREE`, default
+    /// `ADAPT_FROM`).
+    p2_free: f64,
+    /// From `p2_free` on, a round's phase 2 stops after this multiple of its phase-1 time
+    /// (`EGGG_P2_TIME`, default `P2_ROUND_TIME`).
+    p2_time: f64,
+    /// Adaptive margin (`EGGG_ADAPT`, default `ADAPT_SHARE`, `inf`: off): from `adapt_from`
+    /// seconds on (`EGGG_ADAPT_FROM`), the margin goes one deeper (down to `margin_min`,
+    /// `EGGG_MARGIN_MIN`) when 16x the share of phases 2 and 3 in the latest rounds is below
+    /// this.
+    adapt: f64,
+    adapt_from: f64,
+    margin_min: usize,
+}
+
+impl Knobs {
+    fn from_env() -> Self {
+        let num = |k: &str, default: f64| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(default)
+        };
+        let margins = std::env::var("EGGG_MARGINS")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|x| {
+                        let (t, m) = x.split_once(':')?;
+                        Some((t.parse().ok()?, m.parse().ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![(0.0, 15), (3.0, 14), (6.0, DEEPEST_MARGIN)]);
+        Knobs {
+            margins,
+            p2_free: num("EGGG_P2_FREE", ADAPT_FROM),
+            p2_time: num("EGGG_P2_TIME", P2_ROUND_TIME),
+            adapt: num("EGGG_ADAPT", ADAPT_SHARE),
+            adapt_from: num("EGGG_ADAPT_FROM", ADAPT_FROM),
+            margin_min: std::env::var("EGGG_MARGIN_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(MIN_MARGIN),
+        }
+    }
+
+    fn margin(&self, elapsed: f64) -> usize {
+        self.margins
+            .iter()
+            .rfind(|m| m.0 <= elapsed)
+            .map_or(15, |m| m.1)
+    }
+
+    fn deepest(&self) -> usize {
+        self.margins.iter().map(|m| m.1).min().unwrap_or(15)
+    }
+}
+
 pub struct Tables {
     pub p1: P1Tables,
     pub p2: P2Tables,
@@ -128,10 +209,44 @@ pub struct Stats {
     pub time: [Duration; 3],
 }
 
+/// A phase-1 path, stored inline (the driver searches phase-1 lengths up to 40): long runs keep
+/// millions of candidates, and a heap block per path cost as much as the rest of a candidate
+/// and a malloc per candidate made in the phase-1 workers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Moves1 {
+    len: u8,
+    m: [u8; 40],
+}
+
+impl Moves1 {
+    fn new(p: &[u8]) -> Self {
+        let mut m = [0u8; 40];
+        m[..p.len()].copy_from_slice(p);
+        Moves1 {
+            len: p.len() as u8,
+            m,
+        }
+    }
+}
+
+impl std::ops::Deref for Moves1 {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.m[..self.len as usize]
+    }
+}
+
+impl std::fmt::Debug for Moves1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+/// A phase-1 endpoint in one phase-2 frame (72 bytes: its cube is recomputed when it is
+/// searched, see [`Candidate::cube`]).
 struct Candidate {
-    moves1: Vec<u8>,
-    frame: usize,
-    cube: Cube,
+    moves1: Moves1,
+    frame: u8,
     centre: u32,
     tau: [u8; 16],
     /// Exact tau distance, or with the joint table, the exact joint distance.
@@ -141,6 +256,19 @@ struct Candidate {
     h2: u8,
     /// Phase-2 depths below this have been searched.
     done2: u8,
+    /// The round that made it (debug output).
+    round: u32,
+}
+
+impl Candidate {
+    /// The standardised phase-2 cube of the candidate (`cube`: the cube being solved).
+    fn cube(&self, cube: &Cube) -> Cube {
+        let c = self
+            .moves1
+            .iter()
+            .fold(*cube, |c, &m| c.apply_perm(&MOVE_PERMS[m as usize]));
+        standardise(&c, self.frame as usize)
+    }
 }
 
 struct Reduction {
@@ -151,6 +279,9 @@ struct Reduction {
     h3: u8,
     /// Phase-3 depths below this have been searched without a solution.
     done3: u8,
+    /// The rounds that made it and its candidate (debug output).
+    round: u32,
+    cand_round: u32,
 }
 
 /// The resumable state of one phase-1 length level.
@@ -381,16 +512,17 @@ fn make_candidates(
         if moves1.len() + h2 as usize > limit {
             continue;
         }
+        let _ = x;
         out.push(Candidate {
-            moves1: moves1.clone(),
-            frame,
-            cube: x,
+            moves1: Moves1::new(moves1),
+            frame: frame as u8,
             centre,
             tau: w.1,
             dt,
             df,
             h2,
             done2: 0,
+            round: 0,
         });
     }
 }
@@ -438,7 +570,7 @@ fn order_by_yield(jobs: &mut Vec<(u8, Vec<u8>)>, yields: &HashMap<[u8; 3], (u64,
 /// The frame rotation of a candidate's phase 2, the last phase-1 move in that frame, and the
 /// moves allowed to open phase 2 (see [`first_moves`]).
 fn phase2_root(c: &Candidate) -> (Mat, usize, u32) {
-    let rot = frame_rotation(c.frame);
+    let rot = frame_rotation(c.frame as usize);
     let last1 = c
         .moves1
         .last()
@@ -502,6 +634,22 @@ struct Run<'a, 'r> {
     /// and at the previous length.
     yields: HashMap<[u8; 3], (u64, u64)>,
     prev_yields: HashMap<[u8; 3], (u64, u64)>,
+    /// Debug output (`EGGG_DEBUG`).
+    trace: bool,
+    knobs: Knobs,
+    /// Adaptive margin (see [`Knobs::adapt`]): levels below the schedule's margin, the start
+    /// of the current measuring window (None: the next round is a change's catch-up and is
+    /// not measured) and the phase-2 and 3 time in it.
+    margin_extra: usize,
+    adapt_at: Option<f64>,
+    adapt_p23: Duration,
+    /// Debug: the current phase-1 level's nodes, endpoints and kept candidates so far, when
+    /// it started, and the previous level's nodes.
+    lvl_nodes: u64,
+    lvl_eps: usize,
+    lvl_kept: usize,
+    lvl_start: f64,
+    prev_lvl_nodes: u64,
 }
 
 impl<'a> Solver<'a> {
@@ -576,6 +724,16 @@ impl<'a> Solver<'a> {
             printed: HashSet::new(),
             yields: HashMap::new(),
             prev_yields: HashMap::new(),
+            trace: std::env::var_os("EGGG_DEBUG").is_some(),
+            knobs: Knobs::from_env(),
+            margin_extra: 0,
+            adapt_at: None,
+            adapt_p23: Duration::ZERO,
+            lvl_nodes: 0,
+            lvl_eps: 0,
+            lvl_kept: 0,
+            lvl_start: 0.0,
+            prev_lvl_nodes: 0,
         };
         run.level.jobs = run.level_jobs(len0);
         std::thread::scope(|scope| {
@@ -658,8 +816,35 @@ impl<'a, 'r> Run<'a, 'r> {
                 (None, None)
             };
             let tp = Instant::now();
+            let (eps0, nodes0, kept0) = (self.made_cands, self.stats.nodes1, self.cands.len());
+            let len0 = self.level.len;
             self.phase1(want1);
             self.stats.time[0] += tp.elapsed();
+            if self.trace {
+                let now = self.start.elapsed().as_secs_f64();
+                let cut = self
+                    .p1_cut
+                    .map(|c| c.saturating_duration_since(t0).as_secs_f64())
+                    .unwrap_or(-1.0);
+                eprintln!(
+                    "[{now:8.3}] ROUND {} best {} p1 {:.3} s (cut {:.3}) levels {}..{} round nodes {:.3e} eps {} kept {} | level {} nodes {:.3e} (prev level {:.3e}) jobs {}/{} want1 {}",
+                    self.stats.rounds,
+                    self.best_len(),
+                    tp.elapsed().as_secs_f64(),
+                    cut,
+                    len0,
+                    self.level.len,
+                    (self.stats.nodes1 - nodes0) as f64,
+                    self.made_cands - eps0,
+                    self.cands.len() - kept0,
+                    self.level.len,
+                    self.lvl_nodes as f64,
+                    self.prev_lvl_nodes as f64,
+                    self.level.next,
+                    self.level.jobs.len(),
+                    want1
+                );
+            }
             debug(
                 self.start,
                 &format!(
@@ -679,9 +864,18 @@ impl<'a, 'r> Run<'a, 'r> {
             } else {
                 want2
             };
+            if self.best.is_some()
+                && self.knobs.p2_time.is_finite()
+                && self.start.elapsed().as_secs_f64() >= self.knobs.p2_free
+            {
+                let p1 = t0.elapsed().mul_f64(self.knobs.p2_time);
+                let at = Instant::now() + p1;
+                self.p2_cut = Some(self.p2_cut.map_or(at, |c| c.min(at)));
+            }
             let tp = Instant::now();
             self.phase2(want2_now);
             self.stats.time[1] += tp.elapsed();
+            let p2_round = tp.elapsed();
             debug(
                 self.start,
                 &format!(
@@ -703,6 +897,7 @@ impl<'a, 'r> Run<'a, 'r> {
             self.phase3_levels(t1 + budget);
             self.stats.time[2] += t1.elapsed();
             check += t1.elapsed();
+            self.adapt(t1.elapsed() + p2_round);
             if std::env::var_os("EGGG_MEM").is_some() {
                 self.mem_report();
             }
@@ -711,6 +906,53 @@ impl<'a, 'r> Run<'a, 'r> {
             }
             want1 = want1.saturating_mul(2);
             want2 = want2.saturating_mul(2);
+        }
+    }
+
+    /// The adaptive margin (see [`Knobs::adapt`]), after each round (`p23`: the round's
+    /// phase-2 and 3 time). The share of phases 2 and 3 is measured over the rounds since the
+    /// last change, except the first one (which catches up with the new level), and over at
+    /// least `ADAPT_WINDOW` of the time elapsed (about one round).
+    fn adapt(&mut self, p23: Duration) {
+        const ADAPT_WINDOW: f64 = 0.15;
+        let k = &self.knobs;
+        let elapsed = self.start.elapsed().as_secs_f64();
+        if !k.adapt.is_finite()
+            || self.best.is_none()
+            || elapsed < k.adapt_from
+            || self.margin_now() <= k.margin_min
+            || self.margin_now() > k.deepest()
+        {
+            return;
+        }
+        let Some(at) = self.adapt_at else {
+            // The window starts after this round.
+            self.adapt_at = Some(elapsed);
+            self.adapt_p23 = Duration::ZERO;
+            return;
+        };
+        self.adapt_p23 += p23;
+        let since = elapsed - at;
+        if since < ADAPT_WINDOW * elapsed {
+            return;
+        }
+        let share = self.adapt_p23.as_secs_f64() / since.max(1e-9);
+        if 16.0 * share < k.adapt {
+            self.margin_extra += 1;
+            if self.trace {
+                eprintln!(
+                    "[{elapsed:8.3}] ADAPT margin {} (phase 2+3 share {:.4} over {:.1} s)",
+                    self.margin_now(),
+                    share,
+                    since
+                );
+            }
+            self.adapt_at = None;
+        } else {
+            // A sliding window: the latest rounds only (the best length, and with it the
+            // cost of the deepest level, changes during the run).
+            self.adapt_at = Some(elapsed);
+            self.adapt_p23 = Duration::ZERO;
         }
     }
 
@@ -725,8 +967,7 @@ impl<'a, 'r> Run<'a, 'r> {
                 (cap + 8).div_ceil(16).max(2) * 16
             }
         };
-        let cand_heap: usize = self.cands.iter().map(|c| block(c.moves1.capacity())).sum();
-        let cand_bytes = self.cands.capacity() * std::mem::size_of::<Candidate>() + cand_heap;
+        let cand_bytes = self.cands.capacity() * std::mem::size_of::<Candidate>();
         let red_heap: usize = self.reds.iter().map(|r| block(r.moves12.capacity())).sum();
         let red_bytes = self.reds.capacity() * std::mem::size_of::<Reduction>() + red_heap;
         let idx_bytes =
@@ -853,6 +1094,22 @@ impl<'a, 'r> Run<'a, 'r> {
                 // solution exists (before, every candidate counts as kept, and the order
                 // made some first solutions later on the M2).
                 let len = self.level.len + 1;
+                if self.trace {
+                    let now = self.start.elapsed().as_secs_f64();
+                    eprintln!(
+                        "[{now:8.3}] P1LEVEL {} done: nodes {:.3e} endpoints {} kept {} in {:.3} s ({:.3}..{:.3})",
+                        self.level.len,
+                        self.lvl_nodes as f64,
+                        self.lvl_eps,
+                        self.lvl_kept,
+                        now - self.lvl_start,
+                        self.lvl_start,
+                        now
+                    );
+                    self.prev_lvl_nodes = self.lvl_nodes;
+                    (self.lvl_nodes, self.lvl_eps, self.lvl_kept) = (0, 0, 0);
+                    self.lvl_start = now;
+                }
                 self.prev_yields = std::mem::take(&mut self.yields);
                 let mut jobs = self.level_jobs(len);
                 if self.order_jobs && self.best.is_some() {
@@ -955,6 +1212,7 @@ impl<'a, 'r> Run<'a, 'r> {
                 }
             });
             self.stats.nodes1 += nodes.load(Ordering::Relaxed);
+            self.lvl_nodes += nodes.load(Ordering::Relaxed);
             self.cand_time +=
                 Duration::from_nanos(cand_nanos.load(Ordering::Relaxed) / threads as u64);
             if self.stopped() {
@@ -985,6 +1243,14 @@ impl<'a, 'r> Run<'a, 'r> {
             // The new candidates, in job order (the order of their endpoints).
             // (Levels, jobs and handed-back subtrees are disjoint: no endpoint comes twice.)
             self.made_cands += results.iter().map(|r| r.4).sum::<usize>();
+            self.lvl_eps += results.iter().map(|r| r.4).sum::<usize>();
+            self.lvl_kept += results.iter().map(|r| r.1.len()).sum::<usize>();
+            let round = self.stats.rounds as u32;
+            for r in &mut results {
+                for c in &mut r.1 {
+                    c.round = round;
+                }
+            }
             for c in results.iter().flat_map(|r| &r.1) {
                 if let Some(k) = prefix3(&c.moves1) {
                     self.yields.entry(k).or_default().0 += 1;
@@ -998,7 +1264,31 @@ impl<'a, 'r> Run<'a, 'r> {
     /// The longest reduction that could still lead to a shorter solution at the deepest
     /// phase-2 level (`DEEPEST_MARGIN`); unlimited before the first solution.
     fn useful_l12(&self) -> usize {
-        self.best_len().saturating_sub(DEEPEST_MARGIN)
+        self.best_len().saturating_sub(self.keep_margin())
+    }
+
+    /// The phase-2 margin now (see [`Knobs`]).
+    fn margin_now(&self) -> usize {
+        let m = self.knobs.margin(self.start.elapsed().as_secs_f64());
+        m.saturating_sub(self.margin_extra)
+            .max(self.knobs.margin_min.min(m))
+    }
+
+    /// Candidates are made (and kept while not searched) down to L1 + h2 = best - this.
+    fn keep_margin(&self) -> usize {
+        if self.knobs.adapt.is_finite() {
+            self.knobs.deepest().min(self.margin_now())
+        } else {
+            self.knobs.deepest()
+        }
+    }
+
+    /// Searched candidates are kept while the level of their next search is at most this
+    /// (with the adaptive margin, one level more than [`Run::useful_l12`] while the margin can
+    /// still deepen: then every candidate searched so far gets the new level's search).
+    fn useful_next(&self) -> usize {
+        let deepen = self.knobs.adapt.is_finite() && self.margin_now() > self.knobs.margin_min;
+        self.useful_l12() + deepen as usize
     }
 
     /// Drop the candidates and reductions that can no longer lead to a shorter solution
@@ -1007,9 +1297,11 @@ impl<'a, 'r> Run<'a, 'r> {
         if self.best.is_none() {
             return;
         }
-        let limit = self.useful_l12();
-        self.cands
-            .retain(|c| c.moves1.len() + c.h2.max(c.done2) as usize <= limit);
+        let (limit, next) = (self.useful_l12(), self.useful_next());
+        self.cands.retain(|c| {
+            let l1 = c.moves1.len();
+            l1 + c.h2 as usize <= limit && l1 + c.h2.max(c.done2) as usize <= next
+        });
         let bound = self.bound();
         self.reds
             .retain(|r| r.moves12.len() + (r.h3.max(r.done3) as usize) < bound);
@@ -1042,12 +1334,11 @@ impl<'a, 'r> Run<'a, 'r> {
         // margin goes from 15 to 13 as the run gets longer (phases 2 and 3 are then cheap
         // next to phase 1). Measured on 20 positions x 30 s: 39.3 -> 39.0 moves.
         let elapsed = self.start.elapsed().as_secs_f64();
-        let margin = if elapsed < 3.0 {
-            15
-        } else if elapsed < 6.0 {
-            14
+        let margin = self.margin_now();
+        let want = if elapsed >= self.knobs.p2_free {
+            usize::MAX
         } else {
-            DEEPEST_MARGIN
+            want
         };
         let cap = self.best_len().saturating_sub(margin).min(64);
         let mut t12 = self
@@ -1056,6 +1347,23 @@ impl<'a, 'r> Run<'a, 'r> {
             .map(|c| c.moves1.len() + c.h2.max(c.done2) as usize)
             .min()
             .unwrap_or(99);
+        if self.trace {
+            // The candidates by the level of their next search (up to the cap).
+            let mut reach = std::collections::BTreeMap::new();
+            for c in &self.cands {
+                let t = c.moves1.len() + c.h2.max(c.done2) as usize;
+                if t <= cap + 1 {
+                    *reach.entry(t).or_insert(0usize) += 1;
+                }
+            }
+            eprintln!(
+                "[{:8.3}] P2 start: margin {margin} cap {cap} want {want} made_reds {} cands {} next-level counts {:?}",
+                self.start.elapsed().as_secs_f64(),
+                self.made_reds,
+                self.cands.len(),
+                reach
+            );
+        }
         while self.made_reds < want
             && !self.stopped()
             && t12 <= cap
@@ -1074,6 +1382,23 @@ impl<'a, 'r> Run<'a, 'r> {
                 }
             }
             t12 += 1;
+        }
+        if self.trace {
+            let why = if self.stopped() {
+                "stop"
+            } else if self.made_reds >= want {
+                "budget"
+            } else if t12 > cap {
+                "cap"
+            } else {
+                "cut"
+            };
+            eprintln!(
+                "[{:8.3}] P2 end ({why}): made_reds {} reds {}",
+                self.start.elapsed().as_secs_f64(),
+                self.made_reds,
+                self.reds.len()
+            );
         }
         self.stats.reductions = self.reds.len();
     }
@@ -1102,6 +1427,7 @@ impl<'a, 'r> Run<'a, 'r> {
             u8::MAX
         };
         let cands = &self.cands;
+        let root_cube = &self.cube;
         let todo: Vec<usize> = (0..cands.len())
             .filter(|&i| {
                 let c = &cands[i];
@@ -1113,6 +1439,10 @@ impl<'a, 'r> Run<'a, 'r> {
         let nodes = AtomicU64::new(0);
         let stop = self.stop;
         let made = AtomicUsize::new(0);
+        let started = AtomicUsize::new(0);
+        let seen_all = AtomicU64::new(0);
+        let t_level = Instant::now();
+        let round = self.stats.rounds as u32;
         let cut = self.p2_cut;
         let past_cut = || cut.is_some_and(|c| Instant::now() >= c);
         // Per search: its jobs (1 if whole), and those that ran to the end.
@@ -1136,9 +1466,10 @@ impl<'a, 'r> Run<'a, 'r> {
             // per search, nearly all hopeless).
             let mut local = vec![];
             let mut seen = 0usize;
+            let x0 = c.cube(root_cube);
             let mut keep = |p: &[u8]| {
                 seen += 1;
-                let mut x = c.cube;
+                let mut x = x0;
                 for &m in p {
                     x = x.apply_perm(&MOVE_PERMS[m as usize]);
                 }
@@ -1147,15 +1478,17 @@ impl<'a, 'r> Run<'a, 'r> {
                     // A reduction whose phase 3 cannot beat the best solution (or, with
                     // ties, equal it) never will (the best only gets shorter).
                     if c.moves1.len() + p.len() + (h3 as usize) < bound {
-                        let mut moves12 = c.moves1.clone();
+                        let mut moves12 = c.moves1.to_vec();
                         moves12.extend(p.iter().map(|&m| rotate_move(m as usize, &rot_inv) as u8));
                         local.push(Reduction {
                             moves12,
                             len1: c.moves1.len(),
-                            frame: c.frame,
+                            frame: c.frame as usize,
                             c3,
                             h3,
                             done3: 0,
+                            round,
+                            cand_round: c.round,
                         });
                     }
                 }
@@ -1170,6 +1503,7 @@ impl<'a, 'r> Run<'a, 'r> {
                 None => srch.dfs(c.centre, &c.tau, c.dt, l2, last1, first, &mut keep),
             };
             nodes.fetch_add(srch.nodes, Ordering::Relaxed);
+            seen_all.fetch_add(seen as u64, Ordering::Relaxed);
             made.fetch_add(local.len(), Ordering::Relaxed);
             if !srch.aborted {
                 finished[k].fetch_add(1, Ordering::Relaxed);
@@ -1204,6 +1538,7 @@ impl<'a, 'r> Run<'a, 'r> {
                             splitting.fetch_sub(1, Ordering::SeqCst);
                             continue;
                         }
+                        started.fetch_add(1, Ordering::Relaxed);
                         let c = &cands[todo[k]];
                         let l2 = (t12 - c.moves1.len()) as u8;
                         let slack = l2.saturating_sub(c.h2);
@@ -1226,11 +1561,36 @@ impl<'a, 'r> Run<'a, 'r> {
                 });
             }
         });
+        let mut n_fin = 0usize;
         for (k, &i) in todo.iter().enumerate() {
             if finished[k].load(Ordering::Relaxed) == parts[k].load(Ordering::Relaxed) {
                 let c = &mut self.cands[i];
                 c.done2 = c.done2.max((t12 - c.moves1.len()) as u8 + 1);
+                n_fin += 1;
             }
+        }
+        if self.trace {
+            let why = if self.stopped() {
+                "stop"
+            } else if past_cut() {
+                "cut"
+            } else if made.load(Ordering::Relaxed) >= need {
+                "budget"
+            } else {
+                "done"
+            };
+            eprintln!(
+                "[{:8.3}] P2LEVEL {t12}: todo {} started {} finished {} kept reds {} (need {need}) nodes {:.3e} in {:.3} s ({why}) seen {} best {}",
+                self.start.elapsed().as_secs_f64(),
+                todo.len(),
+                started.load(Ordering::Relaxed),
+                n_fin,
+                made.load(Ordering::Relaxed),
+                nodes.load(Ordering::Relaxed) as f64,
+                t_level.elapsed().as_secs_f64(),
+                seen_all.load(Ordering::Relaxed),
+                self.best_len() as isize
+            );
         }
         self.stats.nodes2 += nodes.load(Ordering::Relaxed);
         let mut v = out.into_inner().unwrap();
@@ -1260,6 +1620,19 @@ impl<'a, 'r> Run<'a, 'r> {
             return;
         }
         if sol.len() < self.best_len() {
+            if self.trace {
+                eprintln!(
+                    "[{:8.3}] IMPROVE {} -> {} phases {:?} (L12 {}) round {} candidate round {} reduction round {}",
+                    self.start.elapsed().as_secs_f64(),
+                    self.best_len() as isize,
+                    sol.len(),
+                    sol.phases,
+                    red.moves12.len(),
+                    self.stats.rounds,
+                    red.cand_round,
+                    red.round
+                );
+            }
             if self.ties {
                 self.printed.insert(sol.moves.clone());
             }
@@ -1345,6 +1718,7 @@ impl<'a, 'r> Run<'a, 'r> {
                 jobs.push((i, None));
             }
         }
+        let t_level = Instant::now();
         let result = Mutex::new(Vec::<(usize, Vec<u8>)>::new());
         let found = AtomicBool::new(false);
         let nodes = AtomicU64::new(0);
@@ -1384,13 +1758,32 @@ impl<'a, 'r> Run<'a, 'r> {
         // reduction's first.
         result.sort_by_key(|x| x.0);
         result.dedup_by_key(|x| x.0);
+        let mut n_fin = 0usize;
         for i in 0..self.reds.len() {
             if (parts[i] > 0 && finished[i].load(Ordering::Relaxed) == parts[i])
                 || pruned.contains(&i)
             {
                 let r = &mut self.reds[i];
                 r.done3 = r.done3.max((total - r.moves12.len()) as u8 + 1);
+                n_fin += 1;
             }
+        }
+        if self.trace {
+            eprintln!(
+                "[{:8.3}] P3LEVEL {total}: reds {} jobs {} finished {} found {} nodes {:.3e} in {:.3} s{}",
+                self.start.elapsed().as_secs_f64(),
+                order.len(),
+                jobs.len(),
+                n_fin,
+                result.len(),
+                nodes.load(Ordering::Relaxed) as f64,
+                t_level.elapsed().as_secs_f64(),
+                if Instant::now() >= deadline {
+                    " (deadline)"
+                } else {
+                    ""
+                }
+            );
         }
         if all {
             // A reduction with a solution at this level has given its share.
@@ -1712,14 +2105,14 @@ mod tests {
     }
 
     /// The former candidate construction: a rotation search per standardisation, the full
-    /// joint-table walk, and the limit applied afterwards.
+    /// joint-table walk, and the limit applied afterwards; with its standardised cube.
     fn candidate_ref(
         t: &Tables,
         cube: &Cube,
         moves1: &[u8],
         frame: usize,
         limit: usize,
-    ) -> Option<Candidate> {
+    ) -> Option<(Candidate, Cube)> {
         let mut c = *cube;
         for &m in moves1 {
             c = c.apply_perm(&MOVE_PERMS[m as usize]);
@@ -1742,17 +2135,17 @@ mod tests {
             None => (t.p2.tau_distance(&tau), 0),
         };
         let c = Candidate {
-            moves1: moves1.to_vec(),
-            frame,
-            cube: x,
+            moves1: Moves1::new(moves1),
+            frame: frame as u8,
             centre,
             tau,
             dt,
             df,
             h2: cd.max(dt).max(df),
             done2: 0,
+            round: 0,
         };
-        (c.moves1.len() + c.h2 as usize <= limit).then_some(c)
+        (c.moves1.len() + c.h2 as usize <= limit).then_some((c, x))
     }
 
     /// The joint-table state (U/D pattern, tau, PLL bit) of the cube rotated by x (about the
@@ -1818,11 +2211,21 @@ mod tests {
             .collect()
     }
 
-    fn same(a: &Candidate, b: &Candidate) -> bool {
+    /// `a` (with `cube` the cube being solved) is the reference candidate `b` with standardised
+    /// cube `xb`.
+    fn same(a: &Candidate, cube: &Cube, b: &Candidate, xb: &Cube) -> bool {
         (
-            &a.moves1, a.frame, a.cube, a.centre, a.tau, a.dt, a.df, a.h2, a.done2,
+            a.moves1,
+            a.frame,
+            a.cube(cube),
+            a.centre,
+            a.tau,
+            a.dt,
+            a.df,
+            a.h2,
+            a.done2,
         ) == (
-            &b.moves1, b.frame, b.cube, b.centre, b.tau, b.dt, b.df, b.h2, b.done2,
+            b.moves1, b.frame, *xb, b.centre, b.tau, b.dt, b.df, b.h2, b.done2,
         )
     }
 
@@ -1853,9 +2256,9 @@ mod tests {
                 }
                 kept += old.len();
                 assert_eq!(new.len(), old.len(), "limit {limit}");
-                for (a, b) in new.iter().zip(&old) {
+                for (a, (b, xb)) in new.iter().zip(&old) {
                     assert!(
-                        same(a, b),
+                        same(a, &cube, b, xb),
                         "limit {limit}: {:?} frame {}",
                         b.moves1,
                         b.frame
@@ -2460,6 +2863,16 @@ mod tests {
                     printed: HashSet::new(),
                     yields: HashMap::new(),
                     prev_yields: HashMap::new(),
+                    trace: false,
+                    knobs: Knobs::from_env(),
+                    margin_extra: 0,
+                    adapt_at: None,
+                    adapt_p23: Duration::ZERO,
+                    lvl_nodes: 0,
+                    lvl_eps: 0,
+                    lvl_kept: 0,
+                    lvl_start: 0.0,
+                    prev_lvl_nodes: 0,
                 };
                 run.level.jobs = run.level_jobs(run.level.len);
                 // The order applies once a solution exists (a 60-move one keeps every
@@ -2478,7 +2891,7 @@ mod tests {
                     .cands
                     .iter()
                     .filter(|c| c.moves1.len() <= last as usize)
-                    .map(|c| (c.moves1.clone(), c.frame))
+                    .map(|c| (c.moves1.to_vec(), c.frame as usize))
                     .collect();
                 c.sort();
                 found.push(c);
@@ -2553,6 +2966,16 @@ mod tests {
                 printed: HashSet::new(),
                 yields: HashMap::new(),
                 prev_yields: HashMap::new(),
+                trace: false,
+                knobs: Knobs::from_env(),
+                margin_extra: 0,
+                adapt_at: None,
+                adapt_p23: Duration::ZERO,
+                lvl_nodes: 0,
+                lvl_eps: 0,
+                lvl_kept: 0,
+                lvl_start: 0.0,
+                prev_lvl_nodes: 0,
             };
             run.level.jobs = run.level_jobs(run.level.len);
             run.phase1(1000);
