@@ -9,7 +9,9 @@
 //! the low wing slots low and the U/D axis) and the swap of the U and D colours: the pair
 //! (U/D pattern, tau on the four M-slice edges) is reduced to a class, and the other eight
 //! entries of tau, conjugated into the class representative, are ranked (8!/2). Distances
-//! are stored mod 3 in 2 bits (1.05 GB).
+//! are stored mod 3 in 2 bits (1.05 GB), or exactly in 4 bits (2.1 GB, the same index; see
+//! [`Joint::generate_exact`]): then a state's distance is one read instead of a walk down the
+//! mod-3 table.
 
 use crate::comb::FACT;
 use crate::cube::{EDGE_POS, GEO, ROTATIONS, centre_slot, mat_apply};
@@ -58,9 +60,27 @@ pub struct Joint {
     dual_moves: [(V32, V32); 17],
     /// [`conj`] by each symmetry as two byte shuffles in both lanes: (e_inv, e_map).
     conj2: [(V32, V32); 8],
+    /// The distances: mod 3 in 2 bits per entry (3: not reached), or with `exact` the
+    /// distances themselves in 4 bits per entry (15: not reached).
     pub table: HugeBuf<u64>,
+    /// `table` holds exact distances (see [`Joint::generate_exact`]).
+    pub exact: bool,
     pub n: usize,
 }
+
+/// The stored value of an exact entry (0..15) mod 3, two bits each (15, not reached: 3).
+const EXACT_MOD3: u32 = {
+    let mut t = 3u32 << 30;
+    let mut v = 0;
+    while v < 15 {
+        t |= (v % 3) << (2 * v);
+        v += 1;
+    }
+    t
+};
+
+/// The value of an exact entry for states not reached (and the largest storable distance + 1).
+pub const EXACT_NONE: u8 = 15;
 
 #[inline(always)]
 fn prefix_rank(tau: &[u8; 16]) -> usize {
@@ -486,6 +506,7 @@ impl Joint {
             dual_moves,
             conj2,
             table: HugeBuf::zeroed(1),
+            exact: false,
             n,
         }
     }
@@ -494,8 +515,14 @@ impl Joint {
         self.rep.len()
     }
 
+    /// The size of the mod-3 table.
     pub fn bytes(&self) -> usize {
         self.n.div_ceil(32) * 8
+    }
+
+    /// The size of the exact table.
+    pub fn exact_bytes(&self) -> usize {
+        self.n.div_ceil(16) * 8
     }
 
     /// Table index (one stabiliser variant; the table holds the same value in all of them).
@@ -658,19 +685,36 @@ impl Joint {
         (ud as u32, full, pll)
     }
 
+    /// The distance of entry `i` mod 3 (3: not reached), from either table.
     #[inline(always)]
     pub fn get(&self, i: usize) -> u8 {
-        (self.table[i >> 5] >> ((i & 31) * 2) & 3) as u8
+        if self.exact {
+            (EXACT_MOD3 >> (2 * self.get_exact(i)) & 3) as u8
+        } else {
+            (self.table[i >> 5] >> ((i & 31) * 2) & 3) as u8
+        }
+    }
+
+    /// The exact distance of entry `i` ([`EXACT_NONE`]: not reached); needs the exact table.
+    #[inline(always)]
+    pub fn get_exact(&self, i: usize) -> u8 {
+        (self.table[i >> 4] >> ((i & 15) * 4) & 15) as u8
     }
 
     #[inline(always)]
     pub fn prefetch(&self, i: usize) {
-        crate::table::prefetch(unsafe { self.table.as_ptr().add(i >> 5) });
+        let w = if self.exact { i >> 4 } else { i >> 5 };
+        crate::table::prefetch(unsafe { self.table.as_ptr().add(w) });
     }
 
     /// Exact distance of a state, by walking down the mod-3 table (four children read at a
-    /// time).
+    /// time), or read from the exact table.
     pub fn distance(&self, ud: u32, tau: &[u8; 16], pll: u32) -> u8 {
+        if self.exact {
+            let d = self.get_exact(self.index(ud, tau, pll));
+            assert!(d < EXACT_NONE, "no bound");
+            return d;
+        }
         let mut w = Walk::new(self, ud, tau, pll, u8::MAX);
         loop {
             if let Some(d) = w.step::<4>(self) {
@@ -781,6 +825,10 @@ impl Joint {
         const LANES: usize = 16;
         out.clear();
         out.resize(states.len(), None);
+        if self.exact {
+            self.read_at_most(states, out);
+            return;
+        }
         let mut lanes: Vec<(usize, Walk)> = Vec::with_capacity(LANES);
         let mut next = 0;
         loop {
@@ -802,6 +850,190 @@ impl Joint {
                 }
             }
         }
+    }
+
+    /// [`Joint::distances_at_most`] with the exact table: one read per state, pipelined (the
+    /// class-table entry of a state is prefetched `AHEAD` states before its table index is
+    /// computed, and its table entry `AHEAD` states before it is read).
+    fn read_at_most(&self, states: &[(u32, [u8; 16], u32, u8)], out: &mut [Option<u8>]) {
+        const AHEAD: usize = 16;
+        let n = states.len();
+        let (mut raws, mut idxs) = ([0usize; AHEAD], [0usize; AHEAD]);
+        // Per step, the read of state i - 2 AHEAD, the index of i - AHEAD and the class-table
+        // position of i (in this order: they share the ring slots).
+        for i in 0..n + 2 * AHEAD {
+            if i >= 2 * AHEAD {
+                let k = i - 2 * AHEAD;
+                let d = self.get_exact(idxs[k % AHEAD]);
+                out[k] = (d <= states[k].3 && d < EXACT_NONE).then_some(d);
+            }
+            if i >= AHEAD && i - AHEAD < n {
+                let k = i - AHEAD;
+                let (_, ref tau, pll, _) = states[k];
+                let x = self.index_raw(raws[k % AHEAD], tau, pll);
+                self.prefetch(x);
+                idxs[k % AHEAD] = x;
+            }
+            if i < n {
+                let (ud, ref tau, _, _) = states[i];
+                let r = self.raw(ud, tau);
+                self.prefetch_cls(r);
+                raws[i % AHEAD] = r;
+            }
+        }
+    }
+
+    /// The exact table (4 bits per entry, [`EXACT_NONE`]: not reached) from the mod-3 table
+    /// (`self.table`): breadth-first over the canonical entries, where a neighbour of a state
+    /// at distance d is at d + 1 exactly when its stored value is (d + 1) mod 3 (neighbours'
+    /// distances differ by at most one), so each state is expanded once and its children need
+    /// no other test; then every other stabiliser variant gets its canonical entry's value.
+    /// Panics if a distance reaches [`EXACT_NONE`] or if a value disagrees with the mod-3
+    /// table. Returns the table and the number of entries per distance.
+    pub fn generate_exact(
+        &self,
+        p2: &P2Tables,
+        threads: usize,
+        verbose: bool,
+    ) -> (HugeBuf<u64>, Vec<usize>) {
+        assert!(!self.exact, "generate_exact needs the mod-3 table");
+        let t0 = std::time::Instant::now();
+        let n = self.n;
+        let words = n.div_ceil(16);
+        let out = HugeBuf::<u64>::zeroed(words);
+        let w: &[AtomicU64] =
+            unsafe { std::slice::from_raw_parts(out.as_ptr() as *const AtomicU64, words) };
+        crate::par::for_chunks(words, 1 << 16, |r| {
+            for i in r {
+                w[i].store(u64::MAX, Ordering::Relaxed);
+            }
+        });
+        let get = |i: usize| (w[i >> 4].load(Ordering::Relaxed) >> ((i & 15) * 4) & 15) as u8;
+        // Set a not-reached entry (15) to `v`; true if this call did it.
+        let set = |i: usize, v: u8| -> bool {
+            let sh = (i & 15) * 4;
+            let old = w[i >> 4].fetch_and(!((15 ^ v as u64) << sh), Ordering::Relaxed);
+            old >> sh & 15 == 15
+        };
+        // Run `f` on chunks of the words, on `threads` threads; the sum of its results.
+        let par = |chunk: usize, f: &(dyn Fn(std::ops::Range<usize>) -> usize + Sync)| {
+            let next = AtomicUsize::new(0);
+            let total = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..threads.max(1) {
+                    s.spawn(|| {
+                        let mut local = 0;
+                        loop {
+                            let start = next.fetch_add(chunk, Ordering::Relaxed);
+                            if start >= words {
+                                break;
+                            }
+                            local += f(start..(start + chunk).min(words));
+                        }
+                        total.fetch_add(local, Ordering::Relaxed);
+                    });
+                }
+            });
+            total.into_inner()
+        };
+        let id: [u8; 16] = std::array::from_fn(|i| i as u8);
+        let mut count = 0;
+        for ud in [p2.rank70(0x0f), p2.rank70(0xf0)] {
+            count += set(self.canonical(ud as u32, &id, 0), 0) as usize;
+        }
+        let mut d = 0u8;
+        loop {
+            let want = (d + 1) % 3;
+            let pat = 0x1111_1111_1111_1111u64 * d as u64;
+            let new = par(1 << 10, &|r| {
+                let mut local = 0;
+                for wi in r {
+                    // The entries at distance d: nibbles equal to d (no thread changes them
+                    // in this pass).
+                    let t = w[wi].load(Ordering::Relaxed) ^ pat;
+                    let mut z = !(t | t >> 1 | t >> 2 | t >> 3) & 0x1111_1111_1111_1111;
+                    while z != 0 {
+                        let i = wi * 16 + z.trailing_zeros() as usize / 4;
+                        z &= z - 1;
+                        let (ud, tau, pll) = self.state(i);
+                        let mut kids = [0usize; 17];
+                        for (k, kid) in kids.iter_mut().enumerate() {
+                            *kid = self.canonical(
+                                self.ud_move[ud as usize][k] as u32,
+                                &p2.tau_move(&tau, k),
+                                pll ^ (WIDE >> k & 1),
+                            );
+                            self.prefetch(*kid);
+                            crate::table::prefetch(unsafe { out.as_ptr().add(*kid >> 4) });
+                        }
+                        for &j in &kids {
+                            if self.get(j) == want && get(j) == 15 && set(j, d + 1) {
+                                local += 1;
+                            }
+                        }
+                    }
+                }
+                local
+            });
+            if verbose {
+                eprintln!(
+                    "  exact joint depth {}: {new} ({} of {n} canonical entries, {:.1} s)",
+                    d + 1,
+                    count + new,
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+            if new == 0 {
+                break;
+            }
+            count += new;
+            d += 1;
+            assert!(d < EXACT_NONE, "joint distance {d} does not fit in 4 bits");
+        }
+        // The other stabiliser variants (only classes with a stabiliser have them).
+        let fixed = par(1 << 10, &|r| {
+            let mut local = 0;
+            for i in r.start * 16..(r.end * 16).min(n) {
+                if self.stab[i / 2 / N_REST] == 0 {
+                    continue;
+                }
+                let (ud, tau, pll) = self.state(i);
+                let j = self.canonical(ud, &tau, pll);
+                if j != i {
+                    let v = get(j);
+                    if v != 15 && set(i, v) {
+                        local += 1;
+                    }
+                }
+            }
+            local
+        });
+        // Every entry agrees with the mod-3 table; the counts per distance.
+        let hist = std::sync::Mutex::new(vec![0usize; 16]);
+        let bad = par(1 << 12, &|r| {
+            let mut h = [0usize; 16];
+            let mut bad = 0;
+            for i in r.start * 16..(r.end * 16).min(n) {
+                let v = get(i);
+                h[v as usize] += 1;
+                bad += (self.get(i) != (EXACT_MOD3 >> (2 * v) & 3) as u8) as usize;
+            }
+            let mut g = hist.lock().unwrap();
+            for (a, b) in g.iter_mut().zip(h) {
+                *a += b;
+            }
+            bad
+        });
+        let hist = hist.into_inner().unwrap();
+        if verbose {
+            eprintln!(
+                "  exact joint table: {fixed} stabiliser variants copied, entries per distance {:?}, {:.1} s",
+                &hist[..=d as usize],
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        assert_eq!(bad, 0, "exact entries that disagree with the mod-3 table");
+        (out, hist)
     }
 
     /// Breadth-first generation, in place with 2 bits per entry (3 = not reached yet).

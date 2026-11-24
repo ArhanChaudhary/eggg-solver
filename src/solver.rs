@@ -1878,7 +1878,15 @@ pub fn load_p1(dir: &std::path::Path, big: bool, threads: usize, verbose: bool) 
 
 /// Load or build all tables in `dir`.
 pub fn load_tables(dir: &std::path::Path, h48_k: u32, threads: usize, verbose: bool) -> Tables {
-    load_tables_with(dir, h48_k, false, false, P1Extra::NONE, threads, verbose)
+    load_tables_with(
+        dir,
+        h48_k,
+        JointTable::None,
+        false,
+        P1Extra::NONE,
+        threads,
+        verbose,
+    )
 }
 
 /// Load (or build) the phase-1 pattern table into `p1`: the reduced one (0.9 GB) or the
@@ -2002,8 +2010,26 @@ pub const WINGS2: i8 = 4;
 /// about a second, for 8% (p1check on the M2); distance 8 would add 2.7 GB and 20 s.
 pub const WINGR_K: u8 = 6;
 
-/// Load or build the phase-2 tables in `dir`; `joint`: also the joint table (1.05 GB).
-pub fn load_p2(dir: &std::path::Path, joint: bool, threads: usize, verbose: bool) -> P2Tables {
+/// The joint phase-2 table to load (see [`crate::p2joint`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JointTable {
+    /// None: phase 2 has the pairing table only.
+    None,
+    /// Distances mod 3 (1.05 GB): a state's distance is a walk down the table.
+    Mod3,
+    /// Exact distances (2.1 GB, `p2-joint-exact.tab`, made once from the mod-3 table in about
+    /// a minute on 48 threads): a state's distance is one read, which makes phase-1
+    /// endpoints into phase-2 candidates several times faster.
+    Exact,
+}
+
+/// Load or build the phase-2 tables in `dir`, with the joint table `joint`.
+pub fn load_p2(
+    dir: &std::path::Path,
+    joint: JointTable,
+    threads: usize,
+    verbose: bool,
+) -> P2Tables {
     let p2_path = dir.join("p2-tau.tab");
     let mut p2 = {
         let n = crate::phase2::N_TAU;
@@ -2023,34 +2049,63 @@ pub fn load_p2(dir: &std::path::Path, joint: bool, threads: usize, verbose: bool
             t
         }
     };
-    if joint {
-        let mut j = crate::p2joint::Joint::new(&p2);
-        let path = dir.join("p2-joint2.tab");
-        j.table = crate::table::HugeBuf::zeroed(j.bytes() / 8);
-        let bytes = j.table.as_bytes_mut();
-        if crate::table::load(&path, "p2-joint2", bytes).is_err() {
-            if verbose {
-                eprintln!(
-                    "generating the joint phase-2 table ({:.1} GB)...",
-                    j.bytes() as f64 / 1e9
-                );
-            }
-            j.generate(&p2, threads, verbose);
-            let bytes = j.table.as_bytes();
-            crate::table::save(&path, "p2-joint2", bytes).expect("saving table");
-        }
-        p2.joint = Some(j);
+    if joint == JointTable::None {
+        return p2;
     }
+    let mut j = crate::p2joint::Joint::new(&p2);
+    if joint == JointTable::Exact {
+        let path = dir.join("p2-joint-exact.tab");
+        let mut t = crate::table::HugeBuf::zeroed(j.exact_bytes() / 8);
+        if crate::table::load(&path, "p2-joint-exact", t.as_bytes_mut()).is_ok() {
+            j.table = t;
+            j.exact = true;
+            p2.joint = Some(j);
+            return p2;
+        }
+        drop(t);
+    }
+    let path = dir.join("p2-joint2.tab");
+    j.table = crate::table::HugeBuf::zeroed(j.bytes() / 8);
+    let bytes = j.table.as_bytes_mut();
+    if crate::table::load(&path, "p2-joint2", bytes).is_err() {
+        if verbose {
+            eprintln!(
+                "generating the joint phase-2 table ({:.1} GB)...",
+                j.bytes() as f64 / 1e9
+            );
+        }
+        j.generate(&p2, threads, verbose);
+        let bytes = j.table.as_bytes();
+        crate::table::save(&path, "p2-joint2", bytes).expect("saving table");
+    }
+    if joint == JointTable::Exact {
+        if verbose {
+            eprintln!(
+                "generating the exact joint phase-2 table ({:.1} GB)...",
+                j.exact_bytes() as f64 / 1e9
+            );
+        }
+        let (t, _) = j.generate_exact(&p2, threads, verbose);
+        crate::table::save(
+            &dir.join("p2-joint-exact.tab"),
+            "p2-joint-exact",
+            t.as_bytes(),
+        )
+        .expect("saving table");
+        j.table = t;
+        j.exact = true;
+    }
+    p2.joint = Some(j);
     p2
 }
 
-/// Load or build all tables in `dir`; `joint`: also the joint phase-2 table (1.05 GB);
+/// Load or build all tables in `dir`; `joint`: the joint phase-2 table (see [`JointTable`]);
 /// `p1_big`: the large phase-1 staging table (1.2 GB); `p1_extra`: the phase-1 pattern table
 /// and move-mask table (each `Some(big)`: reduced or large; the large masks need `p1_big`).
 pub fn load_tables_with(
     dir: &std::path::Path,
     h48_k: u32,
-    joint: bool,
+    joint: JointTable,
     p1_big: bool,
     p1_extra: P1Extra,
     threads: usize,
@@ -2214,6 +2269,15 @@ mod tests {
     /// Tables with the joint phase-2 table, from $EGGG_TABLES (default ./tables) with the H48
     /// table h$EGGG_TEST_H48 (default h3).
     fn joint_tables() -> Tables {
+        tables_with(JointTable::Mod3)
+    }
+
+    /// [`joint_tables`] with the exact joint table (made from the mod-3 one if missing).
+    fn exact_tables() -> Tables {
+        tables_with(JointTable::Exact)
+    }
+
+    fn tables_with(joint: JointTable) -> Tables {
         let dir = std::env::var_os("EGGG_TABLES")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| "tables".into());
@@ -2221,7 +2285,12 @@ mod tests {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(3);
-        load_tables_with(&dir, k, true, false, P1Extra::NONE, 8, false)
+        let t = load_tables_with(&dir, k, joint, false, P1Extra::NONE, 8, false);
+        assert_eq!(
+            t.p2.joint.as_ref().unwrap().exact,
+            joint == JointTable::Exact
+        );
+        t
     }
 
     type Endpoints = Vec<(Vec<u8>, u8)>;
@@ -2278,9 +2347,21 @@ mod tests {
     /// are exactly the former construction's, at every limit.
     #[test]
     fn candidates_match_the_former_construction() {
-        let t = joint_tables();
+        candidates_match(&joint_tables(), None);
+    }
+
+    /// The same with the exact joint table (one read per bound instead of a walk), and they
+    /// are exactly the candidates made with the mod-3 table.
+    #[test]
+    fn exact_candidates_match_the_former_construction() {
+        candidates_match(&exact_tables(), Some(&joint_tables()));
+    }
+
+    /// [`candidates_match_the_former_construction`] with tables `t`, and if `same_as` is given,
+    /// the candidates are also exactly those made with its tables.
+    fn candidates_match(t: &Tables, same_as: Option<&Tables>) {
         let (mut kept, mut total) = (0usize, 0usize);
-        for (cube, eps) in random_endpoints(&t, 12, 400, 11) {
+        for (cube, eps) in random_endpoints(t, 12, 400, 11) {
             let Some(l1) = eps.iter().map(|e| e.0.len()).min() else {
                 continue;
             };
@@ -2290,12 +2371,26 @@ mod tests {
                 for chunk in eps.chunks(37) {
                     make_candidates(&t.p2, &cube, chunk, limit, &mut new);
                 }
+                if let Some(u) = same_as {
+                    let mut other = vec![];
+                    for chunk in eps.chunks(64) {
+                        make_candidates(&u.p2, &cube, chunk, limit, &mut other);
+                    }
+                    assert_eq!(new.len(), other.len(), "limit {limit}");
+                    for (a, b) in new.iter().zip(&other) {
+                        assert_eq!(
+                            (a.moves1, a.frame, a.centre, a.tau, a.dt, a.df, a.h2),
+                            (b.moves1, b.frame, b.centre, b.tau, b.dt, b.df, b.h2),
+                            "limit {limit}"
+                        );
+                    }
+                }
                 let mut old = vec![];
                 for (moves1, frames) in &eps {
                     for frame in 0..3 {
                         if frames >> frame & 1 == 1 {
                             total += 1;
-                            old.extend(candidate_ref(&t, &cube, moves1, frame, limit));
+                            old.extend(candidate_ref(t, &cube, moves1, frame, limit));
                         }
                     }
                 }
@@ -2318,9 +2413,19 @@ mod tests {
     /// walk, with and without bounds.
     #[test]
     fn joint_walks_match_the_former_walk() {
+        joint_walks_match(&joint_tables());
+    }
+
+    /// The bounded distances read from the exact joint table match the former walk (down the
+    /// exact table's values mod 3).
+    #[test]
+    fn exact_distances_match_the_former_walk() {
+        joint_walks_match(&exact_tables());
+    }
+
+    fn joint_walks_match(t: &Tables) {
         use crate::phase2::P2_MOVES;
         use rand::Rng;
-        let t = joint_tables();
         let (p2, j) = (&t.p2, t.p2.joint.as_ref().unwrap());
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(3);
         let mut states = vec![];
@@ -2419,11 +2524,20 @@ mod tests {
     /// candidates of random cubes' phase-1 endpoints, all depths up to two past the bound.
     #[test]
     fn joint_search_finds_the_pairing_search_solutions() {
-        let t = joint_tables();
+        joint_search_matches(&joint_tables());
+    }
+
+    /// The same with the exact joint table (its values mod 3 guide the search).
+    #[test]
+    fn exact_joint_search_finds_the_pairing_search_solutions() {
+        joint_search_matches(&exact_tables());
+    }
+
+    fn joint_search_matches(t: &Tables) {
         let p2 = &t.p2;
         let (mut sols, mut searches, mut nodes_j, mut nodes_p) = (0usize, 0usize, 0u64, 0u64);
         let mut tighter = 0;
-        for (cube, eps) in random_endpoints(&t, 6, 40, 17) {
+        for (cube, eps) in random_endpoints(t, 6, 40, 17) {
             let mut cands = vec![];
             make_candidates(p2, &cube, &eps, usize::MAX, &mut cands);
             for c in cands.iter().step_by(3) {
@@ -2473,13 +2587,15 @@ mod tests {
         );
     }
 
-    /// Candidate construction timings (single thread), former and current, on phase-1
-    /// endpoints of random cubes at a few limits (L1 of the shortest endpoint + `extra`):
+    /// Candidate construction timings (single thread), former and current (walks down the
+    /// mod-3 joint table, and reads of the exact one), on phase-1 endpoints of random cubes at
+    /// a few limits (L1 of the shortest endpoint + `extra`):
     /// `cargo test --release candidate_timings -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn candidate_timings() {
         let t = joint_tables();
+        let te = exact_tables();
         let (p2, j) = (&t.p2, t.p2.joint.as_ref().unwrap());
         let sets = random_endpoints(&t, 40, 1000, 21);
         let n: usize = sets
@@ -2544,8 +2660,17 @@ mod tests {
             }
             let new = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
             assert_eq!(out.len(), kept);
+            let t0 = Instant::now();
+            let mut out = vec![];
+            for (cube, eps) in &sets {
+                for chunk in eps.chunks(32) {
+                    make_candidates(&te.p2, cube, chunk, lim(eps), &mut out);
+                }
+            }
+            let exact = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
+            assert_eq!(out.len(), kept);
             eprintln!(
-                "L1 + {extra:>2}: {kept:5} of {n} kept; us per candidate: former {old:.2}, now {new:.2}"
+                "L1 + {extra:>2}: {kept:5} of {n} kept; us per candidate: former {old:.2}, walks {new:.2}, exact table {exact:.2}"
             );
         }
     }
@@ -2785,7 +2910,7 @@ mod tests {
         use crate::phase2::P2_MOVES;
         let dir = std::path::Path::new("tables");
         let small = load_tables(dir, 3, 8, false);
-        let joint = load_tables_with(dir, 3, true, false, P1Extra::NONE, 8, false);
+        let joint = load_tables_with(dir, 3, JointTable::Mod3, false, P1Extra::NONE, 8, false);
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(12);
         let mut total = 0;
         for t in [&small, &joint] {
@@ -2966,7 +3091,7 @@ mod tests {
     #[test]
     fn split_phase2_gives_the_same_reductions() {
         let dir = std::path::Path::new("tables");
-        let t = load_tables_with(dir, 3, true, false, P1Extra::NONE, 8, false);
+        let t = load_tables_with(dir, 3, JointTable::Mod3, false, P1Extra::NONE, 8, false);
         let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(13);
         let mut total = 0;
         for _ in 0..3 {

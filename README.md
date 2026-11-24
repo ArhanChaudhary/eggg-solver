@@ -44,9 +44,9 @@ the default, `auto`, takes the largest tier that fits in a third of the physical
 | `small` | h48 h3 | 0.35 GB |
 | `medium` | h48 h5, joint phase 2 | 2.3 GB |
 | `large` | h48 h6, joint phase 2, phase-1 move masks, wing paths up to 6 (+7 reduced) | 5.13 GB |
-| `huge` | h48 h7, joint phase 2, phase-1 move masks, wing paths up to 7 | 8.45 GB |
-| `xl` | h48 h9, joint phase 2, phase-1 move masks, wing paths up to 7 | 19.85 GB |
-| `xxl` | h48 h11 (the largest), joint phase 2, phase-1 move masks, wing paths up to 7 | 65.45 GB |
+| `huge` | h48 h7, exact joint phase 2, phase-1 move masks, wing paths up to 7 | 9.5 GB |
+| `xl` | h48 h9, exact joint phase 2, phase-1 move masks, wing paths up to 7 | 20.9 GB |
+| `xxl` | h48 h11 (the largest), exact joint phase 2, phase-1 move masks, wing paths up to 7 | 66.5 GB |
 
 Beyond the tables a run needs a few hundred MB, and that does not grow with the run time:
 phase-1 endpoints become phase-2 candidates as they are found (only the few that can still
@@ -64,6 +64,21 @@ The tables: phase-1 centre staging (symmetry-reduced, 25 MB; `--p1-big`: 1.2 GB 
 reduction, faster lookups), phase-2 pairing permutation (60 MB; `--p2-joint`: the joint
 pairing x U/D centres x PLL parity table, 1.05 GB, far fewer phase-2 nodes), phase-3 H48
 (30 MB * 2^K for K edge-orientation bits, `--h48 K`). The three options override the tier.
+The joint table stores distances mod 3 (2 bits), so a state's distance is a walk down the
+table (~10 steps of several reads each); every phase-1 endpoint needs one or two such walks
+to become a phase-2 candidate (about 1% are kept), 12-20% of the phase-1 time in long runs.
+The huge and larger tiers hold its exact distances instead (`p2-joint-exact.tab`, 4 bits,
+2.1 GB, same index; `--p2-exact true|false` overrides the tier): one read per bound. It is
+made once from the mod-3 table, breadth-first (a neighbour of a state at distance d is at d + 1
+exactly when its mod-3 value says so), in 58 s on 48 threads with a peak of 3.3 GB; the
+distances go up to 14 and every entry agrees with the mod-3 table. Bounded distances of random
+states: 1046 ns per walk, 15.5 ns per read (x86, one thread); phase 2 reads the same table
+(its values mod 3; 1.3% more phase-2 CPU). The candidates are exactly the same. x86, 48
+threads: making a candidate 2.5 -> 0.37 thread-us per endpoint frame, 12-14% -> 2.4-2.6% of
+the phase-1 time, phase-1 nodes per second +14% (50 x 20 s, large tier with the exact table)
+and +19% (10 positions x 600 s, huge); lengths unchanged (38.44 = 38.44 at 20 s; 38.3 = 38.3
+at 600 s), as expected for a uniform speed-up in the logarithmic regime of long runs (+19% is a
+quarter of a doubling of the time).
 The larger phase-3 tables matter most with few threads, where phase 3 is a large share of
 the time (one thread: first solution after 6.2 s with `huge`, 1.4 s with `xl`, 0.5 s with
 `xxl`, on average); with many threads phase 1 dominates.
@@ -197,6 +212,27 @@ after 2 s, 38.8 / 39.1 after 60 s on two sets of 20 positions.)
   runs) on the ARM laptop (each under an exclusive benchmark lock), then `scripts/compare.py A B` for a before/after table and
   `scripts/paired.py A.json B.json` for a per-position paired comparison (runs of one build
   reproduce per-position lengths, so small differences are measurable).
+- Long runs (`scripts/erate.py`): a 20-position run of 10 minutes improves only ~5 times after
+  10 s, so paired final lengths cannot resolve effects under ~2x. Each phase-2 solution of
+  total length L12 found at best length B is a draw that wins if its optimal phase 3 has at
+  most B - 1 - L12 moves, distributed like the distance of a random 3x3 position (P(<= 17) =
+  0.305, P(<= 18) = 0.965; the table in the script, from Rokicki et al. / cube20.org), so the
+  run's expected improvements are E = sum over rounds of 1 - exp(-(sum of solutions x
+  P(3x3 distance <= B - 1 - L12))) (several successes in one round make one improvement;
+  `--raw`: without that). `EGGG_DEBUG=1 eggg-solver bench ... 2> X.trace` writes the trace (its
+  `P2 start`, `P2LEVEL <L12>: ... seen <N> best <B>` and `IMPROVE` lines are used;
+  `scripts/x86-long.sh` writes `$EGGG_TRACE_DIR/NAME.trace` when that is set);
+  `scripts/erate.py X.trace` prints E and the observed improvements per position and time
+  window, `scripts/erate.py --pair A.trace B.trace` the E each run gathered while both had
+  the same best (same positions, same wall time: a run that improves sooner faces a harder
+  target afterwards), the ratio B/A with a bootstrap interval over positions, and the
+  geometric mean of the per-position ratios (`--from S`, default 10 s, `--to S`). Two master
+  runs of 20 x 600 s (x86): B/A 1.000 (90% interval 0.95-1.05), where their final lengths
+  could not resolve 2x. In 20-s runs it is much noisier (±15-25%: few rounds at a settled
+  best); use the paired lengths there. E is calibrated loosely: the improvements observed
+  after 10 s in six long runs (300-600 s, 32 improvements) were 0.69 of it (0.5-1.1 per run;
+  the solutions of one candidate are correlated), between 2 and 20 s in two 50 x 20 s runs
+  1.04 (59 improvements).
 - Profile-guided builds (LLVM PGO): `scripts/pgo-build.sh x86|m2 LABEL REF` (an instrumented
   build, a one-minute training run on the machine the binary is for, `llvm-profdata` from the
   toolchain's `llvm-tools` component, and the release build with the profile; per commit).
@@ -204,5 +240,7 @@ after 2 s, 38.8 / 39.1 after 60 s on two sets of 20 positions.)
   plain build; the final lengths of the 50-position suites did not change.
 - `examples/` holds deterministic checks used during optimisation: `p1check` (phase-1
   endpoint hash and node count), `p2jcheck` (joint-table admissibility), `p2cost` (phase-2
-  nodes and CPU time per solution, by depth above the bound), `p3check`,
+  nodes and CPU time per solution, by depth above the bound), `p2exact` (bounded joint
+  distances read from the exact table against walks down the mod-3 one, and their times;
+  makes the exact table if missing), `p3check`,
   `p3nodes` and `p3tasks` (phase-3 bounds, node counts and task splitting).

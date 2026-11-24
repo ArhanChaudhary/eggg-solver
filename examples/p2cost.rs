@@ -10,7 +10,7 @@ use eggg_solver::cube::Cube;
 use eggg_solver::moves::{ALLOWED_AFTER, MOVE_PERMS, N_MOVES};
 use eggg_solver::phase1::{P1State, Search1};
 use eggg_solver::phase2::{Search2, standardise};
-use eggg_solver::solver::{load_p1, load_p2};
+use eggg_solver::solver::{JointTable, load_p1, load_p2};
 use rand::SeedableRng;
 
 fn cpu_now() -> f64 {
@@ -40,7 +40,13 @@ fn main() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| "tables".into());
     let p1 = load_p1(&dir, false, 4, false);
-    let p2 = &load_p2(&dir, true, 4, false);
+    // EGGG_P2_EXACT=1: the exact joint table (same nodes; the reads differ).
+    let joint = if std::env::var_os("EGGG_P2_EXACT").is_some() {
+        JointTable::Exact
+    } else {
+        JointTable::Mod3
+    };
+    let p2 = &load_p2(&dir, joint, 4, false);
     let j = p2.joint.as_ref().unwrap();
     let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(seed);
     // (standardised cube, centre coordinate, tau) of each candidate.
