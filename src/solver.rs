@@ -51,20 +51,38 @@ const MIN_ROUND: Duration = Duration::from_millis(20);
 /// ~5 ms to 1.5 s on the M2, the others less than a millisecond (see `Run::phase2_level`).
 const P2_SPLIT_SLACK: u8 = 3;
 
-/// Experimental schedule knobs (environment, read once per solve; see `Knobs::from_env`).
+/// Long runs: from `ADAPT_FROM` seconds on, after each round, the phase-2 margin goes one
+/// level deeper (down to `MIN_MARGIN`) while 16x the share of phases 2 and 3 in the latest
+/// rounds is below `ADAPT_SHARE`; from then on phase 2 has no reduction budget, and a round's
+/// phase 2 stops after `P2_ROUND_TIME` times its phase 1 (see `Run::adapt`).
+///
+/// Each deeper level has ~13x the phase-2 solutions of the one above, each ~13x less likely to
+/// have a short enough phase 3, so it adds as much chance as each level above it (measured:
+/// the expected improvements per level, solutions x P(optimal 3x3 <= best - 1 - L12), are
+/// equal to within 5%), for ~13x the phase-2 work. After a minute on 48 threads phases 2 and
+/// 3 took 0.1-0.5% of the time at margin 13, so two more levels (12, 11) add ~40% more chance
+/// per round for ~1-3% of the time.
+const ADAPT_FROM: f64 = 20.0;
+const ADAPT_SHARE: f64 = 0.25;
+const MIN_MARGIN: usize = 11;
+const P2_ROUND_TIME: f64 = 1.0;
+
+/// The long-run schedule: the constants above, which the environment can override for
+/// experiments (read once per solve; see `Knobs::from_env`).
 #[derive(Clone, Debug)]
 struct Knobs {
     /// (seconds, margin): the phase-2 margin from that time on (`EGGG_MARGINS=0:15,3:14`).
     margins: Vec<(f64, usize)>,
-    /// From this time on (seconds), phase 2 has no reduction budget (`EGGG_P2_FREE`).
+    /// From this time on (seconds), phase 2 has no reduction budget (`EGGG_P2_FREE`, default
+    /// `ADAPT_FROM`).
     p2_free: f64,
     /// From `p2_free` on, a round's phase 2 stops after this multiple of its phase-1 time
-    /// (`EGGG_P2_TIME`).
+    /// (`EGGG_P2_TIME`, default `P2_ROUND_TIME`).
     p2_time: f64,
-    /// Adaptive margin (`EGGG_ADAPT`, off if infinite): from `adapt_from` seconds on
-    /// (`EGGG_ADAPT_FROM`, default 20), the margin goes one deeper (down to `margin_min`,
-    /// `EGGG_MARGIN_MIN`, default 10) when 16x the share of phases 2 and 3 in the time since
-    /// the last change is below this; candidates are kept one level below the margin.
+    /// Adaptive margin (`EGGG_ADAPT`, default `ADAPT_SHARE`, `inf`: off): from `adapt_from`
+    /// seconds on (`EGGG_ADAPT_FROM`), the margin goes one deeper (down to `margin_min`,
+    /// `EGGG_MARGIN_MIN`) when 16x the share of phases 2 and 3 in the latest rounds is below
+    /// this.
     adapt: f64,
     adapt_from: f64,
     margin_min: usize,
@@ -72,11 +90,11 @@ struct Knobs {
 
 impl Knobs {
     fn from_env() -> Self {
-        let num = |k: &str| {
+        let num = |k: &str, default: f64| {
             std::env::var(k)
                 .ok()
                 .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(f64::INFINITY)
+                .unwrap_or(default)
         };
         let margins = std::env::var("EGGG_MARGINS")
             .ok()
@@ -91,17 +109,14 @@ impl Knobs {
             .unwrap_or_else(|| vec![(0.0, 15), (3.0, 14), (6.0, DEEPEST_MARGIN)]);
         Knobs {
             margins,
-            p2_free: num("EGGG_P2_FREE"),
-            p2_time: num("EGGG_P2_TIME"),
-            adapt: num("EGGG_ADAPT"),
-            adapt_from: std::env::var("EGGG_ADAPT_FROM")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(20.0),
+            p2_free: num("EGGG_P2_FREE", ADAPT_FROM),
+            p2_time: num("EGGG_P2_TIME", P2_ROUND_TIME),
+            adapt: num("EGGG_ADAPT", ADAPT_SHARE),
+            adapt_from: num("EGGG_ADAPT_FROM", ADAPT_FROM),
             margin_min: std::env::var("EGGG_MARGIN_MIN")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(10),
+                .unwrap_or(MIN_MARGIN),
         }
     }
 
