@@ -449,7 +449,41 @@ fn options(limits: &LimitArgs, search: &SearchArgs, threads: usize) -> Options {
         reductions: search.reductions,
         order_jobs: !search.no_job_order,
         ties: search.ties,
+        pool_budget: pool_budget(),
     }
+}
+
+/// Memory for the solver's candidate and reduction pools, once the tables are loaded: half of
+/// the memory available beyond 8 GB of headroom, at least 1 GB. Available: Linux's
+/// MemAvailable, else a quarter of the physical memory; `EGGG_PHYS_GB=N` sizes it as on a
+/// machine with N GB (N GB less this process and 4 GB of other use).
+fn pool_budget() -> usize {
+    const GB: f64 = (1u64 << 30) as f64;
+    // SAFETY: sysconf has no preconditions.
+    let ram = unsafe {
+        libc::sysconf(libc::_SC_PHYS_PAGES) as f64 * libc::sysconf(libc::_SC_PAGESIZE) as f64
+    };
+    let kb = |key: &str, text: &str| {
+        text.lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v * 1024.0)
+    };
+    let avail = match std::env::var("EGGG_PHYS_GB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        Some(n) => {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+            n * GB - kb("VmRSS:", &status).unwrap_or(0.0) - 4.0 * GB
+        }
+        None => std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|m| kb("MemAvailable:", &m))
+            .unwrap_or(ram / 4.0),
+    };
+    ((avail - 8.0 * GB) / 2.0).max(GB) as usize
 }
 
 fn solve_one(
