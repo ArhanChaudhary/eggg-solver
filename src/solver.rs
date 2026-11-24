@@ -3127,3 +3127,512 @@ mod tests {
         }
     }
 }
+
+/// Coverage audit: every reduction must be produced. A random reduction sequence `w` (a
+/// uniformly random canonical sequence ending in a wide move) of a position `P = R w^-1` (`R`
+/// reduced) is split per frame as the solver splits it, and phase 1 (from a prefix, as the
+/// driver's jobs), the candidate and phase 2 must each produce their part.
+#[cfg(test)]
+mod coverage {
+    use super::*;
+    use crate::moves::inverse_move;
+    use rand::{Rng, SeedableRng};
+
+    pub(super) fn audit_tables() -> Tables {
+        let dir = std::env::var_os("EGGG_TABLES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "tables".into());
+        let wing_k = std::env::var("EGGG_COV_WINGK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(WINGK);
+        let mask = std::env::var_os("EGGG_COV_NOMASK")
+            .is_none()
+            .then_some(false);
+        load_tables_with(
+            &dir,
+            0,
+            true,
+            false,
+            P1Extra {
+                pat: None,
+                mask,
+                wing_k: if mask.is_some() { wing_k } else { 0 },
+            },
+            8,
+            false,
+        )
+    }
+
+    /// cnt[k][last]: canonical continuations of k moves after `last` (`N_MOVES`: none).
+    pub(super) fn completions(n: usize) -> Vec<[f64; N_MOVES + 1]> {
+        let mut cnt = vec![[1.0; N_MOVES + 1]];
+        for k in 1..=n {
+            let prev = cnt[k - 1];
+            cnt.push(std::array::from_fn(|last| {
+                let mut a = ALLOWED_AFTER[last];
+                let mut s = 0.0;
+                while a != 0 {
+                    let m = a.trailing_zeros() as usize;
+                    a &= a - 1;
+                    s += prev[m];
+                }
+                s
+            }));
+        }
+        cnt
+    }
+
+    /// A uniformly random canonical sequence of `n` moves whose last same-axis run is one wide
+    /// move (no outer move to leave to phase 3).
+    pub(super) fn random_reduction(
+        rng: &mut impl Rng,
+        cnt: &[[f64; N_MOVES + 1]],
+        n: usize,
+    ) -> Vec<u8> {
+        loop {
+            let mut w = Vec::with_capacity(n);
+            let mut last = N_MOVES;
+            for k in (0..n).rev() {
+                let mut x = rng.r#gen::<f64>() * cnt[k + 1][last];
+                let mut a = ALLOWED_AFTER[last];
+                let mut pick = N_MOVES;
+                while a != 0 {
+                    let m = a.trailing_zeros() as usize;
+                    a &= a - 1;
+                    pick = m;
+                    x -= cnt[k][m];
+                    if x < 0.0 {
+                        break;
+                    }
+                }
+                w.push(pick as u8);
+                last = pick;
+            }
+            let lm = *w.last().unwrap();
+            let axis = (lm / 3) % 3;
+            let run_outer = w
+                .iter()
+                .rev()
+                .take_while(|&&m| (m / 3) % 3 == axis)
+                .any(|&m| m < 18);
+            if lm >= 18 && !run_outer {
+                return w;
+            }
+        }
+    }
+
+    /// The solver's split of reduction `w` in a frame with phase-2 moves `p2_mask`: phase 1
+    /// up to the same-axis run holding the last non-phase-2 move, without that run's phase-2
+    /// moves (they open phase 2).
+    pub(super) fn split(w: &[u8], p2_mask: u32) -> Option<(Vec<u8>, Vec<u8>)> {
+        let j = w.iter().rposition(|&m| p2_mask >> m & 1 == 0)?;
+        let axis = (w[j] / 3) % 3;
+        let same = |m: u8| (m / 3) % 3 == axis;
+        let mut i = j;
+        while i > 0 && same(w[i - 1]) {
+            i -= 1;
+        }
+        let mut e = j;
+        while e + 1 < w.len() && same(w[e + 1]) {
+            e += 1;
+        }
+        let mut s1 = w[..i].to_vec();
+        let mut s2 = vec![];
+        for &m in &w[i..=e] {
+            if p2_mask >> m & 1 == 0 {
+                s1.push(m);
+            } else {
+                s2.push(m);
+            }
+        }
+        s2.extend_from_slice(&w[e + 1..]);
+        Some((s1, s2))
+    }
+
+    /// A random reduced cube in a random orientation.
+    pub(super) fn random_reduced(rng: &mut impl Rng) -> Cube {
+        let mut c = Cube::SOLVED;
+        for _ in 0..40 {
+            c = c.apply_perm(&MOVE_PERMS[rng.gen_range(0..18)]);
+        }
+        let rots = &*crate::cube::ROTATIONS;
+        crate::moves::Conj::new(rots[rng.gen_range(0..rots.len())]).recolour(&c)
+    }
+
+    #[derive(Default, Debug)]
+    pub(super) struct Tally {
+        pub cases: usize,
+        /// Phase-2 checks skipped: more than `EGGG_COV_SLACK2` moves above the bound.
+        pub skipped: usize,
+        pub pred: usize,
+        pub p1: usize,
+        pub cand: usize,
+        pub h2: usize,
+        pub p2: usize,
+        pub dup: usize,
+        pub ok: usize,
+        pub by_l2_miss: HashMap<(usize, usize), (usize, usize)>,
+        pub examples: Vec<String>,
+    }
+
+    /// Checks reduction `w` of `cube` in `frame`: phase 1 searched from the prefix of all but
+    /// `k` of its moves. Returns false on a miss (recorded in `tally`).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn check(
+        t: &Tables,
+        cube: &Cube,
+        w: &[u8],
+        frame: usize,
+        k: usize,
+        smax: usize,
+        slack2: usize,
+        tally: &mut Tally,
+    ) -> bool {
+        let Some((s1, s2)) = split(w, t.p1.frames[frame].p2_mask) else {
+            return true;
+        };
+        if s1.is_empty() {
+            return true;
+        }
+        tally.cases += 1;
+        let key = (s1.len(), s2.len());
+        tally.by_l2_miss.entry(key).or_default().0 += 1;
+        let miss = |tally: &mut Tally, what: &str| {
+            tally.by_l2_miss.entry(key).or_default().1 += 1;
+            if tally.examples.len() < 40 {
+                tally
+                    .examples
+                    .push(format!("{what}: frame {frame} w {w:?} s1 {s1:?} s2 {s2:?}"));
+            }
+            false
+        };
+        // The endpoint test itself.
+        let x1 = s1
+            .iter()
+            .fold(*cube, |c, &m| c.apply_perm(&MOVE_PERMS[m as usize]));
+        let st1 = P1State::from_cube(&x1);
+        if t.p1.endpoint_frames(&st1, crate::phase1::trailing_run(&s1)) >> frame & 1 == 0 {
+            tally.pred += 1;
+            return miss(tally, "endpoint predicate");
+        }
+        // Phase 1 from a prefix, as a driver job (p1_run, then the search): the shortest
+        // prefix leaving at most `k` moves with at most `smax` moves of slack (moves left
+        // minus staging distance; it never grows along a path), so the search stays small.
+        let pair = crate::phase1::ALL_PAIRS;
+        let root = P1State::from_cube(cube);
+        let d0 = t.p1.distance_pair(&root, pair);
+        let mut ds = vec![d0];
+        let mut x = root;
+        for &m in &s1 {
+            x = x.apply(m as usize, &t.p1);
+            ds.push(Mod3Table::decode(
+                ds[ds.len() - 1],
+                t.p1.value_pair(&x, pair),
+            ));
+        }
+        let n1 = s1.len();
+        let start = (0..=n1)
+            .find(|&i| n1 - i <= k && (n1 - i) <= ds[i] as usize + smax)
+            .unwrap();
+        let kk = n1 - start;
+        let prefix = &s1[..start];
+        let (st, d) = root.after_pair(prefix, d0, &t.p1, pair);
+        debug_assert_eq!(d, ds[start]);
+        let mut found = false;
+        let mut times = 0;
+        {
+            let mut srch = Search1::new(&t.p1, |p: &[u8], f| {
+                if p == &s1[..] && f >> frame & 1 == 1 {
+                    found = true;
+                    times += 1;
+                }
+                true
+            });
+            srch.pair = pair;
+            srch.path.extend_from_slice(prefix);
+            let last = prefix.last().map(|&m| m as usize).unwrap_or(N_MOVES);
+            let close = Close::new(None);
+            let mut spill = vec![];
+            p1_run(&mut srch, &st, d, kk as u8, last, 2, &close, &mut spill);
+            assert!(spill.is_empty());
+        }
+        if !found {
+            tally.p1 += 1;
+            return miss(tally, "phase 1");
+        }
+        // The candidate.
+        let mut out = vec![];
+        make_candidates(&t.p2, cube, &[(s1.clone(), 1 << frame)], w.len(), &mut out);
+        let Some(c) = out.pop() else {
+            tally.cand += 1;
+            return miss(tally, "candidate");
+        };
+        if c.h2 as usize > s2.len() {
+            tally.h2 += 1;
+            return miss(tally, "h2 above the phase-2 length");
+        }
+        if s2.len() > c.h2 as usize + slack2 {
+            tally.skipped += 1;
+            tally.ok += 1;
+            return true;
+        }
+        // Phase 2 of exactly |s2| moves.
+        let (rot, last1, first) = phase2_root(&c);
+        let rot_inv = transpose(&rot);
+        let mut hits = 0;
+        let mut srch = Search2::new(&t.p2);
+        srch.dfs_joint(
+            c.centre,
+            &c.tau,
+            c.dt,
+            c.df,
+            s2.len() as u8,
+            last1,
+            first,
+            &mut |p| {
+                let q: Vec<u8> = p
+                    .iter()
+                    .map(|&m| rotate_move(m as usize, &rot_inv) as u8)
+                    .collect();
+                if q == s2 {
+                    hits += 1;
+                }
+                true
+            },
+        );
+        if hits == 0 {
+            tally.p2 += 1;
+            return miss(tally, "phase 2");
+        }
+        if hits > 1 || times > 1 {
+            tally.dup += 1;
+        }
+        tally.ok += 1;
+        true
+    }
+
+    /// Run the audit: `EGGG_COV_N` reductions (default 2000) of lengths 12..=`EGGG_COV_T`
+    /// (default 20), phase 1 from the prefix of all but `EGGG_COV_K` moves (default 10).
+    #[test]
+    #[ignore]
+    fn coverage_audit() {
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(d)
+        };
+        let (n, tmax, k, smax) = (
+            env("EGGG_COV_N", 2000),
+            env("EGGG_COV_T", 20),
+            env("EGGG_COV_K", 10),
+            env("EGGG_COV_S", 3),
+        );
+        // Only frames whose phase 2 has at least `EGGG_COV_MINL2` moves (reductions drawn
+        // until one has), with phase-2 checks at most `EGGG_COV_SLACK2` above the bound.
+        let (min_l2, slack2) = (env("EGGG_COV_MINL2", 0), env("EGGG_COV_SLACK2", usize::MAX));
+        let t = audit_tables();
+        let cnt = completions(tmax + 1);
+        let mut rng =
+            rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(env("EGGG_COV_SEED", 1) as u64);
+        let mut tally = Tally::default();
+        let t0 = Instant::now();
+        let secs = env("EGGG_COV_SECS", usize::MAX) as f64;
+        for i in 0..n {
+            if t0.elapsed().as_secs_f64() > secs {
+                eprintln!("deadline after {i} reductions");
+                break;
+            }
+            let (w, frames) = loop {
+                let len = rng.gen_range(12..=tmax);
+                let w = random_reduction(&mut rng, &cnt, len);
+                let frames: Vec<usize> = (0..3)
+                    .filter(|&f| {
+                        split(&w, t.p1.frames[f].p2_mask)
+                            .is_some_and(|(s1, s2)| !s1.is_empty() && s2.len() >= min_l2)
+                    })
+                    .collect();
+                if !frames.is_empty() {
+                    break (w, frames);
+                }
+            };
+            let r = random_reduced(&mut rng);
+            let cube = w.iter().rev().fold(r, |c, &m| {
+                c.apply_perm(&MOVE_PERMS[inverse_move(m as usize)])
+            });
+            debug_assert_eq!(
+                w.iter()
+                    .fold(cube, |c, &m| c.apply_perm(&MOVE_PERMS[m as usize])),
+                r
+            );
+            for &frame in &frames {
+                check(&t, &cube, &w, frame, k, smax, slack2, &mut tally);
+            }
+            if (i + 1) % 20 == 0 {
+                eprintln!(
+                    "{} reductions, {:.1} s: cases {} ok {} (phase 2 skipped {}) | misses: predicate {} phase1 {} candidate {} h2 {} phase2 {} | dup {}",
+                    i + 1,
+                    t0.elapsed().as_secs_f64(),
+                    tally.cases,
+                    tally.ok,
+                    tally.skipped,
+                    tally.pred,
+                    tally.p1,
+                    tally.cand,
+                    tally.h2,
+                    tally.p2,
+                    tally.dup
+                );
+            }
+        }
+        let mut keys: Vec<_> = tally.by_l2_miss.iter().collect();
+        keys.sort();
+        for ((l1, l2), (n, m)) in keys {
+            if *m > 0 {
+                eprintln!("L1 {l1} L2 {l2}: {m} of {n} missed");
+            }
+        }
+        for e in &tally.examples {
+            eprintln!("{e}");
+        }
+        eprintln!("{tally:?}");
+        assert_eq!(tally.ok, tally.cases, "missed reductions");
+    }
+
+    /// Every reduction of a few random positions built around a known reduction is produced,
+    /// in every frame (a quick version of [`coverage_audit`]).
+    #[test]
+    fn random_reductions_are_produced() {
+        let t = audit_tables();
+        let cnt = completions(19);
+        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(42);
+        let mut tally = Tally::default();
+        for _ in 0..40 {
+            let len = rng.gen_range(10..=18);
+            let w = random_reduction(&mut rng, &cnt, len);
+            let r = random_reduced(&mut rng);
+            let cube = w.iter().rev().fold(r, |c, &m| {
+                c.apply_perm(&MOVE_PERMS[inverse_move(m as usize)])
+            });
+            for frame in 0..3 {
+                check(&t, &cube, &w, frame, 9, 2, usize::MAX, &mut tally);
+            }
+        }
+        assert!(tally.cases > 60, "{tally:?}");
+        assert_eq!(tally.ok, tally.cases, "{:?}", tally.examples);
+    }
+
+    /// Exhaustive counts on random positions (no driver caps): per position, the phase-1
+    /// endpoints (with frames) of each length up to `EGGG_COV_X1` (default 15) and the phase-2
+    /// solutions of every candidate at every total length up to `EGGG_COV_X12` (default 24),
+    /// by (L12, L1). `EGGG_COV_POS` positions (default 96) on `EGGG_COV_THREADS` threads.
+    #[test]
+    #[ignore]
+    fn coverage_counts() {
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(d)
+        };
+        let (npos, x1, x12, threads) = (
+            env("EGGG_COV_POS", 96),
+            env("EGGG_COV_X1", 15),
+            env("EGGG_COV_X12", 24),
+            env("EGGG_COV_THREADS", 48),
+        );
+        let t = audit_tables();
+        let mut rng =
+            rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(env("EGGG_COV_SEED", 7) as u64);
+        let cubes: Vec<Cube> = (0..npos).map(|_| Cube::random(&mut rng)).collect();
+        let next = AtomicUsize::new(0);
+        let out = Mutex::new(());
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= cubes.len() {
+                            break;
+                        }
+                        let cube = &cubes[i];
+                        let root = P1State::from_cube(cube);
+                        let d0 = t.p1.distance(&root);
+                        let mut eps_n = vec![0u64; x1 + 1];
+                        let mut cands = vec![];
+                        for len in d0.max(1) as usize..=x1 {
+                            let mut buf: Vec<(Vec<u8>, u8)> = vec![];
+                            let mut n = 0u64;
+                            let mut srch = Search1::new(&t.p1, |p: &[u8], f| {
+                                n += f.count_ones() as u64;
+                                buf.push((p.to_vec(), f));
+                                if buf.len() == 4096 {
+                                    make_candidates(&t.p2, cube, &buf, x12, &mut cands);
+                                    buf.clear();
+                                }
+                                true
+                            });
+                            srch.dfs(&root, d0, len as u8, N_MOVES);
+                            drop(srch);
+                            make_candidates(&t.p2, cube, &buf, x12, &mut cands);
+                            eps_n[len] = n;
+                        }
+                        // (L12, L1) -> solutions
+                        let mut sols: std::collections::BTreeMap<(usize, usize), u64> =
+                            Default::default();
+                        // L12 -> (candidates with a solution, most solutions of one)
+                        let mut top: std::collections::BTreeMap<usize, (u64, u64)> =
+                            Default::default();
+                        for c in &cands {
+                            let l1 = c.moves1.len();
+                            let (_, last1, first) = phase2_root(c);
+                            for l2 in c.h2 as usize..=x12 - l1 {
+                                let mut k = 0u64;
+                                let mut srch = Search2::new(&t.p2);
+                                srch.dfs_joint(
+                                    c.centre,
+                                    &c.tau,
+                                    c.dt,
+                                    c.df,
+                                    l2 as u8,
+                                    last1,
+                                    first,
+                                    &mut |_| {
+                                        k += 1;
+                                        true
+                                    },
+                                );
+                                if k > 0 {
+                                    *sols.entry((l1 + l2, l1)).or_default() += k;
+                                    let e = top.entry(l1 + l2).or_insert((0u64, 0u64));
+                                    e.0 += 1;
+                                    e.1 = e.1.max(k);
+                                }
+                            }
+                        }
+                        let _g = out.lock().unwrap();
+                        let e: Vec<String> = (1..=x1)
+                            .filter(|&l| eps_n[l] > 0)
+                            .map(|l| format!("{l}:{}", eps_n[l]))
+                            .collect();
+                        let so: Vec<String> = sols
+                            .iter()
+                            .map(|((x, l), n)| format!("{x}:{l}:{n}"))
+                            .collect();
+                        let tp: Vec<String> = top
+                            .iter()
+                            .map(|(x, (n, m))| format!("{x}:{n}:{m}"))
+                            .collect();
+                        println!(
+                            "POS {i} d0 {d0} eps {} sols {} top {}",
+                            e.join(","),
+                            so.join(","),
+                            tp.join(",")
+                        );
+                    }
+                });
+            }
+        });
+    }
+}
