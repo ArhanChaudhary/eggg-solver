@@ -73,7 +73,12 @@ made once from the mod-3 table, breadth-first (a neighbour of a state at distanc
 exactly when its mod-3 value says so), in 58 s on 48 threads with a peak of 3.3 GB; the
 distances go up to 14 and every entry agrees with the mod-3 table. Bounded distances of random
 states: 1046 ns per walk, 15.5 ns per read (x86, one thread); phase 2 reads the same table
-(its values mod 3).
+(its values mod 3; 1.3% more phase-2 CPU). The candidates are exactly the same. x86, 48
+threads: making a candidate 2.5 -> 0.37 thread-us per endpoint frame, 12-14% -> 2.4-2.6% of
+the phase-1 time, phase-1 nodes per second +14% (50 x 20 s, large tier with the exact table)
+and +19% (10 positions x 600 s, huge); lengths unchanged (38.44 = 38.44 at 20 s; 38.3 = 38.3
+at 600 s), as expected for a uniform speed-up in the logarithmic regime of long runs (+19% is a
+quarter of a doubling of the time).
 The larger phase-3 tables matter most with few threads, where phase 3 is a large share of
 the time (one thread: first solution after 6.2 s with `huge`, 1.4 s with `xl`, 0.5 s with
 `xxl`, on average); with many threads phase 1 dominates.
