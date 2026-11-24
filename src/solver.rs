@@ -61,10 +61,12 @@ const P2_SPLIT_SLACK: u8 = 3;
 /// the expected improvements per level, solutions x P(optimal 3x3 <= best - 1 - L12), are
 /// equal to within 5%), for ~13x the phase-2 work. After a minute on 48 threads phases 2 and
 /// 3 took 0.1-0.5% of the time at margin 13, so two more levels (12, 11) add ~40% more chance
-/// per round for ~1-3% of the time.
+/// per round for ~1-3% of the time; in runs of 10 minutes or more, margin 10 (the candidates
+/// of each level are ~14x those of the level above: the pools are bounded by
+/// `Options::pool_budget`).
 const ADAPT_FROM: f64 = 20.0;
 const ADAPT_SHARE: f64 = 0.25;
-const MIN_MARGIN: usize = 11;
+const MIN_MARGIN: usize = 10;
 const P2_ROUND_TIME: f64 = 1.0;
 
 /// The long-run schedule: the constants above, which the environment can override for
@@ -161,6 +163,10 @@ pub struct Options {
     /// (identical move sequences are reported once). The best solution stays the first one
     /// of its length.
     pub ties: bool,
+    /// Memory for the candidate and reduction pools (bytes): a round's phase 1 stops once
+    /// they would outgrow it, and searched candidates are only kept for a deeper margin while
+    /// they take at most half of it (see `Run::adapt`).
+    pub pool_budget: usize,
 }
 
 impl Default for Options {
@@ -174,6 +180,7 @@ impl Default for Options {
             reductions: 32,
             order_jobs: true,
             ties: false,
+            pool_budget: 4 << 30,
         }
     }
 }
@@ -650,6 +657,8 @@ struct Run<'a, 'r> {
     lvl_kept: usize,
     lvl_start: f64,
     prev_lvl_nodes: u64,
+    /// See [`Options::pool_budget`].
+    pool_budget: usize,
 }
 
 impl<'a> Solver<'a> {
@@ -734,6 +743,7 @@ impl<'a> Solver<'a> {
             lvl_kept: 0,
             lvl_start: 0.0,
             prev_lvl_nodes: 0,
+            pool_budget: self.opts.pool_budget,
         };
         run.level.jobs = run.level_jobs(len0);
         std::thread::scope(|scope| {
@@ -793,6 +803,12 @@ impl<'a, 'r> Run<'a, 'r> {
         let (mut want1, mut want2) = (endpoints, reductions);
         // Time spent producing reductions (phases 1 and 2) and checking them (phase 3).
         let (mut produce, mut check) = (Duration::ZERO, Duration::ZERO);
+        // After the margin goes deeper, the next round skips phase 1: its phase 2 searches the
+        // new level of every candidate kept for it at once, instead of after a whole round of
+        // phase 1 (a quarter of the time elapsed).
+        let mut catch_up = false;
+        // The latest round's phase-1 time.
+        let mut last_p1 = Duration::ZERO;
         loop {
             if self.stopped() {
                 return;
@@ -818,7 +834,10 @@ impl<'a, 'r> Run<'a, 'r> {
             let tp = Instant::now();
             let (eps0, nodes0, kept0) = (self.made_cands, self.stats.nodes1, self.cands.len());
             let len0 = self.level.len;
-            self.phase1(want1);
+            if !catch_up {
+                self.phase1(want1);
+                last_p1 = tp.elapsed();
+            }
             self.stats.time[0] += tp.elapsed();
             if self.trace {
                 let now = self.start.elapsed().as_secs_f64();
@@ -827,7 +846,7 @@ impl<'a, 'r> Run<'a, 'r> {
                     .map(|c| c.saturating_duration_since(t0).as_secs_f64())
                     .unwrap_or(-1.0);
                 eprintln!(
-                    "[{now:8.3}] ROUND {} best {} p1 {:.3} s (cut {:.3}) levels {}..{} round nodes {:.3e} eps {} kept {} | level {} nodes {:.3e} (prev level {:.3e}) jobs {}/{} want1 {}",
+                    "[{now:8.3}] ROUND {} best {} p1 {:.3} s (cut {:.3}) levels {}..{} round nodes {:.3e} eps {} kept {} | level {} nodes {:.3e} (prev level {:.3e}) jobs {}/{} want1 {} pool {:.0}/{:.0} MB{}",
                     self.stats.rounds,
                     self.best_len(),
                     tp.elapsed().as_secs_f64(),
@@ -842,7 +861,10 @@ impl<'a, 'r> Run<'a, 'r> {
                     self.prev_lvl_nodes as f64,
                     self.level.next,
                     self.level.jobs.len(),
-                    want1
+                    want1,
+                    self.pool_bytes() as f64 / 1e6,
+                    self.pool_budget as f64 / 1e6,
+                    if catch_up { " (catch-up)" } else { "" }
                 );
             }
             debug(
@@ -868,7 +890,7 @@ impl<'a, 'r> Run<'a, 'r> {
                 && self.knobs.p2_time.is_finite()
                 && self.start.elapsed().as_secs_f64() >= self.knobs.p2_free
             {
-                let p1 = t0.elapsed().mul_f64(self.knobs.p2_time);
+                let p1 = if catch_up { last_p1 } else { t0.elapsed() }.mul_f64(self.knobs.p2_time);
                 let at = Instant::now() + p1;
                 self.p2_cut = Some(self.p2_cut.map_or(at, |c| c.min(at)));
             }
@@ -897,12 +919,15 @@ impl<'a, 'r> Run<'a, 'r> {
             self.phase3_levels(t1 + budget);
             self.stats.time[2] += t1.elapsed();
             check += t1.elapsed();
-            self.adapt(t1.elapsed() + p2_round);
+            let deeper = self.adapt(t1.elapsed() + p2_round);
             if std::env::var_os("EGGG_MEM").is_some() {
                 self.mem_report();
             }
             if self.stopped() || self.level.len > 40 {
                 return;
+            }
+            if std::mem::replace(&mut catch_up, deeper) {
+                continue;
             }
             want1 = want1.saturating_mul(2);
             want2 = want2.saturating_mul(2);
@@ -913,7 +938,7 @@ impl<'a, 'r> Run<'a, 'r> {
     /// phase-2 and 3 time). The share of phases 2 and 3 is measured over the rounds since the
     /// last change, except the first one (which catches up with the new level), and over at
     /// least `ADAPT_WINDOW` of the time elapsed (about one round).
-    fn adapt(&mut self, p23: Duration) {
+    fn adapt(&mut self, p23: Duration) -> bool {
         const ADAPT_WINDOW: f64 = 0.15;
         let k = &self.knobs;
         let elapsed = self.start.elapsed().as_secs_f64();
@@ -923,18 +948,18 @@ impl<'a, 'r> Run<'a, 'r> {
             || self.margin_now() <= k.margin_min
             || self.margin_now() > k.deepest()
         {
-            return;
+            return false;
         }
         let Some(at) = self.adapt_at else {
             // The window starts after this round.
             self.adapt_at = Some(elapsed);
             self.adapt_p23 = Duration::ZERO;
-            return;
+            return false;
         };
         self.adapt_p23 += p23;
         let since = elapsed - at;
         if since < ADAPT_WINDOW * elapsed {
-            return;
+            return false;
         }
         let share = self.adapt_p23.as_secs_f64() / since.max(1e-9);
         if 16.0 * share < k.adapt {
@@ -948,11 +973,13 @@ impl<'a, 'r> Run<'a, 'r> {
                 );
             }
             self.adapt_at = None;
+            true
         } else {
             // A sliding window: the latest rounds only (the best length, and with it the
             // cost of the deepest level, changes during the run).
             self.adapt_at = Some(elapsed);
             self.adapt_p23 = Duration::ZERO;
+            false
         }
     }
 
@@ -1088,6 +1115,7 @@ impl<'a, 'r> Run<'a, 'r> {
             && !self.stopped()
             && self.level.len <= 40
             && !self.p1_cut.is_some_and(|c| Instant::now() >= c)
+            && self.pool_bytes() < self.pool_budget
         {
             if self.level.next >= self.level.jobs.len() {
                 // The level is complete: its yields rank the next level's jobs, once a
@@ -1119,6 +1147,10 @@ impl<'a, 'r> Run<'a, 'r> {
                 continue;
             }
             let need = want - self.made_cands;
+            // Candidates that still fit in the pool budget (see `Options::pool_budget`).
+            let room = (self.pool_budget.saturating_sub(self.pool_bytes()))
+                / std::mem::size_of::<Candidate>();
+            let kept_new = AtomicUsize::new(0);
             let t = &self.t.p1;
             let (root, d0, len, stop) = (self.root, self.d0, self.level.len, self.stop);
             let jobs = &self.level.jobs;
@@ -1200,7 +1232,10 @@ impl<'a, 'r> Run<'a, 'r> {
                             drop(srch);
                             flush(&buf[..used], &mut made);
                             n += job_nodes;
-                            if found.fetch_add(k, Ordering::Relaxed) + k >= need {
+                            let kept = made.len();
+                            if found.fetch_add(k, Ordering::Relaxed) + k >= need
+                                || kept_new.fetch_add(kept, Ordering::Relaxed) + kept >= room
+                            {
                                 close.raise();
                             }
                             local.push((j, made, spill, job_nodes, k));
@@ -1286,9 +1321,19 @@ impl<'a, 'r> Run<'a, 'r> {
     /// Searched candidates are kept while the level of their next search is at most this
     /// (with the adaptive margin, one level more than [`Run::useful_l12`] while the margin can
     /// still deepen: then every candidate searched so far gets the new level's search).
+    /// (Searched candidates are only kept for that while the pools take at most half of
+    /// [`Options::pool_budget`].)
     fn useful_next(&self) -> usize {
-        let deepen = self.knobs.adapt.is_finite() && self.margin_now() > self.knobs.margin_min;
+        let deepen = self.knobs.adapt.is_finite()
+            && self.margin_now() > self.knobs.margin_min
+            && 2 * self.pool_bytes() <= self.pool_budget;
         self.useful_l12() + deepen as usize
+    }
+
+    /// The memory the candidate and reduction pools take (their heap blocks estimated).
+    fn pool_bytes(&self) -> usize {
+        self.cands.len() * std::mem::size_of::<Candidate>()
+            + self.reds.len() * (std::mem::size_of::<Reduction>() + 48)
     }
 
     /// Drop the candidates and reductions that can no longer lead to a shorter solution
@@ -2873,6 +2918,7 @@ mod tests {
                     lvl_kept: 0,
                     lvl_start: 0.0,
                     prev_lvl_nodes: 0,
+                    pool_budget: 4 << 30,
                 };
                 run.level.jobs = run.level_jobs(run.level.len);
                 // The order applies once a solution exists (a 60-move one keeps every
@@ -2976,6 +3022,7 @@ mod tests {
                 lvl_kept: 0,
                 lvl_start: 0.0,
                 prev_lvl_nodes: 0,
+                pool_budget: 4 << 30,
             };
             run.level.jobs = run.level_jobs(run.level.len);
             run.phase1(1000);
