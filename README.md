@@ -212,16 +212,22 @@ after 2 s, 38.8 / 39.1 after 60 s on two sets of 20 positions.)
   total length L12 found at best length B is a draw that wins if its optimal phase 3 has at
   most B - 1 - L12 moves, distributed like the distance of a random 3x3 position (P(<= 17) =
   0.305, P(<= 18) = 0.965; the table in the script, from Rokicki et al. / cube20.org), so the
-  run's expected improvements are E = sum of solutions x P(3x3 distance <= B - 1 - L12). E
-  resolves ~10-20%. `EGGG_DEBUG=1 eggg-solver bench ... 2> X.trace` writes the trace (its
-  `P2LEVEL <L12>: ... seen <N> best <B>` and `IMPROVE` lines are used; `scripts/x86-long.sh`
-  writes `$EGGG_TRACE_DIR/NAME.trace` when that is set); `scripts/erate.py X.trace` prints E and
-  the observed improvements per position and time window, `scripts/erate.py --pair A.trace
-  B.trace` the E each run gathered while both had the same best (same positions, same wall
-  time: a run that improves sooner faces a harder target afterwards), the ratio B/A and a
-  bootstrap interval over positions (`--from S`, default 10 s, `--to S`). E is relative: the
-  improvements observed after 10 s were 0.5-0.7 of it (successes cluster: the solutions of
-  one candidate are correlated, and several in one round make one improvement).
+  run's expected improvements are E = sum over rounds of 1 - exp(-(sum of solutions x
+  P(3x3 distance <= B - 1 - L12))) (several successes in one round make one improvement;
+  `--raw`: without that). `EGGG_DEBUG=1 eggg-solver bench ... 2> X.trace` writes the trace (its
+  `P2 start`, `P2LEVEL <L12>: ... seen <N> best <B>` and `IMPROVE` lines are used;
+  `scripts/x86-long.sh` writes `$EGGG_TRACE_DIR/NAME.trace` when that is set);
+  `scripts/erate.py X.trace` prints E and the observed improvements per position and time
+  window, `scripts/erate.py --pair A.trace B.trace` the E each run gathered while both had
+  the same best (same positions, same wall time: a run that improves sooner faces a harder
+  target afterwards), the ratio B/A with a bootstrap interval over positions, and the
+  geometric mean of the per-position ratios (`--from S`, default 10 s, `--to S`). Two master
+  runs of 20 x 600 s (x86): B/A 1.000 (90% interval 0.95-1.05), where their final lengths
+  could not resolve 2x. In 20-s runs it is much noisier (±15-25%: few rounds at a settled
+  best); use the paired lengths there. E is calibrated loosely: the improvements observed
+  after 10 s in six long runs (300-600 s, 32 improvements) were 0.69 of it (0.5-1.1 per run;
+  the solutions of one candidate are correlated), between 2 and 20 s in two 50 x 20 s runs
+  1.04 (59 improvements).
 - Profile-guided builds (LLVM PGO): `scripts/pgo-build.sh x86|m2 LABEL REF` (an instrumented
   build, a one-minute training run on the machine the binary is for, `llvm-profdata` from the
   toolchain's `llvm-tools` component, and the release build with the profile; per commit).

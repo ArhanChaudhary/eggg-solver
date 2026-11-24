@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Expected improvements (E) of long runs, from their EGGG_DEBUG traces.
 
-    scripts/erate.py [--from S] TRACE...           per position and per time window
-    scripts/erate.py [--from S] --pair A.trace B.trace   paired comparison (same positions)
+    scripts/erate.py [--from S] [--raw] TRACE...    per position and per time window
+    scripts/erate.py [--from S] [--to S] [--raw] --pair A.trace B.trace
+                                                    paired comparison (same positions)
 
 A long run improves only a few times (20 positions x 600 s: ~5 improvements after 10 s), so
 comparing final lengths cannot detect effects under ~2x. Instead, every phase-2 solution
@@ -12,28 +13,35 @@ a round's chance of an improvement is
 
     E = sum over its phase-2 levels L12 of  seen(L12) x P(3x3 distance <= best - 1 - L12)
 
-and E summed over a run is the number of improvements the model expects. It resolves
-differences of ~10-20% between builds where the lengths need ~2x.
+(see "E per round" below) and E summed over a run is the number of improvements the model
+expects. Two master runs of 20 x 600 s (x86): B/A = 1.000, 90% interval 0.95-1.05, where the
+final lengths cannot resolve 2x. Short runs (20 s) are far noisier (+-15-25%).
 
 Trace (stderr of `EGGG_DEBUG=1 eggg-solver bench ...` or `solve`): lines "[  t] MSG" with t
 the seconds since the position's start; positions follow each other (t starts again near 0).
-Used: "P2LEVEL <L12>: ... seen <N> best <B>" (N phase-2 solutions of total length L12 at
-best length B; -1 before the first solution, not counted) and "IMPROVE <B> -> <B'> ..."
-(observed improvements; the first solution, from -1, is not one).
+Used: "P2 start" (a round's phase 2 begins), "P2LEVEL <L12>: ... seen <N> best <B>" (N
+phase-2 solutions of total length L12 at best length B; -1 before the first solution, not
+counted) and "IMPROVE <B> -> <B'> ..." (observed improvements; the first solution, from -1,
+is not one).
 
-Calibration: improvements observed after 10 s were 0.5-0.7 of E (x86, 48 threads: 20 x 600 s
-runs 6 observed / 12.1 and 6 / 12.6 expected; 20 x 300 s runs 0.63 pooled; the analysis of
-2026-11-24 used 0.69). E counts every successful reduction, but successes cluster (the
-reductions of one candidate are correlated, and several successes in one round make one
-improvement), so read E as a relative measure: compare E between runs, and scale it by
-~0.6-0.7 for the number of improvements. Before ~10 s the bests fall every few rounds and E
-is far above the improvements seen (each round has many successes).
+Calibration: the improvements observed after 10 s in six 20-position long runs (x86, 48
+threads, 300-600 s; 32 improvements) were 0.69 of E (0.5-1.1 per run: the reductions of one
+candidate are correlated); between 2 and 20 s in two 50 x 20 s runs, 1.04 of it (59
+improvements). Read E as a relative measure: compare it between runs; ~0.7 E improvements
+are expected in long runs.
 
 Pair mode compares, per position and best length, the E each run gathered while BOTH had that
 best, over the same wall-clock interval (a run that improves sooner faces a harder target
 afterwards; comparing at equal best and equal time removes that). Totals, the ratio B/A, the
-positions where B gathered more, and a bootstrap interval over positions.
+positions where B gathered more, a bootstrap interval over positions, and the geometric mean
+of the per-position ratios (less dominated by the few positions with the most E).
+
+E per round: a round's chance of an improvement is 1 - exp(-E) for the E of its levels
+(several successes in one round make one improvement; `--raw`: E itself). In long runs a
+round's E is small and the two agree; early on (best lengths still falling) the raw E is far
+above the improvements seen.
 """
+import math
 import random
 import re
 import sys
@@ -65,28 +73,44 @@ P2LEVEL = re.compile(r'^P2LEVEL (\d+):.* seen (\d+) best (-?\d+)')
 IMPROVE = re.compile(r'^IMPROVE (-?\d+) -> (\d+)')
 
 
-def positions(path):
-    """Per position: (end time, [(t, 'E', best, e)], [(t, old, new)] improvements)."""
-    out, cur, last = [], None, -1.0
+def positions(path, raw=False):
+    """Per position: (end time, [(t, best, e)] per P2LEVEL line, [(t, old, new)] improvements).
+    A round's chance is 1 - exp(-E) for its E summed over its levels (several successes in
+    one round make one improvement), spread over its lines in proportion; `raw`: E itself."""
+    out, cur, last, rnd = [], None, -1.0, []
+
+    def close_round():
+        e = sum(x[2] for x in rnd)
+        f = 1.0 if raw or e <= 0 else -math.expm1(-e) / e
+        cur[1].extend((t, b, x * f) for t, b, x in rnd)
+        rnd.clear()
+
     for line in open(path, errors='replace'):
         m = LINE.match(line.rstrip('\n'))
         if not m:
             continue
         t, msg = float(m.group(1)), m.group(2)
         if cur is None or t < last - 0.5:
+            if cur is not None:
+                close_round()
             cur = [0.0, [], []]
             out.append(cur)
         last = t
         cur[0] = max(cur[0], t)
+        if msg.startswith('P2 start'):
+            close_round()
+            continue
         m = P2LEVEL.match(msg)
         if m:
             l12, seen, best = int(m.group(1)), int(m.group(2)), int(m.group(3))
             if best >= 0 and seen:
-                cur[1].append((t, best, seen * p_at_most(best - 1 - l12)))
+                rnd.append((t, best, seen * p_at_most(best - 1 - l12)))
             continue
         m = IMPROVE.match(msg)
         if m and int(m.group(1)) >= 0:
             cur[2].append((t, int(m.group(1)), int(m.group(2))))
+    if cur is not None:
+        close_round()
     return [tuple(p) for p in out]
 
 
@@ -125,10 +149,10 @@ def fmt(x):
     return f'{x:.3g}' if x else '0'
 
 
-def single(paths, t0, windows):
+def single(paths, t0, windows, raw):
     tot_e = tot_o = 0.0
     for path in paths:
-        ps = positions(path)
+        ps = positions(path, raw)
         print(f'{path}: {len(ps)} positions; E from {t0:g} s')
         print('| pos | final | at (s) | E | observed | E/s, last half | ')
         print('|---:|---:|---:|---:|---:|---:|')
@@ -166,8 +190,8 @@ def single(paths, t0, windows):
         print(f'all files from {t0:g} s: E {tot_e:.3f}, observed {tot_o:.0f} (observed/E {tot_o / tot_e:.2f})')
 
 
-def pair(pa, pb, t0, t1, boot):
-    A, B = positions(pa), positions(pb)
+def pair(pa, pb, t0, t1, boot, raw):
+    A, B = positions(pa, raw), positions(pb, raw)
     assert len(A) == len(B), f'not paired: {len(A)} vs {len(B)} positions'
     rows = []
     for i, (a, b) in enumerate(zip(A, B)):
@@ -209,12 +233,27 @@ def pair(pa, pb, t0, t1, boot):
         rs.sort()
         lo, hi = rs[int(0.05 * len(rs))], rs[int(0.95 * len(rs)) - 1]
         print(f' (90% bootstrap over positions {lo:.3f}..{hi:.3f}); B more in {more}, less in {less} of {len(rows)} positions')
+        # The geometric mean of the per-position ratios (positions with E in both): less
+        # dominated by the few positions with the most E.
+        lr = [math.log(r[5] / r[4]) for r in rows if r[4] > 0 and r[5] > 0]
+        if lr:
+            gs = []
+            for _ in range(boot):
+                s = [lr[rnd.randrange(len(lr))] for _ in lr]
+                gs.append(math.exp(sum(s) / len(s)))
+            gs.sort()
+            g = math.exp(sum(lr) / len(lr))
+            print(f'geometric mean of B/A over {len(lr)} positions: {g:.3f} (90% bootstrap '
+                  f'{gs[int(0.05 * len(gs))]:.3f}..{gs[int(0.95 * len(gs)) - 1]:.3f})')
     print(f'improvements from {t0:g} s: A {sum(r[6] for r in rows)}, B {sum(r[7] for r in rows)}')
 
 
 def main():
     args = sys.argv[1:]
     t0, t1, boot = 10.0, float('inf'), 2000
+    raw = '--raw' in args
+    if raw:
+        args.remove('--raw')
     windows = [0, 10, 30, 60, 120, 300, 600, 1200, 3600, float('inf')]
     if '--from' in args:
         k = args.index('--from')
@@ -228,10 +267,10 @@ def main():
         print(__doc__)
         return
     if args[0] == '--pair':
-        assert len(args) == 3, 'usage: erate.py [--from S] [--to S] --pair A.trace B.trace'
-        pair(args[1], args[2], t0, t1, boot)
+        assert len(args) == 3, 'usage: erate.py [--from S] [--to S] [--raw] --pair A.trace B.trace'
+        pair(args[1], args[2], t0, t1, boot, raw)
     else:
-        single(args, t0, windows)
+        single(args, t0, windows, raw)
 
 
 if __name__ == '__main__':
