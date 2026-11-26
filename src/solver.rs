@@ -18,6 +18,7 @@ use crate::moves::{ALLOWED_AFTER, MOVE_PERMS, N_MOVES, frame_rotation, rotate_mo
 use crate::phase1::{P1State, P1Tables, Search1};
 use crate::phase2::{P2Tables, Search2, Task2, first_moves, standardise};
 use crate::phase3::{P3Tables, Search3, Task};
+use crate::symmetry::PositionSymmetry;
 
 /// Phase-1 endpoints are turned into candidates this many at a time (see `Run::phase1`).
 const EP_BUFFER: usize = 256;
@@ -167,6 +168,10 @@ pub struct Options {
     /// they would outgrow it, and searched candidates are only kept for a deeper margin while
     /// they take at most half of it (see `Run::adapt`).
     pub pool_budget: usize,
+    /// Use the position's own symmetries: phase 1 searches one job prefix per orbit under
+    /// those that fix the URF corner, after rotating the input so that most of them do (see
+    /// [`crate::symmetry`]). The same solution lengths are reachable, with less work.
+    pub symmetry: bool,
 }
 
 impl Default for Options {
@@ -181,6 +186,7 @@ impl Default for Options {
             order_jobs: true,
             ties: false,
             pool_budget: 4 << 30,
+            symmetry: true,
         }
     }
 }
@@ -214,6 +220,15 @@ pub struct Stats {
     pub rounds: usize,
     /// Wall time spent in each phase.
     pub time: [Duration; 3],
+    /// The order of the position's stabiliser (see [`crate::symmetry`]), how many of its
+    /// elements are rotations, and the number of its symmetries the search pruned by (1:
+    /// none).
+    pub sym_order: usize,
+    pub sym_rotations: usize,
+    pub sym_used: usize,
+    /// Phase-1 job prefixes made (over all levels) and those skipped as images of others.
+    pub jobs: u64,
+    pub jobs_pruned: u64,
 }
 
 /// A phase-1 path, stored inline (the driver searches phase-1 lengths up to 40): long runs keep
@@ -659,6 +674,8 @@ struct Run<'a, 'r> {
     prev_lvl_nodes: u64,
     /// See [`Options::pool_budget`].
     pool_budget: usize,
+    /// The symmetries the job prefixes are pruned by (see [`crate::symmetry`]).
+    sym: PositionSymmetry,
 }
 
 impl<'a> Solver<'a> {
@@ -671,8 +688,76 @@ impl<'a> Solver<'a> {
     }
 
     /// Solve `cube`, calling `report` with each improvement.
+    ///
+    /// With [`Options::symmetry`], the position's symmetries are found first (microseconds);
+    /// if some can prune the search, it runs on the input turned so that most of them fix the
+    /// URF corner, and its solutions are mapped back move for move. With [`Options::ties`],
+    /// the images of each solution reported under those symmetries are reported too (the
+    /// pruned search would not find most of them).
     pub fn solve(&mut self, cube: &Cube, report: &mut dyn FnMut(&Solution)) -> Option<Solution> {
         let start = Instant::now();
+        // The per-pair searches of the pattern tables have their own jobs: not pruned.
+        let sym = PositionSymmetry::of(cube, self.opts.symmetry && self.t.p1.pat.is_none());
+        if std::env::var_os("EGGG_DEBUG").is_some() {
+            eprintln!(
+                "[{:8.3}] SYMMETRY {}",
+                start.elapsed().as_secs_f64(),
+                sym.describe()
+            );
+        }
+        let best = if sym.used() == 1 {
+            self.solve_with(cube, &sym, start, report)
+        } else {
+            self.solve_symmetric(cube, &sym, start, report)
+        };
+        self.stats.sym_order = sym.order;
+        self.stats.sym_rotations = sym.rotations;
+        self.stats.sym_used = sym.used();
+        best
+    }
+
+    /// [`Solver::solve`] with symmetries to prune by: on the rotated input, solutions mapped
+    /// back.
+    fn solve_symmetric(
+        &mut self,
+        cube: &Cube,
+        sym: &PositionSymmetry,
+        start: Instant,
+        report: &mut dyn FnMut(&Solution),
+    ) -> Option<Solution> {
+        let ties = self.opts.ties;
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let back = |s: &Solution, moves: &[u8]| Solution {
+            moves: sym.map_back(moves),
+            ..s.clone()
+        };
+        let mut wrap = |s: &Solution| {
+            let out = back(s, &s.moves);
+            if ties && !seen.insert(out.moves.clone()) {
+                return;
+            }
+            report(&out);
+            if ties {
+                for img in sym.images(&s.moves) {
+                    let img = back(s, &img);
+                    if seen.insert(img.moves.clone()) {
+                        report(&img);
+                    }
+                }
+            }
+        };
+        let rotated = sym.rotated(cube);
+        self.solve_with(&rotated, sym, start, &mut wrap)
+            .map(|s| back(&s, &s.moves))
+    }
+
+    fn solve_with(
+        &mut self,
+        cube: &Cube,
+        sym: &PositionSymmetry,
+        start: Instant,
+        report: &mut dyn FnMut(&Solution),
+    ) -> Option<Solution> {
         let deadline = start + self.opts.time_limit;
         let hard = self.opts.hard_limit;
         let stop = AtomicBool::new(false);
@@ -744,6 +829,7 @@ impl<'a> Solver<'a> {
             lvl_start: 0.0,
             prev_lvl_nodes: 0,
             pool_budget: self.opts.pool_budget,
+            sym: sym.clone(),
         };
         run.level.jobs = run.level_jobs(len0);
         std::thread::scope(|scope| {
@@ -1057,7 +1143,7 @@ impl<'a, 'r> Run<'a, 'r> {
         );
     }
 
-    fn level_jobs(&self, len: u8) -> Vec<(u8, Vec<u8>)> {
+    fn level_jobs(&mut self, len: u8) -> Vec<(u8, Vec<u8>)> {
         let depth = if len < 3 {
             0
         } else if len < 7 {
@@ -1081,6 +1167,20 @@ impl<'a, 'r> Run<'a, 'r> {
             }
             jobs = next;
         }
+        // One prefix per orbit under the position's symmetries (see `crate::symmetry`).
+        let made = jobs.len();
+        if self.sym.used() > 1 {
+            jobs.retain(|p| self.sym.keeps(p));
+            if self.trace {
+                eprintln!(
+                    "[{:8.3}] P1JOBS {len}: {} of {made} prefixes of {depth} moves kept by symmetry",
+                    self.start.elapsed().as_secs_f64(),
+                    jobs.len(),
+                );
+            }
+        }
+        self.stats.jobs += made as u64;
+        self.stats.jobs_pruned += (made - jobs.len()) as u64;
         // Per search, keep only prefixes that can still reach the goal in `len` moves.
         let t = &self.t.p1;
         let mut out = vec![];
@@ -3044,6 +3144,7 @@ mod tests {
                     lvl_start: 0.0,
                     prev_lvl_nodes: 0,
                     pool_budget: 4 << 30,
+                    sym: PositionSymmetry::none(),
                 };
                 run.level.jobs = run.level_jobs(run.level.len);
                 // The order applies once a solution exists (a 60-move one keeps every
@@ -3148,6 +3249,7 @@ mod tests {
                 lvl_start: 0.0,
                 prev_lvl_nodes: 0,
                 pool_budget: 4 << 30,
+                sym: PositionSymmetry::none(),
             };
             run.level.jobs = run.level_jobs(run.level.len);
             run.phase1(1000);
