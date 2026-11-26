@@ -203,6 +203,35 @@ minutes, none longer; 4 of the 6 improvements after 10 s came from the two deepe
 masks, the round cut, the faster phase 2 and the wing-path tables, 2026-11-17: 39.7 / 39.5
 after 2 s, 38.8 / 39.1 after 60 s on two sets of 20 positions.)
 
+**Symmetric positions** (`src/symmetry.rs`). Before the search the solver finds the
+position's own symmetries: those of the 48 cube symmetries (24 rotations, each also mirrored)
+under which its facelet colouring is unchanged up to a relabelling of the colours (~45 µs;
+`solve -v` prints the stabiliser, `EGGG_DEBUG=1` the job prefixes kept per phase-1 length). If
+a symmetry `s` keeps the position, `M` solves it exactly when `s M s⁻¹` does, so its solutions
+come in orbits of equally long sequences. The symmetries that fix the URF corner (the turns by
+120° and 240° about the URF-DBL diagonal and the three mirrors that swap two of U, R and F,
+which also invert the turn direction) map the 27 moves and their canonical order onto
+themselves, so phase 1 searches only the 3-move job prefixes that are the least of their orbit
+under the position's such symmetries `S` (exactly one per orbit): every solution has an image
+with a kept prefix, and the endpoints below an image prefix are the images of the endpoints
+below the original (frames and colour assignments permuted; all are searched). That is 1/|S|
+of the phase-1 nodes, endpoints and phase-2/3 work, with no solution length lost. The input is
+first turned (a whole-cube rotation) so that the corner direction fixed by the most of its
+symmetries becomes URF, so a 3-fold axis through any corner or any diagonal mirror counts; the
+solutions are mapped back move for move (a Dw, Lw or Bw becomes Uw, Rw or Fw and a rotation the
+later moves absorb), and with `--ties` the images of each solution are printed too. Mirrors in
+the planes parallel to a face, quarter and half turns about face axes and half turns about edge
+axes cannot be used this way (they take some of Uw, Rw, Fw to Dw, Lw, Bw); random positions
+have no symmetry at all. `--no-symmetry` turns this off. 10 random symmetric positions
+(`examples/symgen.rs`: 4 with the 3-fold turns about URF, 2 about another diagonal, 4 with
+those and the three mirrors; x86, 48 threads, huge tier, 60 s each, with and without the
+pruning): per phase-1 length exactly 1/|S| of the endpoints and ~1/|S| of the nodes; 38.30 ->
+38.00 moves after 60 s (2 shorter, none longer), 40.10 -> 38.90 after 0.25 s (7 shorter), never
+longer at any checkpoint; the final length of the run without pruning reached 1.7-4.6x sooner
+(e.g. 37 moves after 6.1 s instead of 28 s). 50 random positions (seed 6060, large tier, 20 s):
+the same improvements and final lengths as before on every position (38.44), phase-1 nodes
+per second +0.9% (noise).
+
 ## Development
 
 - `cargo test --release` (end-to-end tests use `./tables`, generating them if missing).

@@ -135,3 +135,55 @@ fn ties_reports_equal_solutions_once() {
         assert_eq!(&best.moves, first);
     }
 }
+
+/// Symmetric positions (short scrambles with symmetries that fix the URF corner, some only
+/// after a whole-cube rotation, and the checkerboard with all 48) are solved as short with the
+/// symmetry pruning as without it, the pruning is used, and with `ties` every reported
+/// solution (the images of each solution found included) solves the cube, once each.
+#[test]
+fn symmetric_positions_solve_as_short_with_pruning() {
+    for (scramble, used) in [
+        ("Uw2", 2),
+        ("B2 Fw2", 2),
+        ("Fw2 Rw2 Fw2 U2", 2),
+        ("Fw2 Rw2 Uw2 Fw2", 3),
+        ("R2 L2 U2 D2 F2 B2", 6),
+        ("Fw2 Rw2 Uw2 Fw2 R2 L2 U2 D2 F2 B2", 3),
+    ] {
+        let f = facelets_of(scramble);
+        let (cube, _) = f.to_cube().unwrap();
+        let mut lens = vec![];
+        for symmetry in [true, false] {
+            let opts = Options {
+                time_limit: Duration::from_secs_f64(1.5),
+                threads: 4,
+                symmetry,
+                ties: true,
+                ..Default::default()
+            };
+            let mut s = Solver::new(tables(), opts);
+            let mut seen: Vec<Vec<u8>> = vec![];
+            let best = s
+                .solve(&cube, &mut |sol| seen.push(sol.moves.clone()))
+                .expect("no solution found");
+            assert!(verify(&f, &best.moves), "{scramble}");
+            for (i, m) in seen.iter().enumerate() {
+                assert!(
+                    verify(&f, m),
+                    "{scramble}: a reported solution does not solve it"
+                );
+                assert!(!seen[..i].contains(m), "{scramble}: reported twice");
+            }
+            assert_eq!(
+                s.stats.sym_used,
+                if symmetry { used } else { 1 },
+                "{scramble}"
+            );
+            if symmetry {
+                assert!(s.stats.jobs_pruned > 0, "{scramble}");
+            }
+            lens.push(best.len());
+        }
+        assert_eq!(lens[0], lens[1], "{scramble}");
+    }
+}

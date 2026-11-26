@@ -319,6 +319,10 @@ struct SearchArgs {
     /// length, so improvements can come a little later.
     #[arg(long)]
     ties: bool,
+    /// Do not use the position's own symmetries (by default, a symmetric position's phase 1
+    /// searches one move prefix per orbit of equivalent ones; for comparisons).
+    #[arg(long)]
+    no_symmetry: bool,
 }
 
 #[derive(Args, Clone)]
@@ -469,6 +473,7 @@ fn options(limits: &LimitArgs, search: &SearchArgs, threads: usize) -> Options {
         order_jobs: !search.no_job_order,
         ties: search.ties,
         pool_budget: pool_budget(),
+        symmetry: !search.no_symmetry,
     }
 }
 
@@ -568,6 +573,10 @@ fn cmd_solve(a: SolveArgs) -> Result<(), String> {
         }
         if a.output.verbose {
             eprintln!("{stats:?}");
+            eprintln!(
+                "symmetry: stabiliser of order {} ({} rotations), pruned by {} ({} of {} phase-1 job prefixes skipped)",
+                stats.sym_order, stats.sym_rotations, stats.sym_used, stats.jobs_pruned, stats.jobs
+            );
         }
         std::io::stdout().flush().ok();
     }

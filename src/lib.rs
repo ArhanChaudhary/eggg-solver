@@ -16,6 +16,7 @@ pub mod phase2;
 pub mod phase3;
 pub mod simd;
 pub mod solver;
+pub mod symmetry;
 pub mod table;
 pub mod wing2;
 pub mod wingpath;
