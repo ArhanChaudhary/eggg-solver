@@ -27,8 +27,8 @@ const EP_BUFFER: usize = 256;
 const SPLIT_DEPTH: u8 = 15;
 use crate::table::Mod3Table;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The deepest phase-2 level is best - DEEPEST_MARGIN (see `Run::phase2`).
@@ -172,6 +172,10 @@ pub struct Options {
     /// those that fix the URF corner, after rotating the input so that most of them do (see
     /// [`crate::symmetry`]). The same solution lengths are reachable, with less work.
     pub symmetry: bool,
+    /// External stop: raising it (from any thread) ends the solve within a few milliseconds,
+    /// whatever the limits, and [`Solver::solve`] returns the best solution found so far
+    /// (None if there is none yet). The solver only reads it.
+    pub stop: Option<Arc<AtomicBool>>,
 }
 
 impl Default for Options {
@@ -187,6 +191,7 @@ impl Default for Options {
             ties: false,
             pool_budget: 4 << 30,
             symmetry: true,
+            stop: None,
         }
     }
 }
@@ -760,7 +765,9 @@ impl<'a> Solver<'a> {
     ) -> Option<Solution> {
         let deadline = start + self.opts.time_limit;
         let hard = self.opts.hard_limit;
-        let stop = AtomicBool::new(false);
+        let external = self.opts.stop.as_deref();
+        // (Already raised externally: no search.)
+        let stop = AtomicBool::new(external.is_some_and(|e| e.load(Ordering::Relaxed)));
         let have = AtomicBool::new(false);
         if cube.to_facelets().is_solved() {
             let s = Solution {
@@ -833,7 +840,8 @@ impl<'a> Solver<'a> {
         };
         run.level.jobs = run.level_jobs(len0);
         std::thread::scope(|scope| {
-            // Watchdog that raises the stop flag at the deadline.
+            // Watchdog that raises the stop flag at the deadline, or when the external stop
+            // (`Options::stop`) is raised.
             let (stop_ref, done_ref, have_ref) = (&stop, &done, &have);
             scope.spawn(move || {
                 while !done_ref.load(Ordering::Relaxed) {
@@ -841,6 +849,7 @@ impl<'a> Solver<'a> {
                     let now = Instant::now();
                     if (now >= deadline && have_ref.load(Ordering::Relaxed))
                         || hard.is_some_and(|h| now >= start + h)
+                        || external.is_some_and(|e| e.load(Ordering::Relaxed))
                     {
                         stop_ref.store(true, Ordering::Relaxed);
                         break;

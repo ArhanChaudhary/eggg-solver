@@ -6,8 +6,9 @@ use eggg_solver::cube::{Cube, Facelets};
 use eggg_solver::notation::{Style, format_moves, parse_moves};
 use eggg_solver::solver::{Options, Solver, Tables, load_tables, verify};
 use rand::SeedableRng;
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 fn tables() -> &'static Tables {
     static T: OnceLock<Tables> = OnceLock::new();
@@ -186,4 +187,55 @@ fn symmetric_positions_solve_as_short_with_pruning() {
         }
         assert_eq!(lens[0], lens[1], "{scramble}");
     }
+}
+
+/// `Options::stop`, raised from another thread, ends a solve without a time limit within a
+/// fraction of a second, mid-run (with the best solution reported so far) and before any
+/// solution exists (with none).
+#[test]
+fn external_stop_ends_a_solve_promptly() {
+    let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(99);
+    let f = Cube::random(&mut rng).to_facelets();
+    let (cube, _) = f.to_cube().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let opts = Options {
+        time_limit: Duration::from_secs(3600),
+        threads: 4,
+        stop: Some(stop.clone()),
+        ..Default::default()
+    };
+    // The length of the last solution reported (0: none yet).
+    let last = AtomicUsize::new(0);
+    let stopped_at = OnceLock::new();
+    let best = std::thread::scope(|s| {
+        s.spawn(|| {
+            let t = Instant::now();
+            while last.load(Ordering::Relaxed) == 0 && t.elapsed() < Duration::from_secs(300) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Let it search on a little (into the next phases and rounds).
+            std::thread::sleep(Duration::from_millis(300));
+            stopped_at.set(Instant::now()).unwrap();
+            stop.store(true, Ordering::Relaxed);
+        });
+        Solver::new(tables(), opts.clone()).solve(&cube, &mut |s| {
+            last.store(s.len(), Ordering::Relaxed);
+        })
+    });
+    let latency = stopped_at.get().unwrap().elapsed();
+    assert!(
+        latency < Duration::from_secs(1),
+        "stopped after {latency:?}"
+    );
+    let best = best.expect("no solution returned");
+    assert!(
+        verify(&f, &best.moves),
+        "the solution does not solve the cube"
+    );
+    assert_eq!(best.len(), last.load(Ordering::Relaxed));
+    // Raised before the solve starts: it returns at once, without a solution.
+    let t = Instant::now();
+    let none = Solver::new(tables(), opts).solve(&cube, &mut |_| {});
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    assert!(none.is_none());
 }
