@@ -7,6 +7,8 @@ use eggg_solver::solver::{
 use rand::SeedableRng;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
@@ -28,6 +30,14 @@ enum Cmd {
     Gen(GenArgs),
     /// Benchmark on random positions.
     Bench(BenchArgs),
+    /// Load the tables once, then solve positions given as commands (`solve SCRAMBLE`, `stop`,
+    /// ...).
+    ///
+    /// The commands (below) are read from stdin, one per line; a solve runs in the background
+    /// while the next one is read. The options are the defaults of each solve (`solve` and
+    /// `random` can change the limits and --ties).
+    #[command(visible_alias = "repl", after_help = INTERACTIVE_HELP)]
+    Interactive(InteractiveArgs),
     /// Print the facelets of positions.
     Show(ShowArgs),
     /// Benchmark the phase-3 search alone: optimal solves of random 3x3x3 positions.
@@ -65,8 +75,8 @@ struct InputArgs {
 #[derive(Args, Clone)]
 #[command(next_help_heading = "Limits")]
 struct LimitArgs {
-    /// Search for at most this many seconds per position (default: `solve` runs until it is
-    /// stopped or `-l` is reached, printing each improvement; `bench` 5 seconds).
+    /// Search for at most this many seconds per position (default: `solve` and `interactive`
+    /// run until stopped or `-l` is reached, printing each improvement; `bench` 5 seconds).
     #[arg(short = 't', long, value_name = "SECONDS")]
     time: Option<f64>,
     /// Stop as soon as a solution of at most this many moves is found.
@@ -383,6 +393,32 @@ struct BenchArgs {
     verbose: bool,
 }
 
+/// The options of `interactive`: the defaults of each solve.
+#[derive(Args)]
+struct InteractiveArgs {
+    #[command(flatten)]
+    limits: LimitArgs,
+    #[command(flatten)]
+    search: SearchArgs,
+    #[command(flatten)]
+    tables: TableArgs,
+    #[command(flatten)]
+    output: OutputArgs,
+}
+
+const INTERACTIVE_HELP: &str = "\
+Commands:
+  solve SCRAMBLE|FACELETS [-t S] [-l N] [--hard-limit S] [--ties]
+                   Solve a position (stopping the running solve first), printing each
+                   improvement and, when it ends, the best solution (without -t, until stopped)
+  random [SEED] [-t S] [-l N] [--hard-limit S] [--ties]
+                   Solve a uniformly random position (its facelets are printed first)
+  stop             Stop the running solve and print its best solution
+  status           Whether a solve is running, for how long, and its best length so far
+  wait [SECONDS]   Wait until the running solve ends (at most SECONDS; for scripts)
+  help [COMMAND]   List the commands, or a command's options
+  quit, exit       Stop the running solve and exit (so does the end of the input)";
+
 #[derive(Args)]
 struct ShowArgs {
     #[command(flatten)]
@@ -474,6 +510,7 @@ fn options(limits: &LimitArgs, search: &SearchArgs, threads: usize) -> Options {
         ties: search.ties,
         pool_budget: pool_budget(),
         symmetry: !search.no_symmetry,
+        stop: None,
     }
 }
 
@@ -572,15 +609,19 @@ fn cmd_solve(a: SolveArgs) -> Result<(), String> {
             None => println!("no solution found"),
         }
         if a.output.verbose {
-            eprintln!("{stats:?}");
-            eprintln!(
-                "symmetry: stabiliser of order {} ({} rotations), pruned by {} ({} of {} phase-1 job prefixes skipped)",
-                stats.sym_order, stats.sym_rotations, stats.sym_used, stats.jobs_pruned, stats.jobs
-            );
+            eprintln!("{}", stats_text(&stats));
         }
         std::io::stdout().flush().ok();
     }
     Ok(())
+}
+
+/// A solve's statistics (`--verbose`).
+fn stats_text(stats: &eggg_solver::solver::Stats) -> String {
+    format!(
+        "{stats:?}\nsymmetry: stabiliser of order {} ({} rotations), pruned by {} ({} of {} phase-1 job prefixes skipped)",
+        stats.sym_order, stats.sym_rotations, stats.sym_used, stats.jobs_pruned, stats.jobs
+    )
 }
 
 fn positions_label_useful(l: &str) -> bool {
@@ -803,6 +844,424 @@ fn cmd_show(a: ShowArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// A command of the interactive mode (the first word of a line names it).
+#[derive(Parser)]
+#[command(multicall = true, help_template = "{all-args}")]
+struct ReplLine {
+    #[command(subcommand)]
+    cmd: ReplCmd,
+}
+
+#[derive(Subcommand)]
+enum ReplCmd {
+    /// Solve a position (stopping the running solve first), printing each improvement and,
+    /// when it ends, the best solution.
+    Solve {
+        /// A scramble (WCA or SiGN notation) or a 96-character facelet string.
+        #[arg(required = true, value_name = "SCRAMBLE|FACELETS")]
+        position: Vec<String>,
+        #[command(flatten)]
+        job: JobArgs,
+    },
+    /// Solve a uniformly random position (its facelets are printed first).
+    Random {
+        /// Seed of the position (default: a random one, printed).
+        seed: Option<u64>,
+        #[command(flatten)]
+        job: JobArgs,
+    },
+    /// Stop the running solve and print its best solution.
+    Stop,
+    /// Whether a solve is running, for how long, and its best length so far.
+    Status,
+    /// Wait until the running solve ends (for scripts).
+    Wait {
+        /// Wait at most this long.
+        #[arg(value_parser = seconds)]
+        seconds: Option<f64>,
+    },
+    /// Stop the running solve and exit (so does the end of the input).
+    #[command(visible_alias = "exit")]
+    Quit,
+}
+
+/// A solve's limits (overriding the interactive mode's options).
+#[derive(Args)]
+struct JobArgs {
+    /// Search for at most this many seconds (default: the interactive mode's -t, else until
+    /// stopped or -l is reached).
+    #[arg(short = 't', long, value_name = "SECONDS", value_parser = seconds)]
+    time: Option<f64>,
+    /// Stop as soon as a solution of at most this many moves is found (default: the
+    /// interactive mode's -l).
+    #[arg(short = 'l', long, value_name = "MOVES")]
+    max_length: Option<usize>,
+    /// Give up after this many seconds even without a solution (default: the interactive
+    /// mode's --hard-limit).
+    #[arg(long, value_name = "SECONDS", value_parser = seconds)]
+    hard_limit: Option<f64>,
+    /// Also print every solution as long as the best so far (default: the interactive mode's
+    /// --ties).
+    #[arg(long)]
+    ties: bool,
+}
+
+/// A duration in seconds (finite, not negative; at most a century).
+fn seconds(s: &str) -> Result<f64, String> {
+    let x: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    Duration::try_from_secs_f64(x).map_err(|e| format!("{e}"))?;
+    Ok(x.min(FOREVER.as_secs_f64()))
+}
+
+/// The interactive mode's output: whole lines, from any thread. With a terminal, the `> `
+/// prompt (on stderr, so that stdout holds only results) is redrawn below the lines printed
+/// while it is shown.
+struct Console {
+    tty: bool,
+    /// (prompt shown, waiting for a command)
+    state: std::sync::Mutex<(bool, bool)>,
+}
+
+impl Console {
+    fn print(&self, err: bool, text: &str) {
+        let mut st = self.state.lock().unwrap();
+        let mut e = std::io::stderr().lock();
+        if st.0 {
+            let _ = write!(e, "\r\x1b[K");
+            st.0 = false;
+        }
+        if err {
+            let _ = writeln!(e, "{text}");
+        } else {
+            let _ = e.flush();
+            let mut o = std::io::stdout().lock();
+            let _ = writeln!(o, "{text}");
+            let _ = o.flush();
+        }
+        if self.tty && st.1 {
+            let _ = write!(e, "> ");
+            st.0 = true;
+        }
+        let _ = e.flush();
+    }
+
+    fn out(&self, text: &str) {
+        self.print(false, text);
+    }
+
+    fn err(&self, text: &str) {
+        self.print(true, text);
+    }
+
+    /// Wait for a command (showing the prompt with a terminal).
+    fn prompt(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.1 = true;
+        if self.tty && !st.0 {
+            let mut e = std::io::stderr().lock();
+            let _ = write!(e, "> ");
+            let _ = e.flush();
+            st.0 = true;
+        }
+    }
+
+    /// Not waiting for a command (any more): a command was read (the terminal's echo of its
+    /// newline ended the prompt's line), or the input ended (the prompt is erased).
+    fn idle(&self) {
+        let mut st = self.state.lock().unwrap();
+        if st.0 {
+            let mut e = std::io::stderr().lock();
+            let _ = write!(e, "\r\x1b[K");
+            let _ = e.flush();
+        }
+        *st = (false, false);
+    }
+}
+
+/// A solve running in the background.
+struct Job<'scope> {
+    label: String,
+    start: Instant,
+    stop: Arc<AtomicBool>,
+    /// The best solution so far: (length, found at).
+    best: Arc<std::sync::Mutex<Option<(usize, Duration)>>>,
+    handle: std::thread::ScopedJoinHandle<'scope, ()>,
+}
+
+impl Job<'_> {
+    /// Stop the solve (if it still runs) and wait until it has printed its result.
+    fn finish(self) {
+        if !self.handle.is_finished() {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+        self.handle.join().ok();
+    }
+}
+
+/// Settings of the interactive mode's solves.
+struct Repl<'a> {
+    tables: &'a Tables,
+    console: &'a Console,
+    base: Options,
+    style: Style,
+    quiet: bool,
+    verbose: bool,
+}
+
+impl<'a> Repl<'a> {
+    /// Start solving `f` in the background.
+    fn start<'scope>(
+        &self,
+        scope: &'scope std::thread::Scope<'scope, '_>,
+        label: String,
+        f: Facelets,
+        ja: &JobArgs,
+    ) -> Job<'scope>
+    where
+        'a: 'scope,
+    {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut opts = self.base.clone();
+        if let Some(t) = ja.time {
+            opts.time_limit = Duration::from_secs_f64(t);
+        }
+        if let Some(l) = ja.max_length {
+            opts.target_length = Some(l);
+        }
+        if let Some(h) = ja.hard_limit {
+            opts.hard_limit = Some(Duration::from_secs_f64(h));
+        }
+        opts.ties |= ja.ties;
+        // The memory available now (the tables are loaded, the previous solve is over).
+        opts.pool_budget = pool_budget();
+        opts.stop = Some(stop.clone());
+        let best = Arc::new(std::sync::Mutex::new(None));
+        let (tables, console, style, quiet, verbose) = (
+            self.tables,
+            self.console,
+            self.style,
+            self.quiet,
+            self.verbose,
+        );
+        let (stop2, best2) = (stop.clone(), best.clone());
+        let start = Instant::now();
+        let handle = scope.spawn(move || {
+            let ties = opts.ties;
+            let (sol, stats) = solve_one(tables, &opts, &f, |s| {
+                *best2.lock().unwrap() = Some((s.len(), s.elapsed));
+                if !quiet {
+                    console.out(&format!(
+                        "{:9.3} s  {:2} moves  phases {:?}  {}",
+                        s.elapsed.as_secs_f64(),
+                        s.len(),
+                        s.phases,
+                        format_solution(s, style)
+                    ));
+                } else if ties {
+                    console.out(&format_solution(s, style));
+                }
+            });
+            let wall = start.elapsed();
+            let why = if stop2.load(Ordering::Relaxed) {
+                "stopped"
+            } else if sol
+                .as_ref()
+                .zip(opts.target_length)
+                .is_some_and(|(s, l)| s.len() <= l)
+            {
+                "-l reached"
+            } else if sol.is_some() && wall >= opts.time_limit {
+                "time limit reached"
+            } else if opts.hard_limit.is_some_and(|h| wall >= h) {
+                "hard limit reached"
+            } else {
+                "search finished"
+            };
+            match &sol {
+                Some(s) => {
+                    console.out(&format_solution(s, style));
+                    if !quiet {
+                        console.out(&format!(
+                            "{} moves; found at {:.3} s; {why} after {:.3} s",
+                            s.len(),
+                            s.elapsed.as_secs_f64(),
+                            wall.as_secs_f64()
+                        ));
+                    }
+                }
+                None => console.out(&format!(
+                    "no solution found; {why} after {:.3} s",
+                    wall.as_secs_f64()
+                )),
+            }
+            if verbose {
+                console.err(&stats_text(&stats));
+            }
+            drop((sol, stats, opts));
+            // Hand the solve's pools back to the system: memory stays bounded over many solves.
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            // SAFETY: malloc_trim has no preconditions.
+            unsafe {
+                libc::malloc_trim(0);
+            }
+        });
+        Job {
+            label,
+            start,
+            stop,
+            best,
+            handle,
+        }
+    }
+}
+
+fn cmd_interactive(a: InteractiveArgs) -> Result<(), String> {
+    use std::io::IsTerminal;
+    let threads = setup_threads(a.search.threads);
+    let t0 = Instant::now();
+    let tables = a.tables.load(threads, !a.output.quiet);
+    let console = Console {
+        tty: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+        state: std::sync::Mutex::new((false, false)),
+    };
+    let repl = Repl {
+        tables: &tables,
+        console: &console,
+        base: options(&a.limits, &a.search, threads),
+        style: a.output.notation,
+        quiet: a.output.quiet,
+        verbose: a.output.verbose,
+    };
+    if !a.output.quiet {
+        eprintln!(
+            "ready ({:.1} s); commands: solve SCRAMBLE [-t S] [-l N], random [SEED], stop, status, wait, help, quit",
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    std::thread::scope(|scope| {
+        let mut job: Option<Job> = None;
+        let mut lines = std::io::stdin().lock().lines();
+        loop {
+            console.prompt();
+            let line = lines.next();
+            console.idle();
+            let Some(Ok(line)) = line else {
+                break;
+            };
+            // '#' starts a comment; quotes around a scramble are allowed.
+            let line = line.split('#').next().unwrap_or("").replace('"', " ");
+            let words: Vec<&str> = line.split_whitespace().collect();
+            if words.is_empty() {
+                continue;
+            }
+            let unknown = || {
+                console.err(&format!(
+                    "error: unknown command '{}' ('help' lists the commands)",
+                    words[0]
+                ))
+            };
+            if words[0].starts_with('-') {
+                unknown();
+                continue;
+            }
+            let cmd = match ReplLine::try_parse_from(&words) {
+                Ok(l) => l.cmd,
+                Err(e) if e.kind() == clap::error::ErrorKind::InvalidSubcommand => {
+                    unknown();
+                    continue;
+                }
+                Err(e) => {
+                    let text = e.render().to_string();
+                    if e.use_stderr() {
+                        console.err(text.trim_end());
+                    } else {
+                        console.out(text.trim_end());
+                    }
+                    continue;
+                }
+            };
+            let new = match cmd {
+                ReplCmd::Solve { position, job: ja } => {
+                    let text = position.join(" ");
+                    match parse_position(&text).and_then(|f| f.to_cube().map(|_| f)) {
+                        Ok(f) => {
+                            let header = (!repl.quiet).then(|| {
+                                if positions_label_useful(&text) {
+                                    format!("# {text}")
+                                } else {
+                                    "# (position)".to_string()
+                                }
+                            });
+                            Some((text, header, f, ja))
+                        }
+                        Err(e) => {
+                            console.err(&format!("error: invalid position: {e}"));
+                            None
+                        }
+                    }
+                }
+                ReplCmd::Random { seed, job: ja } => {
+                    let seed = seed.unwrap_or_else(|| rand::random::<u32>() as u64);
+                    let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(seed);
+                    let f = Cube::random(&mut rng).to_facelets();
+                    let label = format!("random (seed {seed})");
+                    let header = format!("# {label}: {}", f.to_string_letters());
+                    Some((label, Some(header), f, ja))
+                }
+                ReplCmd::Stop => {
+                    match job.take() {
+                        Some(j) if !j.handle.is_finished() => j.finish(),
+                        _ => console.out("no solve running"),
+                    }
+                    None
+                }
+                ReplCmd::Status => {
+                    match &job {
+                        Some(j) if !j.handle.is_finished() => {
+                            let best = match *j.best.lock().unwrap() {
+                                Some((n, at)) => {
+                                    format!("best {n} moves (found at {:.3} s)", at.as_secs_f64())
+                                }
+                                None => "no solution yet".to_string(),
+                            };
+                            console.out(&format!(
+                                "running for {:.3} s, {best}: {}",
+                                j.start.elapsed().as_secs_f64(),
+                                j.label
+                            ));
+                        }
+                        _ => console.out("no solve running"),
+                    }
+                    None
+                }
+                ReplCmd::Wait { seconds } => {
+                    if let Some(j) = &job {
+                        let until = seconds.map(|s| Instant::now() + Duration::from_secs_f64(s));
+                        while !j.handle.is_finished() && until.is_none_or(|u| Instant::now() < u) {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    None
+                }
+                ReplCmd::Quit => break,
+            };
+            if let Some((label, header, f, ja)) = new {
+                if let Some(j) = job.take() {
+                    j.finish();
+                }
+                if let Some(h) = header {
+                    console.out(&h);
+                }
+                job = Some(repl.start(scope, label, f, &ja));
+            }
+        }
+        if let Some(j) = job.take() {
+            j.finish();
+        }
+    });
+    Ok(())
+}
+
 fn main() {
     // Exit quietly when the output pipe closes.
     unsafe {
@@ -813,6 +1272,7 @@ fn main() {
         Cmd::Solve(a) => cmd_solve(a),
         Cmd::Gen(a) => cmd_gen(a),
         Cmd::Bench(a) => cmd_bench(a),
+        Cmd::Interactive(a) => cmd_interactive(a),
         Cmd::Show(a) => cmd_show(a),
         Cmd::Bench3(a) => cmd_bench3(a),
     };

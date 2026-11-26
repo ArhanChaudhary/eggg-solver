@@ -19,6 +19,8 @@ target/release/eggg-solver solve "..." -n sign -l 40
 target/release/eggg-solver solve --random 10 -t 5 -q
 # Also print every other solution as short as the best so far (equally short alternatives):
 target/release/eggg-solver solve "..." -t 30 --ties
+# Load the tables once, then solve positions typed as commands (see below):
+target/release/eggg-solver interactive
 # Generate the tables up front, or benchmark:
 target/release/eggg-solver gen
 target/release/eggg-solver bench -N 10 -t 5
@@ -29,6 +31,60 @@ best solution. Without `-t`, `solve` searches until it is stopped (Ctrl-C) or `-
 `bench` defaults to 5 seconds per position. With `--ties`, solutions as long as the best so far are printed too (one per
 reduction, each move sequence once; phase 3 then also searches the best length, so they
 mostly appear in longer runs). The time limit is soft until a first solution exists (`--hard-limit` to cap it).
+
+### Interactive mode
+
+`eggg-solver interactive` (alias `repl`) loads the tables once and then reads commands, one per
+line, so that positions can be solved and stopped one after another without reloading them.
+It takes the options of `solve` (tier, tables, threads, notation, `--ties`, and `-t`, `-l`,
+`--hard-limit` as the defaults of each solve: without `-t`, a solve runs until it is stopped).
+A solve runs in the background, printing each improvement as `solve` does, then the best
+solution and why it ended; meanwhile further commands are read:
+
+| command | |
+|---|---|
+| `solve SCRAMBLE\|FACELETS [-t S] [-l N] [--hard-limit S] [--ties]` | solve a position (stopping the running solve first) |
+| `random [SEED] [-t S] ...` | solve a uniformly random position (its facelets are printed first) |
+| `stop` | stop the running solve (within a few ms) and print its best solution |
+| `status` | whether a solve is running, for how long, its best length so far |
+| `wait [SECONDS]` | wait until the running solve ends (for scripts) |
+| `help [COMMAND]` | list the commands, or a command's options |
+| `quit`, `exit` | stop the running solve and exit (so does the end of the input) |
+
+Results go to stdout; the table messages, errors and (on a terminal) the `> ` prompt to
+stderr. With piped input the commands run as they arrive (`wait` lets a script wait for a
+solve to end). An example session (large tier, 8 threads):
+
+```text
+$ eggg-solver interactive --tier large -j 8
+tables: h48 h6, joint phase 2, phase-1 move masks, wing paths <= 6 (Large tier)
+...
+ready (1.6 s); commands: solve SCRAMBLE [-t S] [-l N], random [SEED], stop, status, wait, help, quit
+> solve Rw U2 x Rw2 F' Bw D Lw' 2R B2 u' -t 3
+# Rw U2 x Rw2 F' Bw D Lw' 2R B2 u'
+    0.006 s   9 moves  phases [9, 0, 0]  Uw B2 R F' U Uw' Fw2 U2 Fw'
+Uw B2 R F' U Uw' Fw2 U2 Fw'
+9 moves; found at 0.006 s; time limit reached after 3.004 s
+> random 7
+# random (seed 7): DBBFFBDBRDFDLLBDFLULRRLFFBLLRFURBDRRFUDULLFRLLDBUBBUDFFURBBLDUUURLDURLUDRDRBLUFFDRDBUURDFURFFBLB
+    0.195 s  39 moves  phases [13, 12, 14]  R Uw' B' L U2 D' F Uw' Rw' U' R' F' Rw F' U F2 Uw2 Fw2 L2 D2 Rw2 U' R2 Rw2 Uw2 R2 U D2 B2 U2 D' F U2 F2 B R2 U' B U
+    0.269 s  37 moves  phases [13, 9, 15]  B R B' Uw' F B' L Uw' Rw' F' U' Rw F R Fw2 U2 R2 U' L2 U' Uw2 Fw2 R2 F' L D2 F' D' L2 U' L2 F2 L2 D2 L D F'
+> status
+running for 4.043 s, best 37 moves (found at 0.269 s): random (seed 7)
+> stop
+B R B' Uw' F B' L Uw' Rw' F' U' Rw F R Fw2 U2 R2 U' L2 U' Uw2 Fw2 R2 F' L D2 F' D' L2 U' L2 F2 L2 D2 L D F'
+37 moves; found at 0.269 s; stopped after 4.246 s
+> solve R U R' U' -l 4
+# R U R' U'
+    0.002 s   4 moves  phases [2, 0, 2]  U R U' R'
+U R U' R'
+4 moves; found at 0.002 s; -l reached after 0.002 s
+> quit
+```
+
+Each solve has its own pools, freed when it ends: over 60 solves of 1.5 s (large tier, 16
+threads) the memory beyond the tables grew from 0.05 to 0.44 GB, flattening out (glibc keeps
+the top of each thread's malloc arena; `solve --random N` grows the same way).
 
 ### Tables and memory
 
