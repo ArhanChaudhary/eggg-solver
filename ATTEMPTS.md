@@ -1,6 +1,6 @@
 # Optimisation log: everything tried so far
 
-Status as of 2026-11-24. ✅ merged into master, ❌ tried and not merged (measured), ⏳ in
+Status as of 2026-11-26. ✅ merged into master, ❌ tried and not merged (measured), ⏳ in
 progress, ⏸ waiting for the 48-thread x86 server (busy with another project since
 2026-11-17). Numbers are mean solution lengths (moves) on random positions unless stated;
 "M2" is the 8-core ARM laptop, "x86" the 48-core server. Branch names in `code`; every
@@ -49,6 +49,7 @@ Phase 1 is still most of the run time, so most recent work targets it.
 | ❌ | Pattern tables (`--p1-pat`, opt-in) | Per-colour-pair searches: 1.4x fewer reads, superseded by the masks. |
 | ❌ | Finer job ordering (`opt/p1-order2`) | 4- and 5-move jobs ranked by hierarchical yield: at most +3–6% kept candidates (oracle +16–37%), neutral in length (38.96 vs 38.94). |
 | ✅ | Wing-path depth 8 (`opt/wing-mem`, `--p1-wing 8`) | The build used ~2x the final size (OOM on a 32 GB machine); now the table is 15.2 GB, built in ~40 s and saved to disk. Opt-in only: at 48 threads (50 × 10 s) huge/xl/xxl with depth 8 match depth 7 to within one position. |
+| ✅ | **Position symmetry** (`feat/position-symmetry`) | The input's own symmetries (stabiliser among the 48, on the facelet colouring up to recolouring, ~45 µs). The ≤ 6 that fix the URF corner map the 27 moves and their canonical order onto themselves, so phase 1 searches one 3-move job prefix per orbit (the least): exact, 1/\|S\| of the endpoints, nodes and phase-2/3 work. The input is first turned so the corner most symmetries fix is URF; solutions mapped back move for move. 10 symmetric positions (\|S\| = 3 or 6, x86, 48 threads, 60 s): 38.30 → 38.00 (2 shorter, 0 longer), the unpruned final length reached 1.7–4.6x sooner; random positions unchanged (50 × 20 s: identical improvements, 38.44). Face-axis turns, face-parallel mirrors and edge-axis half turns are not usable this way. |
 | ⏸ | Unreduced 8-byte mask table (~38 GB) | No symmetry handling at all; estimated 1.2–1.3x. Needs the x86 server's memory. |
 | ⏸ | 17.5 GB pair-mask table, 18.9 GB large mask table | Existing opt-in options, never benchmarked at full size. |
 
